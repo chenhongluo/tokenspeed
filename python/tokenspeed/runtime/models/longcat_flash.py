@@ -906,5 +906,9 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         )
 
 
+class LongcatCausalLM(LongcatFlashForCausalLM):
+    """LongCat-2.0 causal language model entry point."""
+
+
 FLASHForCausalLM = LongcatFlashForCausalLM
-EntryClass = LongcatFlashForCausalLM
+EntryClass = [LongcatFlashForCausalLM, LongcatCausalLM]

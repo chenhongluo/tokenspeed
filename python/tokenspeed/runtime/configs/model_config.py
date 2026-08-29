@@ -67,6 +67,7 @@ _MLA_ARCHITECTURES = frozenset(
         "DeepseekV3ForCausalLM",
         "DeepseekV3ForCausalLMNextN",
         "Eagle3DeepseekV2ForCausalLM",
+        "LongcatCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
@@ -93,6 +94,7 @@ _MSA_ARCHITECTURES = frozenset(
 )
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
     {
+        "LongcatCausalLM",
         "LongcatFlashForCausalLM",
     }
 )

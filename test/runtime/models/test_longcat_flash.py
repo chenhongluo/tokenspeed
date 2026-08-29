@@ -1,6 +1,29 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Cheap LongCat-Flash model wiring tests."""
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,6 +46,14 @@ class TestLongcatFlashRegistry(unittest.TestCase):
         self.assertIs(cls, LongcatFlashForCausalLM)
         self.assertEqual(arch, "LongcatFlashForCausalLM")
 
+    def test_longcat_2_entry_registered(self):
+        from tokenspeed.runtime.models.longcat_flash import LongcatCausalLM
+        from tokenspeed.runtime.models.registry import ModelRegistry
+
+        cls, arch = ModelRegistry.resolve_model_cls(["LongcatCausalLM"])
+        self.assertIs(cls, LongcatCausalLM)
+        self.assertEqual(arch, "LongcatCausalLM")
+
     def test_mla_and_double_attention_metadata_registered(self):
         from tokenspeed.runtime.configs import model_config
 
@@ -31,9 +62,45 @@ class TestLongcatFlashRegistry(unittest.TestCase):
             "LongcatFlashForCausalLM",
             model_config._DOUBLE_ATTENTION_LAYER_ARCHITECTURES,
         )
+        self.assertIn("LongcatCausalLM", model_config._MLA_ARCHITECTURES)
+        self.assertIn(
+            "LongcatCausalLM",
+            model_config._DOUBLE_ATTENTION_LAYER_ARCHITECTURES,
+        )
 
 
 class TestLongcatFlashConfig(unittest.TestCase):
+    def test_get_config_loads_longcat_2_checkpoint_shape(self):
+        from tokenspeed.runtime.configs.longcat_config import LongcatConfig
+        from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["LongcatCausalLM"],
+                        "model_type": "longcat",
+                        "vocab_size": 163840,
+                        "hidden_size": 8192,
+                        "num_layers": 38,
+                        "num_hidden_layers": 76,
+                        "num_attention_heads": 64,
+                        "n_routed_experts": 768,
+                        "moe_topk": 12,
+                        "qk_nope_head_dim": 128,
+                        "qk_rope_head_dim": 64,
+                    }
+                )
+            )
+
+            config = get_config(tmpdir, trust_remote_code=False)
+
+        self.assertIsInstance(config, LongcatConfig)
+        self.assertEqual(config.num_hidden_layers, 38)
+        self.assertEqual(config.qk_head_dim, 192)
+        self.assertEqual(config.num_experts_per_tok, 12)
+
     def test_config_aliases_are_normalized(self):
         config = SimpleNamespace(
             num_layers=28,
