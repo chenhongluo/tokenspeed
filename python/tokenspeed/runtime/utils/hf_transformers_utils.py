@@ -45,6 +45,7 @@ from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
     DeepseekV4Config,
+    FLASHLocalConfig,
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
@@ -74,6 +75,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
     DeepseekV4Config.model_type: DeepseekV4Config,
+    FLASHLocalConfig.model_type: FLASHLocalConfig,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
@@ -88,6 +90,23 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
 }
+
+_ARCHITECTURE_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    "FLASHLocalForCausalLM": FLASHLocalConfig,
+}
+
+
+def _resolve_registered_config(
+    raw_config: dict[str, Any],
+) -> type[PretrainedConfig] | None:
+    model_type = raw_config.get("model_type")
+    if isinstance(model_type, str) and model_type in _CONFIG_REGISTRY:
+        return _CONFIG_REGISTRY[model_type]
+
+    architectures = raw_config.get("architectures")
+    if isinstance(architectures, list) and architectures:
+        return _ARCHITECTURE_CONFIG_REGISTRY.get(architectures[0])
+    return None
 
 
 def _snapshot_commit_hash(snapshot_path: str) -> str | None:
@@ -312,10 +331,7 @@ def get_config(
             # exception because Transformers 5.12 resolves its relative
             # imports incorrectly from symlink-backed local snapshots. Keep
             # that remote-code load revision-pinned and inside the same lock.
-            if (
-                raw_config.get("model_type", "llama") not in _CONFIG_REGISTRY
-                and trust_remote_code
-            ):
+            if _resolve_registered_config(raw_config) is None and trust_remote_code:
                 snapshot_revision = _snapshot_commit_hash(model_path)
                 if snapshot_revision is not None:
                     # Keep the lock while Transformers copies executable code
@@ -342,8 +358,8 @@ def get_config(
         raw_config = load_raw_config(model_path)
 
     if config is None:
-        if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
-            config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
+        config_class = _resolve_registered_config(raw_config)
+        if config_class is not None:
             config = config_class.from_pretrained(model_path)
         else:
             config = AutoConfig.from_pretrained(

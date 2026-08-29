@@ -21,6 +21,7 @@
 """Runtime configuration exports."""
 
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.configs.inkling_config import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -58,6 +59,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 
 __all__ = [
     "DeepseekV4Config",
+    "FLASHLocalConfig",
     "Qwen2Config",
     "Qwen3Config",
     "Qwen3MoeConfig",
