@@ -193,6 +193,7 @@ _HYBRID_GDN_ARCHITECTURES = {
 # the base sub-backend auto-resolves to MLA from the arch, and the linear
 # sub-backend runs the KDA kernels (KdaAttnBackend).
 _HYBRID_MLA_KDA_ARCHITECTURES = {
+    "FLASHLocalForCausalLM",
     "KimiK3ForConditionalGeneration",
 }
 

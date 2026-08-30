@@ -34,6 +34,7 @@ from tokenspeed.runtime.models.longcat_flash import (
     LongcatFlashForCausalLM,
     _ensure_longcat_config,
     _get_longcat_moe_quant_config,
+    _RuntimeLongcatModel,
     _RuntimeLongcatMoE,
 )
 
@@ -120,6 +121,63 @@ class TestLongcatFlashConfig(unittest.TestCase):
         self.assertEqual(config.hidden_act, "silu")
         self.assertEqual(config.zero_expert_num, 0)
         self.assertFalse(config.router_bias)
+
+    def test_over_embedding_aliases_are_normalized(self):
+        config = SimpleNamespace(
+            num_layers=38,
+            ffn_hidden_size=12288,
+            expert_ffn_hidden_size=2048,
+            moe_topk=12,
+            hidden_size=8192,
+            vocab_size=163840,
+            n_routed_experts=768,
+            oe_vocab_size_ratio=100.567,
+            oe_neighbor_num=5,
+            oe_split_num=4,
+            oe_ignored_token_ids=[2, 3],
+        )
+
+        _ensure_longcat_config(config)
+
+        self.assertTrue(config.use_over_embedding)
+        self.assertEqual(config.over_embedding_m, 16476897)
+        self.assertEqual(config.oe_ignore_tokens, [2, 3])
+
+    def test_longcat_2_builds_shared_over_embedding_layer(self):
+        model = object.__new__(_RuntimeLongcatModel)
+        model.mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_rank=3, tp_size=8, tp_group=tuple(range(8)))
+        )
+        config = SimpleNamespace(
+            use_over_embedding=True,
+            vocab_size=163840,
+            hidden_size=8192,
+            over_embedding_m=16476897,
+            oe_neighbor_num=5,
+            oe_split_num=4,
+            oe_ignore_tokens=[2, 3],
+            eos_token_id=2,
+        )
+
+        with mock.patch(
+            "tokenspeed.runtime.models.longcat_flash._LongCatOverEmbedding"
+        ) as over_embedding:
+            embedding = _RuntimeLongcatModel._build_embed_tokens(model, config)
+
+        self.assertIs(embedding, over_embedding.return_value)
+        over_embedding.assert_called_once_with(
+            num_embeddings=163840,
+            embedding_dim=8192,
+            over_embedding_m=16476897,
+            hashes_per_order=4,
+            max_ngram_order=5,
+            tp_rank=3,
+            tp_size=8,
+            tp_group=tuple(range(8)),
+            ignored_token_ids=(2, 3),
+            eos_token_id=2,
+            fix_normalize_factor=False,
+        )
 
 
 class TestLongcatMixedFp8Config(unittest.TestCase):

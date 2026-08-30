@@ -45,6 +45,9 @@ from tokenspeed_kernel.ops.attention import (
 from tokenspeed_kernel.ops.attention.triton.capture_payload import (
     capture_replay_payload,
 )
+from tokenspeed_kernel.ops.attention.triton.linear.kda import (
+    kda_recurrent_decode_pool,
+)
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
 )
@@ -395,6 +398,8 @@ class KdaAttnBackend(MambaAttnBackend):
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         value_dim: int,
@@ -409,7 +414,7 @@ class KdaAttnBackend(MambaAttnBackend):
             raise ValueError(
                 "norm_weight and norm_eps are required with a KDA output gate"
             )
-        if f_a_out is None:
+        if f_a_out is None or not qk_l2norm_in_kernel:
             return None
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
@@ -465,6 +470,8 @@ class KdaAttnBackend(MambaAttnBackend):
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
         lower_bound: float | None,
         output_gate: torch.Tensor | None,
         norm_weight: torch.Tensor | None,
@@ -484,21 +491,39 @@ class KdaAttnBackend(MambaAttnBackend):
         g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
         beta_kda = beta_raw.view(1, seq_len, num_value_heads)
 
-        core_attn_out = kda_paged_decode(
-            query,
-            key,
-            value,
-            g_kda,
-            beta_kda,
-            A_log,
-            dt_bias,
-            state_pool=ssm_states,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            cu_seqlens=query_start_loc,
-            lower_bound=lower_bound,
-            recurrent_layout=self.kda_recurrent_layout,
-        )
+        if qk_l2norm_in_kernel:
+            core_attn_out = kda_paged_decode(
+                query,
+                key,
+                value,
+                g_kda,
+                beta_kda,
+                A_log,
+                dt_bias,
+                state_pool=ssm_states,
+                read_indices=read_indices,
+                write_indices=write_indices,
+                cu_seqlens=query_start_loc,
+                lower_bound=lower_bound,
+                recurrent_layout=self.kda_recurrent_layout,
+            )
+        else:
+            core_attn_out = kda_recurrent_decode_pool(
+                query,
+                key,
+                value,
+                g_kda,
+                beta_kda,
+                A_log,
+                dt_bias,
+                h_pool=ssm_states,
+                read_indices=read_indices,
+                write_indices=write_indices,
+                cu_seqlens=query_start_loc,
+                lower_bound=lower_bound,
+                beta_is_logit=beta_is_logit,
+                qk_l2norm_in_kernel=False,
+            )
         if output_gate is not None:
             core_attn_out = rmsnorm_gated_sigmoid(
                 core_attn_out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
@@ -792,6 +817,8 @@ class KdaAttnBackend(MambaAttnBackend):
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
@@ -834,7 +861,34 @@ class KdaAttnBackend(MambaAttnBackend):
                 "batch"
             )
 
-        kda_result = kda_paged_prefill(
+        if qk_l2norm_in_kernel:
+            kda_result = kda_paged_prefill(
+                query,
+                key,
+                value,
+                g_kda,
+                beta_kda,
+                A_log,
+                dt_bias,
+                initial_state=recurrent_state,
+                cu_seqlens=query_start_loc,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                lower_bound=lower_bound,
+                solution=None if self.kda_backend == "auto" else self.kda_backend,
+                recurrent_layout=self.kda_recurrent_layout,
+            )
+            return kda_result.out.squeeze(0), kda_result.final_state
+
+        if self.kda_recurrent_layout != "v_major":
+            raise NotImplementedError(
+                "FGBKDA currently requires V-major recurrent state"
+            )
+        state_rows = torch.arange(
+            query_start_loc.numel() - 1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        core_attn_out = kda_recurrent_decode_pool(
             query,
             key,
             value,
@@ -842,15 +896,15 @@ class KdaAttnBackend(MambaAttnBackend):
             beta_kda,
             A_log,
             dt_bias,
-            initial_state=recurrent_state,
+            h_pool=recurrent_state,
+            read_indices=state_rows,
+            write_indices=state_rows,
             cu_seqlens=query_start_loc,
-            cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
-            solution=None if self.kda_backend == "auto" else self.kda_backend,
-            recurrent_layout=self.kda_recurrent_layout,
+            beta_is_logit=beta_is_logit,
+            qk_l2norm_in_kernel=False,
         )
-
-        return kda_result.out.squeeze(0), kda_result.final_state
+        return core_attn_out.squeeze(0), recurrent_state
 
 
 class HybridKDABackend(HybridLinearAttnBackend):

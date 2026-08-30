@@ -67,6 +67,7 @@ _MLA_ARCHITECTURES = frozenset(
         "DeepseekV3ForCausalLM",
         "DeepseekV3ForCausalLMNextN",
         "Eagle3DeepseekV2ForCausalLM",
+        "FLASHLocalForCausalLM",
         "LongcatCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",

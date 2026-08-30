@@ -211,6 +211,8 @@ class EventLoop:
         self.max_total_num_tokens = geometry.token_capacity
         # Planning reads this every round; keep the value, not the handle.
         self._uses_eager_grammar = specs.uses_eager_grammar
+        self._request_prefix_lookback = specs.request_prefix_lookback
+        self._request_prefix_slot_owners: dict[int, str] = {}
         cache_groups = specs.cache_groups
         # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
@@ -999,6 +1001,7 @@ class EventLoop:
                         # KeyError on rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
+                        request_prefixes = self._gather_request_prefixes(forward_op)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
                             forward_op, grammar_inputs
@@ -1019,6 +1022,7 @@ class EventLoop:
                                 if self.model_config.is_multimodal_active
                                 else None
                             ),
+                            request_prefixes=request_prefixes,
                         )
                         # EPD invariant: handshaked items were filled by the
                         # async admission drain before admission; none may
@@ -1088,6 +1092,52 @@ class EventLoop:
             self.output_processor.rid_to_state[rid].sampling_params
             for rid in forward_op.request_ids
         ]
+
+    @staticmethod
+    def _bounded_request_prefix(state, boundary: int, lookback: int) -> tuple[int, ...]:
+        """Return at most ``lookback`` tokens ending at ``boundary``."""
+        begin = max(0, boundary - lookback)
+        prompt = state.prompt_input_ids
+        prompt_length = len(prompt)
+        if boundary <= prompt_length:
+            return tuple(prompt[begin:boundary])
+        output_end = boundary - prompt_length
+        if begin >= prompt_length:
+            return tuple(state.output_ids[begin - prompt_length : output_end])
+        return tuple(prompt[begin:] + state.output_ids[:output_end])
+
+    def _gather_request_prefixes(self, forward_op):
+        """Gather bounded model-owned prefix inputs for changed request slots."""
+        lookback = self._request_prefix_lookback
+        if lookback <= 0:
+            return None
+
+        prefixes = []
+        num_extends = forward_op.num_extends()
+        states = self.output_processor.rid_to_state
+        for index, (request_id, slot) in enumerate(
+            zip(forward_op.request_ids, forward_op.request_pool_indices)
+        ):
+            slot = int(slot)
+            if index >= num_extends and self._request_prefix_slot_owners.get(slot) == (
+                request_id
+            ):
+                continue
+            state = states[request_id]
+            boundary = (
+                int(forward_op.extend_prefix_lens[index])
+                if index < num_extends
+                else max(0, len(state.prompt_input_ids) + len(state.output_ids) - 1)
+            )
+            prefixes.append(
+                (
+                    slot,
+                    boundary,
+                    self._bounded_request_prefix(state, boundary, lookback),
+                )
+            )
+            self._request_prefix_slot_owners[slot] = request_id
+        return tuple(prefixes) or None
 
     def _gather_grammar_state(self, forward_op) -> GrammarStepInputs | None:
         """Build ``GrammarStepInputs`` for the current batch, or ``None``.

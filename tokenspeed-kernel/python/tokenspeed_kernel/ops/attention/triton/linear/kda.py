@@ -108,6 +108,8 @@ def kda_recurrent_decode_pool(
     write_indices: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    beta_is_logit: bool = True,
+    qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
     """Single-step decode KDA update with in-kernel state-pool addressing.
 
@@ -134,9 +136,9 @@ def kda_recurrent_decode_pool(
         write_indices,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=qk_l2norm_in_kernel,
         use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
+        use_beta_sigmoid_in_kernel=beta_is_logit,
     )
 
 

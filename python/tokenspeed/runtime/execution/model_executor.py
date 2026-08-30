@@ -429,6 +429,15 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        bind_model_runtime_inputs = getattr(
+            self.model_runner.model, "bind_model_runtime_inputs", None
+        )
+        if bind_model_runtime_inputs is not None:
+            bind_model_runtime_inputs(
+                input_buffers=self.input_buffers,
+                max_request_slots=config.max_req_pool_size,
+                history_capacity=config.physical_context_len,
+            )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -1297,6 +1306,7 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
+        request_prefixes=None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1354,6 +1364,21 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 out_loc_table=page_table,
             )
+            if request_prefixes:
+                stage_request_prefixes = getattr(
+                    self.model_runner.model, "stage_request_prefixes", None
+                )
+                if stage_request_prefixes is None:
+                    raise RuntimeError(
+                        "request prefixes were provided to a model without "
+                        "prefix staging support"
+                    )
+                slots, prefix_lengths, token_tails = zip(*request_prefixes)
+                stage_request_prefixes(
+                    req_pool_indices=slots,
+                    prefix_lengths=prefix_lengths,
+                    request_token_ids=token_tails,
+                )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
             ):

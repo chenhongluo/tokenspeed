@@ -373,10 +373,7 @@ class FLASHLocalConfig(PretrainedConfig):
         self.n_routed_experts = n_routed_experts
         if n_shared_experts is None:
             n_shared_experts = 1 if num_shared_experts is None else num_shared_experts
-        elif (
-            num_shared_experts is not None
-            and num_shared_experts != n_shared_experts
-        ):
+        elif num_shared_experts is not None and num_shared_experts != n_shared_experts:
             raise ValueError(
                 "Conflicting shared-expert counts: "
                 f"num_shared_experts={num_shared_experts}, "
@@ -431,7 +428,9 @@ class FLASHLocalConfig(PretrainedConfig):
         # oe_ignore_tokens: token ids excluded from OE n-gram hashing. Parsed
         # from ``special_token_scope`` (e.g. "0:4,36:55" -> [0,1,2,3,36,...,54]).
         # Only effective when ``ngram_exclude_sp_token`` is True.
-        self.oe_ignore_tokens: list[int] = _parse_special_token_scope(special_token_scope)
+        self.oe_ignore_tokens: list[int] = _parse_special_token_scope(
+            special_token_scope
+        )
         if self.use_over_embedding:
             self.over_embedding_m = int(vocab_size * ngram_vocab_size_ratio)
         self.oe_vocab_size_ratio = self.ngram_vocab_size_ratio
@@ -593,4 +592,3 @@ class FLASHLocalConfig(PretrainedConfig):
             math.prod(conv_state_shape) * conv_dtype.itemsize
             + math.prod(temporal_state_shape) * ssm_dtype.itemsize
         ) * len(mamba_layers)
-

@@ -20,6 +20,8 @@
 
 import json
 
+import torch
+
 
 def test_flash_kda_config_resolves_hybrid_layer_pattern() -> None:
     from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
@@ -60,7 +62,74 @@ def test_get_config_loads_flash_lite_without_model_type(tmp_path) -> None:
 
     assert isinstance(config, FLASHLocalConfig)
     assert config.num_hidden_layers == 28
+    assert config.hidden_act == "silu"
     assert config.num_experts == 384
     assert config.num_experts_per_token == 12
     assert config.over_embedding_m == 4_718_592
     assert config.oe_ignore_tokens == list(range(4)) + list(range(36, 55))
+
+
+def test_flash_kda_model_entry_is_registered() -> None:
+    from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
+    from tokenspeed.runtime.models.registry import ModelRegistry
+
+    model_cls, architecture = ModelRegistry.resolve_model_cls(["FLASHLocalForCausalLM"])
+
+    assert model_cls is FLASHLocalForCausalLM
+    assert architecture == "FLASHLocalForCausalLM"
+
+
+def test_flash_kda_registers_hybrid_mla_kda_attention() -> None:
+    from tokenspeed.runtime.configs import model_config
+    from tokenspeed.runtime.layers.attention import registry
+
+    architecture = "FLASHLocalForCausalLM"
+
+    assert architecture in model_config._MLA_ARCHITECTURES
+    assert architecture in registry._HYBRID_MLA_KDA_ARCHITECTURES
+
+
+def test_flash_kda_group_topk_uses_independent_global_expert_ranges() -> None:
+    from tokenspeed.runtime.models.flash_kda import _group_moe_topk
+
+    logits = torch.tensor(
+        [
+            [0.0, 2.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [0.0, 1.0, 2.0],
+            [1.0, 2.0, 0.0],
+        ]
+    )
+    bias = torch.zeros(6)
+    output = _group_moe_topk(
+        logits,
+        bias,
+        top_k=1,
+        moe_group_size=2,
+        zero_expert_num=1,
+        renormalize=False,
+        routed_scaling_factor=2.0,
+    )
+
+    assert output.topk_ids.tolist() == [[1], [0], [-1], [3]]
+    expected = logits.softmax(dim=-1).amax(dim=-1, keepdim=True) * 2.0
+    torch.testing.assert_close(output.topk_weights, expected)
+
+
+def test_flash_kda_maps_fgbkda_projection_weights_to_checkpoint_structure() -> None:
+    from tokenspeed.runtime.models.flash_kda import (
+        _canonical_flash_kda_weight_name,
+    )
+
+    assert (
+        _canonical_flash_kda_weight_name(
+            "model.layers.0.self_attn.linear_core.g_proj.0.weight"
+        )
+        == "model.layers.0.self_attn.g_proj.weight"
+    )
+    assert (
+        _canonical_flash_kda_weight_name(
+            "model.layers.0.self_attn.linear_core.b_proj.1.weight"
+        )
+        == "model.layers.0.self_attn.b_proj.fc2.weight"
+    )

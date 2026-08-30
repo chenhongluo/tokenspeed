@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable as _Iterable
 
 import torch
@@ -51,6 +52,12 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
+from tokenspeed.runtime.layers.over_embedding import (
+    LongCatOverEmbedding as _LongCatOverEmbedding,
+)
+from tokenspeed.runtime.layers.over_embedding import (
+    resolve_longcat_oe_hyperparameters as _resolve_longcat_oe_hyperparameters,
+)
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig as _QuantizationConfig,
 )
@@ -123,6 +130,24 @@ def _ensure_longcat_config(config):
         config.router_dtype = "float32"
     if not hasattr(config, "routed_scaling_factor"):
         config.routed_scaling_factor = 1.0
+
+    oe_ratio = getattr(config, "ngram_vocab_size_ratio", None)
+    if oe_ratio is None:
+        oe_ratio = getattr(config, "oe_vocab_size_ratio", None)
+    config.use_over_embedding = bool(
+        getattr(config, "use_over_embedding", False) or oe_ratio is not None
+    )
+    if config.use_over_embedding and getattr(config, "over_embedding_m", None) is None:
+        if oe_ratio is None:
+            raise ValueError(
+                "LongCat OE requires ngram_vocab_size_ratio or oe_vocab_size_ratio"
+            )
+        config.over_embedding_m = int(config.vocab_size * oe_ratio)
+    config.oe_ignore_tokens = list(
+        getattr(config, "oe_ignore_tokens", None)
+        or getattr(config, "oe_ignored_token_ids", None)
+        or []
+    )
 
     return config
 
@@ -588,13 +613,7 @@ class _RuntimeLongcatModel(nn.Module):
         self.padding_id = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = _VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
-        )
+        self.embed_tokens = self._build_embed_tokens(config)
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.layers = nn.ModuleList(
             [
@@ -612,6 +631,31 @@ class _RuntimeLongcatModel(nn.Module):
         self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: set[int] = set()
 
+    def _build_embed_tokens(self, config):
+        if not config.use_over_embedding:
+            return _VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                tp_rank=self.mapping.attn.tp_rank,
+                tp_size=self.mapping.attn.tp_size,
+                tp_group=self.mapping.attn.tp_group,
+            )
+
+        max_ngram_order, hashes_per_order = _resolve_longcat_oe_hyperparameters(config)
+        return _LongCatOverEmbedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            over_embedding_m=config.over_embedding_m,
+            hashes_per_order=hashes_per_order,
+            max_ngram_order=max_ngram_order,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+            ignored_token_ids=tuple(config.oe_ignore_tokens),
+            eos_token_id=getattr(config, "eos_token_id", None),
+            fix_normalize_factor=getattr(config, "ngram_fix_normalize_factor", False),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -622,6 +666,8 @@ class _RuntimeLongcatModel(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
             hidden_states = input_embeds
+        elif isinstance(self.embed_tokens, _LongCatOverEmbedding):
+            hidden_states = self.embed_tokens(input_ids, positions, ctx)
         else:
             hidden_states = self.embed_tokens(input_ids)
 
@@ -672,6 +718,43 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+        )
+        embed = self.model.embed_tokens
+        self.requires_request_prefix_tokens = isinstance(embed, _LongCatOverEmbedding)
+        self.request_prefix_lookback = (
+            embed.request_prefix_lookback if self.requires_request_prefix_tokens else 0
+        )
+
+    def bind_model_runtime_inputs(
+        self,
+        *,
+        input_buffers,
+        max_request_slots: int,
+        history_capacity: int,
+    ) -> None:
+        """Bind the shared OE layer to graph-stable executor inputs."""
+        if not self.requires_request_prefix_tokens:
+            return
+        self.model.embed_tokens.bind_runtime_inputs(
+            req_pool_indices=input_buffers.state_write_req_pool_indices_buf,
+            input_lengths=input_buffers.input_lengths_buf,
+            max_request_slots=max_request_slots,
+            history_capacity=history_capacity,
+            padding_req_pool_index=max_request_slots,
+        )
+
+    def stage_request_prefixes(
+        self,
+        *,
+        req_pool_indices,
+        prefix_lengths,
+        request_token_ids,
+    ) -> None:
+        """Stage bounded OE prefix inputs for the next model forward."""
+        self.model.embed_tokens.stage_prefixes(
+            req_pool_indices=req_pool_indices,
+            prefix_lengths=prefix_lengths,
+            request_token_ids=request_token_ids,
         )
 
     def resolve_model(
@@ -745,6 +828,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         )
 
         for name, loaded_weight in weights:
+            if ".mtp." in name or name.startswith("model.mtp."):
+                continue
             layer_id = _get_layer_id(name)
             if (
                 layer_id is not None
@@ -757,6 +842,15 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
+            embed = getattr(self.model, "embed_tokens", None)
+            if isinstance(embed, _LongCatOverEmbedding) and (
+                ".embed_tokens" in name
+                or ".oe_embed_tokens" in name
+                or ".oe_embed_proj" in name
+                or ".ngram_embeddings" in name
+            ):
+                if embed.load_weight(name, loaded_weight):
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -824,6 +918,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         self.post_load_weights()
 
     def post_load_weights(self):
+        embed = getattr(self.model, "embed_tokens", None)
+        if isinstance(embed, _LongCatOverEmbedding):
+            embed.validate_loaded_weights()
+
         for layer in self.model.layers:
             for self_attn in layer.self_attn:
                 if hasattr(
@@ -887,6 +985,29 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_input_embeddings(self) -> nn.Module:
+        """Return the word-only embedding used by a draft model."""
+        embed = self.model.embed_tokens
+        if isinstance(embed, _LongCatOverEmbedding):
+            return embed.word_embedding
+        return embed
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Skip MTP weights and non-local OE branches before shard loading."""
+        if ".mtp." in name or name.startswith("model.mtp."):
+            return False
+        embed = getattr(self.model, "embed_tokens", None)
+        if not isinstance(embed, _LongCatOverEmbedding):
+            return True
+        branch_match = re.search(
+            r"(?:oe_embed_(?:tokens|proj)|(?:embedders|post_projs)\.)(\d+)",
+            name,
+        )
+        if branch_match is None:
+            return True
+        branch_id = int(branch_match.group(1))
+        return any(fragment.branch_id == branch_id for fragment in embed.spec.fragments)
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

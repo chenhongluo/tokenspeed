@@ -76,6 +76,40 @@ if TYPE_CHECKING:
 _STATE_GROUP_ID = LINEAR_ATTENTION
 
 
+def apply_fgbkda_channel_beta(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta_channel_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply FGBKDA's post-convolution channel gate in training order."""
+
+    if query.numel() != beta_channel_logits.numel():
+        raise ValueError(
+            "FGBKDA beta shape must match Q: "
+            f"beta={tuple(beta_channel_logits.shape)}, q={tuple(query.shape)}"
+        )
+    if key.shape != query.shape or value.shape != query.shape:
+        raise ValueError(
+            "FGBKDA requires identical Q/K/V channel shapes, got "
+            f"q={tuple(query.shape)}, k={tuple(key.shape)}, v={tuple(value.shape)}"
+        )
+
+    def l2norm(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(x.float(), p=2.0, dim=-1, eps=1e-12).to(
+            x.dtype
+        )
+
+    beta = (
+        beta_channel_logits.float().sigmoid().add_(1e-10).sqrt_().to(query.dtype)
+    ).reshape_as(query)
+    return (
+        l2norm(query).contiguous(),
+        (l2norm(key) * beta).contiguous(),
+        (value * beta).contiguous(),
+    )
+
+
 def _mask_fresh_initial_state(
     recurrent_state: torch.Tensor,
     has_initial_states: torch.Tensor | None,
@@ -1440,6 +1474,9 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight = kwargs.get("f_b_weight")
         g_raw = kwargs.get("g_raw")
         beta_raw = kwargs.get("beta_raw")
+        beta_channel_raw = kwargs.get("beta_channel_raw")
+        beta_is_logit = kwargs.get("beta_is_logit", True)
+        qk_l2norm_in_kernel = beta_channel_raw is None
         output_gate = kwargs.get("output_gate")
         norm_weight = kwargs.get("norm_weight")
         norm_eps = kwargs.get("norm_eps")
@@ -1465,6 +1502,8 @@ class MambaAttnBackend(AttentionBackend):
             f_a_out=f_a_out,
             f_b_weight=f_b_weight,
             beta_raw=beta_raw,
+            beta_is_logit=beta_is_logit,
+            qk_l2norm_in_kernel=qk_l2norm_in_kernel,
             A_log=A_log,
             dt_bias=dt_bias,
             value_dim=value_dim,
@@ -1508,6 +1547,10 @@ class MambaAttnBackend(AttentionBackend):
         query = query.view(seq_len, 1, num_heads, head_k_dim)
         key = key.view(seq_len, 1, num_heads, head_k_dim)
         value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
+        if beta_channel_raw is not None:
+            query, key, value = apply_fgbkda_channel_beta(
+                query, key, value, beta_channel_raw
+            )
 
         return self._decode_scan(
             query,
@@ -1524,6 +1567,8 @@ class MambaAttnBackend(AttentionBackend):
             f_a_out=f_a_out,
             f_b_weight=f_b_weight,
             beta_raw=beta_raw,
+            beta_is_logit=beta_is_logit,
+            qk_l2norm_in_kernel=qk_l2norm_in_kernel,
             lower_bound=gate_lower_bound,
             output_gate=output_gate,
             norm_weight=norm_weight,
@@ -1542,6 +1587,8 @@ class MambaAttnBackend(AttentionBackend):
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         value_dim: int,
@@ -1604,6 +1651,8 @@ class MambaAttnBackend(AttentionBackend):
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
         lower_bound: float | None,
         output_gate: torch.Tensor | None,
         norm_weight: torch.Tensor | None,
@@ -1699,6 +1748,9 @@ class MambaAttnBackend(AttentionBackend):
         f_a_out = kwargs.get("f_a_out")
         f_b_weight = kwargs.get("f_b_weight")
         beta_raw = kwargs.get("beta_raw")
+        beta_channel_raw = kwargs.get("beta_channel_raw")
+        beta_is_logit = kwargs.get("beta_is_logit", True)
+        qk_l2norm_in_kernel = beta_channel_raw is None
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
@@ -1718,6 +1770,10 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc = self.forward_metadata.query_start_loc
 
         if is_target_verify:
+            if beta_channel_raw is not None:
+                raise NotImplementedError(
+                    "FGBKDA speculative verify is not implemented"
+                )
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
             )
@@ -1842,6 +1898,10 @@ class MambaAttnBackend(AttentionBackend):
             head_v=head_v_dim,
             replay=replay_inputs,
         )
+        if beta_channel_raw is not None:
+            query, key, value = apply_fgbkda_channel_beta(
+                query, key, value, beta_channel_raw
+            )
 
         if is_target_verify:
             core_attn_out = self._verify_scan(
@@ -1880,6 +1940,8 @@ class MambaAttnBackend(AttentionBackend):
                 f_a_out=f_a_out,
                 f_b_weight=f_b_weight,
                 beta_raw=beta_raw,
+                beta_is_logit=beta_is_logit,
+                qk_l2norm_in_kernel=qk_l2norm_in_kernel,
                 seq_len=seq_len,
                 num_real_tokens=num_real_tokens,
                 lower_bound=gate_lower_bound,
@@ -2070,6 +2132,8 @@ class MambaAttnBackend(AttentionBackend):
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
