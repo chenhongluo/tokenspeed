@@ -229,11 +229,54 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
 
 
 class TestLongcatZeroExpert(unittest.TestCase):
+    def test_zero_experts_select_precomputed_topk_moe_plan(self):
+        config = SimpleNamespace(
+            n_routed_experts=3,
+            zero_expert_num=1,
+            zero_expert_type="identity",
+            routed_scaling_factor=1.0,
+            hidden_act="silu",
+            moe_topk=2,
+            hidden_size=8,
+            moe_intermediate_size=16,
+            norm_topk_prob=False,
+        )
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=1,
+                ep_rank=0,
+                ep_size=1,
+            )
+        )
+        router = SimpleNamespace(e_score_correction_bias=torch.zeros(4))
+
+        with (
+            mock.patch.dict(
+                "tokenspeed.runtime.models.longcat_flash.global_server_args_dict",
+                {"ep_num_redundant_experts": 0, "enable_deep_ep": False},
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.longcat_flash._RuntimeLongcatRouter",
+                return_value=router,
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.longcat_flash._MoELayer"
+            ) as moe_layer,
+        ):
+            _RuntimeLongcatMoE(config, mapping)
+
+        self.assertEqual(
+            moe_layer.call_args.kwargs["routing_mode"],
+            "precomputed_topk",
+        )
+
     def test_identity_zero_expert_masks_and_adds_hidden_state(self):
         moe = object.__new__(_RuntimeLongcatMoE)
         moe.zero_expert_num = 1
         moe.n_routed_experts = 3
         moe.zero_expert_type = "identity"
+        moe.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_size=2))
         hidden_states = torch.tensor(
             [[2.0, 4.0], [6.0, 8.0]],
             dtype=torch.float32,
@@ -252,7 +295,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
 
         torch.testing.assert_close(
             zero_output,
-            torch.tensor([[1.5, 3.0], [3.0, 4.0]]),
+            torch.tensor([[0.75, 1.5], [1.5, 2.0]]),
         )
         torch.testing.assert_close(
             topk_output.topk_weights,

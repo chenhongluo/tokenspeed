@@ -270,6 +270,7 @@ class _RuntimeLongcatMoE(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             zero_expert_type=config.zero_expert_type,
+            routing_mode=("precomputed_topk" if config.zero_expert_num > 0 else None),
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
@@ -279,11 +280,6 @@ class _RuntimeLongcatMoE(nn.Module):
                 "routing_method_type": _RoutingMethodType.DeepSeekV3,
             },
         )
-        if config.zero_expert_num > 0 and self.experts.topk_output_format.is_bypassed():
-            raise ValueError(
-                "LongCat zero experts require a MoE backend that accepts "
-                "precomputed top-k ids. Launch with --moe-runner-backend triton."
-            )
         self.topk = _TopK(
             top_k=config.moe_topk,
             renormalize=config.norm_topk_prob,
@@ -326,7 +322,7 @@ class _RuntimeLongcatMoE(nn.Module):
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
                 hidden_states.dtype
             )
-            return hidden_states * zero_weight
+            return hidden_states * (zero_weight / self.mapping.moe.tp_ep_size)
         if self.zero_expert_type in ("", "drop"):
             return None
         raise ValueError(

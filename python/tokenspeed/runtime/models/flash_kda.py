@@ -470,6 +470,7 @@ class FLASHLocalMoE(nn.Module):
             ep_size=self.mapping.moe.ep_size,
             zero_expert_type=config.zero_expert_type,
             activation="silu",
+            routing_mode=("precomputed_topk" if config.zero_expert_num > 0 else None),
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
@@ -477,11 +478,6 @@ class FLASHLocalMoE(nn.Module):
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
         )
-        if config.zero_expert_num > 0 and self.experts.topk_output_format.is_bypassed():
-            raise ValueError(
-                "Flash-KDA zero experts require a MoE backend that accepts "
-                "precomputed top-k ids. Launch with --moe-runner-backend triton."
-            )
         # Shared expert: a dense SwiGLU MLP at the full hidden width. Its
         # row-parallel output remains partial until the layer-end reduction.
         self.shared_experts = DeepseekV3MLP(
