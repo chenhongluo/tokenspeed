@@ -154,6 +154,7 @@ def project_add_word_(
     projection: _torch.Tensor,
     *,
     scale: float,
+    bypass_mask: _torch.Tensor | None = None,
     solution: str | None = None,
 ) -> _torch.Tensor:
     """Project local OE fragments and merge them into word storage in place.
@@ -167,6 +168,8 @@ def project_add_word_(
         activation: Contiguous BF16 ``[M, K_local]`` lookup result.
         projection: Contiguous BF16 ``[K_local, hidden_size]`` packed weight.
         scale: Positive checkpoint normalization divisor.
+        bypass_mask: Optional bool tensor ``[M]``. Masked rows retain the
+            unscaled word embedding and must have zero OE activation.
         solution: Optional registered implementation name.
 
     Returns:
@@ -176,6 +179,16 @@ def project_add_word_(
     _, projection_k = activation.shape
     if num_rows == 0:
         return word_partial
+    if bypass_mask is not None:
+        if bypass_mask.dtype != _torch.bool:
+            raise ValueError("bypass_mask must have bool dtype")
+        if tuple(bypass_mask.shape) != (num_rows,):
+            raise ValueError(
+                f"bypass_mask must have shape ({num_rows},), got "
+                f"{tuple(bypass_mask.shape)}"
+            )
+        if bypass_mask.device != word_partial.device:
+            raise ValueError("bypass_mask must be on the word embedding device")
 
     signature = format_signature(
         word=dense_tensor_format(word_partial.dtype),
@@ -218,6 +231,7 @@ def project_add_word_(
             activation=activation,
             projection=projection,
             scale=scale,
+            bypass_mask=bypass_mask,
         )
     return word_partial
 

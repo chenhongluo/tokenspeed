@@ -605,6 +605,7 @@ class DSABackend(AttentionBackend):
             softmax_scale=layer.scaling,
             page_size=self.kernel_page_size,
             q_len_per_req=q_len_per_req,
+            request_seq_lens=seq_lens,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
         )

@@ -52,12 +52,24 @@ class DSATokenToKVPool(MLATokenToKVPool):
     }
 
     def get_kv_size_bytes(self):
-        return super().get_kv_size_bytes() + _get_tensor_size_bytes(self.index_k_buffer)
+        index_k_bytes = sum(
+            _get_tensor_size_bytes(buffer)
+            for buffer in self.index_k_buffer
+            if buffer is not None
+        )
+        return super().get_kv_size_bytes() + index_k_bytes
+
+    def _require_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        self._field_layer_id(layer_id)
+        buffer = self.index_k_buffer[layer_id]
+        if buffer is None:
+            raise ValueError(f"DSA layer {layer_id} has no Index-K plane")
+        return buffer
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
-        return self.index_k_buffer[layer_id]
+        return self._require_index_k_buffer(layer_id)
 
     def set_index_k_buffer(
         self,
@@ -76,7 +88,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ) -> None:
-        buf = self.index_k_buffer[layer_id]
+        buf = self._require_index_k_buffer(layer_id)
         index_k_fp8, index_k_scale = quantize_fp8_with_scale(
             index_k,
             granularity="token_group",

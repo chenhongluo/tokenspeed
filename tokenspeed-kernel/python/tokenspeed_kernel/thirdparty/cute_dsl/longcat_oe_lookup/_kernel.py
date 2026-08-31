@@ -42,6 +42,7 @@ class CuteLongCatOEAppendPackedLookup:
         fragment_configs: tuple[tuple[int, int, int], ...],
         ignored_token_ids: tuple[int, ...] = (),
         eos_token_id: int | None = None,
+        segment_ignored_tokens: bool = False,
         use_pdl: bool = False,
     ) -> None:
         if vocab_size <= 0:
@@ -75,6 +76,7 @@ class CuteLongCatOEAppendPackedLookup:
         self.local_fragments = len(fragment_configs)
         self.ignored_token_ids = ignored_token_ids
         self.eos_token_id = -1 if eos_token_id is None else eos_token_id
+        self.segment_ignored_tokens = segment_ignored_tokens
         self.use_pdl = use_pdl
         self.ngram_order0, self.modulus0, self.feature_width0 = padded_configs[0]
         self.ngram_order1, self.modulus1, self.feature_width1 = padded_configs[1]
@@ -182,7 +184,10 @@ class CuteLongCatOEAppendPackedLookup:
                 if not boundary_reached:
                     ignored = self._is_ignored(token)
                     if ignored:
-                        invalid = cutlass.Boolean(True)
+                        if cutlass.const_expr(self.segment_ignored_tokens):
+                            boundary_reached = cutlass.Boolean(True)
+                        else:
+                            invalid = cutlass.Boolean(True)
                     else:
                         acc = acc + cutlass.Int64(token) * cutlass.Int64(powers[delta])
             else:
@@ -195,7 +200,10 @@ class CuteLongCatOEAppendPackedLookup:
                     if not boundary_reached:
                         ignored = self._is_ignored(token)
                         if ignored:
-                            invalid = cutlass.Boolean(True)
+                            if cutlass.const_expr(self.segment_ignored_tokens):
+                                boundary_reached = cutlass.Boolean(True)
+                            else:
+                                invalid = cutlass.Boolean(True)
                         else:
                             acc = acc + cutlass.Int64(token) * cutlass.Int64(
                                 powers[delta]
@@ -283,6 +291,12 @@ class CuteLongCatOEAppendPackedLookup:
                     self.modulus2,
                     self.powers2,
                 )
+            if (
+                active
+                and cutlass.const_expr(self.segment_ignored_tokens)
+                and self._is_ignored(input_ids[token_index])
+            ):
+                request_active[0] = cutlass.Int32(0)
         cute.arch.sync_threads()
 
         row = cutlass.Int64(selected_row[0])

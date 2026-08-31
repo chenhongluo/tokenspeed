@@ -33,6 +33,67 @@ _RADIX_TOPK_BLOCK_N = 4096
 
 
 @triton.jit
+def _mark_forced_initial_local_logits_kernel(
+    logits_ptr,
+    logits_row_stride,
+    causal_lens_ptr,
+    num_cols: tl.constexpr,
+    initial_tokens: tl.constexpr,
+    local_tokens: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    causal_len = tl.load(causal_lens_ptr + row).to(tl.int32)
+    initial_end = tl.minimum(causal_len, initial_tokens)
+    local_start = tl.maximum(initial_end, causal_len - local_tokens)
+    forced = (cols < initial_end) | ((cols >= local_start) & (cols < causal_len))
+    tl.store(
+        logits_ptr + row * logits_row_stride + cols,
+        float("inf"),
+        mask=(cols < num_cols) & forced,
+    )
+
+
+def mark_forced_initial_local_logits(
+    logits: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    initial_tokens: int,
+    local_tokens: int,
+) -> None:
+    """Force LongCat sequence-start and causal-tail candidates into top-k."""
+
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        raise ValueError("logits must be a 2-D tensor with unit column stride")
+    if causal_lens.shape != (logits.shape[0],):
+        raise ValueError(
+            f"causal_lens must have shape ({logits.shape[0]},), got "
+            f"{tuple(causal_lens.shape)}"
+        )
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if logits.numel() == 0 or initial_tokens + local_tokens == 0:
+        return
+    causal_lens = causal_lens.to(device=logits.device, dtype=torch.int32).contiguous()
+    block = 256
+    _mark_forced_initial_local_logits_kernel[
+        (logits.shape[0], triton.cdiv(logits.shape[1], block))
+    ](
+        logits,
+        logits.stride(0),
+        causal_lens,
+        num_cols=logits.shape[1],
+        initial_tokens=int(initial_tokens),
+        local_tokens=int(local_tokens),
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit
 def _local_topk_to_global_slots_kernel(
     global_topk_slots_ptr,
     global_topk_slots_stride,

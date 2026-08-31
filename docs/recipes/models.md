@@ -6,6 +6,38 @@ set only the parameters that change runtime behavior.
 The commands below are templates. Validate exact model IDs, checkpoint formats,
 and backend choices against the build you deploy.
 
+## LongCat
+
+TokenSpeed selects the LongCat runtime from the checkpoint architecture:
+
+- `LongcatCausalLM` enables LongCat 2.0 paired-layer LSA/Indexer and consumes
+  over-embedding metadata from the checkpoint.
+- `LongcatFlashForCausalLM` keeps the dense MLA LongCat path.
+- `FLASHLocalForCausalLM` enables the Flash-Lite hybrid KDA/MLA and grouped-MoE
+  path, including its special-token over-embedding policy.
+
+Representative launch shapes are:
+
+```bash
+# LongCat Flash-Lite
+tokenspeed serve /path/to/longcat-flash-lite \
+  --tensor-parallel-size 4 \
+  --attention-backend trtllm_mla \
+  --moe-backend triton
+
+# LongCat 2.0
+tokenspeed serve /path/to/longcat-2.0 \
+  --tensor-parallel-size 8 \
+  --moe-tp-size 8 \
+  --attention-backend trtllm_mla \
+  --moe-backend flashinfer_trtllm \
+  --kv-cache-dtype fp8
+```
+
+For LongCat 2.0, `trtllm_mla` remains the dense MLA delegate inside the LSA
+backend; sparse selection is configured from the checkpoint and does not need
+a separate scheduler option.
+
 ## Inkling
 
 Blog: https://lightseek.org/blog/tokenspeed-inkling.html

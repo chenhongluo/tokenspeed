@@ -142,6 +142,7 @@ class LongCatOverEmbedding(nn.Module):
         params_dtype: torch.dtype | None = None,
         ignored_token_ids: tuple[int, ...] = (),
         eos_token_id: int | None = None,
+        segment_ignored_tokens: bool = False,
         fix_normalize_factor: bool = False,
     ) -> None:
         super().__init__()
@@ -164,6 +165,7 @@ class LongCatOverEmbedding(nn.Module):
             self.spec,
             ignored_token_ids=tuple(dict.fromkeys(ignored_token_ids)),
             eos_token_id=eos_token_id,
+            segment_ignored_tokens=segment_ignored_tokens,
         )
         self.normalize_scale = (
             math.sqrt(self.spec.scale)
@@ -234,6 +236,11 @@ class LongCatOverEmbedding(nn.Module):
         self.register_buffer(
             "_active_request_mask",
             torch.empty(0, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ignored_token_ids",
+            torch.tensor(self.spec.ignored_token_ids, dtype=torch.int32),
             persistent=False,
         )
         self.register_buffer(
@@ -360,19 +367,28 @@ class LongCatOverEmbedding(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         batch_size: int,
+        num_extends: int,
+        decode_width: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.history_token_ids.numel() == 0:
             raise RuntimeError("OE runtime inputs must be bound before forward")
         if batch_size <= 0:
             raise ValueError("OE forward requires a non-empty request batch")
+        if not 0 <= num_extends <= batch_size:
+            raise ValueError(
+                f"OE num_extends must be in [0, {batch_size}], got {num_extends}"
+            )
+        if decode_width <= 0:
+            raise ValueError(f"OE decode width must be positive, got {decode_width}")
 
         rows = self._req_pool_indices[:batch_size]
         active = self._active_request_mask[:batch_size]
         torch.ne(rows, self._padding_req_pool_index, out=active)
         lengths = self._effective_input_lengths[:batch_size]
         lengths.copy_(self._input_lengths[:batch_size])
-        lengths.masked_fill_(~active, 0)
-        lengths[-1].add_(input_ids.numel() - lengths.sum())
+        # Decode lengths track committed tokens, while target verification packs
+        # a fixed-width candidate block for every row, including graph padding.
+        lengths[num_extends:].fill_(decode_width)
         offsets = self._input_start_offsets[: batch_size + 1]
         offsets[0].zero_()
         torch.cumsum(lengths, dim=0, out=offsets[1:])
@@ -505,10 +521,21 @@ class LongCatOverEmbedding(nn.Module):
     ) -> torch.Tensor:
         if input_ids.numel() == 0:
             return self.word_embedding(input_ids)
+        decode_width = max(
+            int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1),
+            1,
+        )
         offsets, req_pool_indices, active_request_mask = self._prepare_history(
-            input_ids, positions, int(ctx.bs)
+            input_ids,
+            positions,
+            int(ctx.bs),
+            int(ctx.num_extends),
+            decode_width,
         )
         word_partial = self.word_embedding(input_ids, reduce_results=False)
+        bypass_mask = None
+        if self.spec.segment_ignored_tokens and self.spec.ignored_token_ids:
+            bypass_mask = torch.isin(input_ids, self._ignored_token_ids)
         activation = append_packed_lookup_(
             input_ids,
             offsets,
@@ -525,6 +552,7 @@ class LongCatOverEmbedding(nn.Module):
             activation,
             self.projection,
             scale=self.normalize_scale,
+            bypass_mask=bypass_mask,
         )
         if self.tp_size > 1:
             local_partial = all_reduce(local_partial, self.tp_group)

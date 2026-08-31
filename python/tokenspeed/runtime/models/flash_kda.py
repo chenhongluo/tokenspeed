@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+from tokenspeed_kernel.ops.moe.cuda import (
+    moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
+)
 from tokenspeed_kernel.ops.moe.triton.group_moe import (
     group_moe_proj_output as _group_moe_proj_output,
 )
@@ -34,9 +37,6 @@ from tokenspeed_kernel.ops.moe.triton.group_moe import (
 )
 from tokenspeed_kernel.ops.moe.triton.group_moe import rmsnorm_scale as _rmsnorm_scale
 from tokenspeed_kernel.platform import pdl_enabled as _pdl_enabled
-from tokenspeed_kernel.thirdparty.cuda import (
-    moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
-)
 from torch import nn
 from transformers import PretrainedConfig as _PretrainedConfig
 
@@ -103,9 +103,25 @@ _OPTIONAL_MISSING_WEIGHT_SUFFIXES = (
 
 
 def _canonical_flash_kda_weight_name(name: str) -> str:
-    """Map Megatron / legacy Flash-KDA checkpoint names to runtime names."""
+    """Map Megatron / legacy Flash-KDA checkpoint names to runtime names.
+
+    A checkpoint key may need both a top-level Megatron rewrite and a nested
+    Flash-KDA rewrite, so all matching replacements are applied in sequence.
+    """
 
     replacements = [
+        (
+            "language_model.embedding.word_embeddings.weight",
+            "model.embed_tokens.weight",
+        ),
+        ("language_model.output_layer.weight", "lm_head.weight"),
+        ("language_model.decoder.final_layernorm.weight", "model.norm.weight"),
+        ("language_model.encoder.final_layernorm.weight", "model.norm.weight"),
+        ("language_model.decoder.layers.", "model.layers."),
+        ("language_model.encoder.layers.", "model.layers."),
+        (".input_layernorm.m.", ".input_layernorm."),
+        (".post_attention_layernorm.m.", ".post_attention_layernorm."),
+        (".self_attention.", ".self_attn."),
         (".mlp.", ".moe."),
         (".self_attn.linear_core.f_proj.0.", ".self_attn.f_proj.fc1."),
         (".self_attn.linear_core.f_proj.1.", ".self_attn.f_proj.fc2."),
@@ -222,6 +238,34 @@ def _parse_flash_kda_router_name(name: str) -> tuple[int, str] | None:
     return layer_id, name.split(marker, 1)[1]
 
 
+def _load_flash_kda_router_correction_bias(
+    moe: "FLASHLocalMoE",
+    loaded_weight: torch.Tensor,
+) -> None:
+    """Load a full-width or shared per-group router correction bias."""
+
+    bias = moe.router.e_score_correction_bias
+    groups = moe.moe_group_size
+    logits_per_group = moe.n_routed_experts + moe.zero_expert_num
+    full_shape = (groups * logits_per_group,)
+    loaded_shape = tuple(loaded_weight.shape)
+    if tuple(bias.shape) != full_shape:
+        raise ValueError(
+            "Flash-KDA router correction bias target has shape "
+            f"{tuple(bias.shape)}, expected {full_shape}."
+        )
+    if loaded_shape == (logits_per_group,):
+        loaded_weight = loaded_weight.repeat(groups)
+    elif loaded_shape != full_shape:
+        raise ValueError(
+            "Flash-KDA router correction bias checkpoint tensor has shape "
+            f"{loaded_shape}, expected {(logits_per_group,)} (shared per group) "
+            f"or {full_shape} (full width)."
+        )
+    with torch.no_grad():
+        bias.copy_(loaded_weight)
+
+
 def _get_flash_kda_moe_quant_config(
     config: _PretrainedConfig,
     quant_config: QuantizationConfig | None,
@@ -235,9 +279,10 @@ def _get_flash_kda_moe_quant_config(
         return quant_config
 
     expert_proj_names = ("gate_proj", "up_proj", "down_proj")
-    num_expected = config.n_routed_experts * len(expert_proj_names)
+    num_experts = config.n_routed_experts * config.moe_group_size
+    num_expected = num_experts * len(expert_proj_names)
     num_ignored = 0
-    for expert_id in range(config.n_routed_experts):
+    for expert_id in range(num_experts):
         expert_prefix = add_prefix(f"experts.{expert_id}", prefix)
         for proj_name in expert_proj_names:
             from tokenspeed.runtime.layers.quantization.utils import (
@@ -527,7 +572,7 @@ class FLASHLocalMoE(nn.Module):
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
                 hidden_states.dtype
             )
-            return hidden_states * zero_weight
+            return hidden_states * (zero_weight / self.mapping.moe.tp_ep_size)
         if self.zero_expert_type in ("", "drop"):
             return None
         raise ValueError(
@@ -1104,6 +1149,7 @@ class FLASHLocalDecoderLayer(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
+        capture_hidden_state: Callable[[torch.Tensor], None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
@@ -1124,6 +1170,8 @@ class FLASHLocalDecoderLayer(nn.Module):
         hidden_states, residual = self.moe_comm.input_reduce_norm(
             hidden_states, residual
         )
+        if capture_hidden_state is not None:
+            capture_hidden_state(self.moe_comm.gather_residual(residual, ctx).clone())
         attn_out = self._forward_attn(positions, hidden_states, ctx, out_cache_loc)
         hidden_states, residual = self.moe_comm.post_attn_reduce_norm(
             attn_out, residual, ctx
@@ -1209,6 +1257,7 @@ class FLASHLocalModel(nn.Module):
         # split_num is the number of hash branches per order. LongCat-2.0 uses
         # neighbor=5 and split=4, producing (5-1)*4 = 16 branches.
         max_ngram_order, hashes_per_order = resolve_longcat_oe_hyperparameters(config)
+        exclude_special_tokens = getattr(config, "ngram_exclude_sp_token", False)
         return LongCatOverEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -1218,8 +1267,11 @@ class FLASHLocalModel(nn.Module):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
-            ignored_token_ids=tuple(config.oe_ignore_tokens),
+            ignored_token_ids=(
+                tuple(config.oe_ignore_tokens) if exclude_special_tokens else ()
+            ),
             eos_token_id=getattr(config, "eos_token_id", None),
+            segment_ignored_tokens=exclude_special_tokens,
             fix_normalize_factor=getattr(config, "ngram_fix_normalize_factor", False),
         )
 
@@ -1242,10 +1294,9 @@ class FLASHLocalModel(nn.Module):
         aux_hidden_states = [] if self.layers_to_capture else None
         layer = None
         for layer_id, layer in enumerate(self.layers):
+            capture_hidden_state = None
             if aux_hidden_states is not None and layer_id in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+                capture_hidden_state = aux_hidden_states.append
             with get_global_expert_distribution_recorder().with_current_layer(layer_id):
                 hidden_states, residual = layer(
                     positions,
@@ -1253,6 +1304,7 @@ class FLASHLocalModel(nn.Module):
                     ctx,
                     out_cache_loc,
                     residual,
+                    capture_hidden_state=capture_hidden_state,
                 )
 
         if not ctx.forward_mode.is_idle() and layer is not None:
@@ -1464,16 +1516,15 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                             param.copy_(loaded_weight)
                         continue
                 if field == "e_score_correction_bias":
-                    param = moe.router.e_score_correction_bias
-                    if param.shape == loaded_weight.shape:
-                        with torch.no_grad():
-                            param.copy_(loaded_weight)
-                        continue
+                    _load_flash_kda_router_correction_bias(moe, loaded_weight)
+                    continue
 
-            if name.endswith(".g_proj.fc2.bias") and name not in params_dict:
-                # KDA checkpoints may carry g_proj.1.bias, while FGBKDA keeps
-                # g_proj.1 bias-free. Skip the bias quietly when the runtime is
-                # configured for the FGBKDA structure.
+            if name.endswith((".g_proj.fc2.weight", ".g_proj.fc2.bias")) and (
+                name not in params_dict
+            ):
+                # FGBKDA uses the first g projection directly; checkpoints may
+                # still carry the unused second projection from the generic KDA
+                # module layout.
                 continue
 
             # OE (n-gram over-embedding) weights: route to the branch-local layer
@@ -1599,18 +1650,13 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         self.post_load_weights()
 
     def post_load_weights(self):
-        """Prepare the absorbed MLA weights, KDA conv weight banks, and the
-        per-group router correction bias.
+        """Prepare the absorbed MLA weights and KDA convolution weight banks.
 
         Flash-KDA's attention is unquantized (MXFP4 ignores ``self_attn.*``), so
         ``kv_b_proj.weight`` is bf16 and no block dequant is needed — mirrors
         Kimi-K3's post_load_weights. KDA layers have no ``kv_b_proj`` (not
         ``KimiLinearMLAAttention``) and are skipped.
 
-        The Multi-Group-Head router keeps its correction bias at full width
-        ``[G * E_per_group]``. If the checkpoint stored it as a single
-        per-group slice ``[E_per_group]`` (the LongcatRouter convention),
-        tile it G times here so the per-group TopK sees one bias per group.
         """
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 
@@ -1636,24 +1682,6 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                     ) ** 0.5
             elif isinstance(self_attn, SeperateFLASHLocal):
                 self_attn.fuse_conv_weights()
-
-        # Tile the per-group router correction bias to full width if the
-        # checkpoint shipped it as a single per-group slice.
-        for layer in self.model.layers:
-            moe = getattr(layer, "moe", None)
-            if moe is None or not hasattr(moe, "router"):
-                continue
-            bias = moe.router.e_score_correction_bias
-            g = moe.moe_group_size
-            e_per_group = moe.n_routed_experts + moe.zero_expert_num
-            if bias.shape[0] == e_per_group and g > 1:
-                bias.data = bias.data.repeat(g)
-            elif bias.shape[0] != g * e_per_group:
-                raise ValueError(
-                    f"Flash-KDA router correction bias has shape {tuple(bias.shape)}; "
-                    f"expected either [{e_per_group}] (per-group, tiled) or "
-                    f"[{g * e_per_group}] (full width)."
-                )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         tp_size = self.mapping.attn.tp_size
@@ -1682,10 +1710,8 @@ class FLASHLocalForCausalLM(BaseCausalLM):
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens
-        # When OE is enabled, ``embed_tokens`` is a ``LongCatOverEmbedding``
-        # (word + n-gram tables) which has no ``.weight`` attribute; the
-        # weight-tying surface is only the regular word table. The OE tables
-        # / projection are not tied to ``lm_head``.
+        # Only the regular word table participates in weight tying; the OE
+        # tables and projection remain model-local.
         if isinstance(embed, LongCatOverEmbedding):
             return embed.word_embedding.weight, self.lm_head.weight
         return embed.weight, self.lm_head.weight
@@ -1713,12 +1739,6 @@ class FLASHLocalForCausalLM(BaseCausalLM):
 
     def set_embed_and_head(self, embed, head):
         embed_module = self.model.embed_tokens
-        if isinstance(embed_module, LongCatOverEmbedding):
-            target = embed_module.word_embedding.weight
-        else:
-            target = embed_module.weight
-        del target
-        del self.lm_head.weight
         if isinstance(embed_module, LongCatOverEmbedding):
             embed_module.word_embedding.weight = embed
         else:

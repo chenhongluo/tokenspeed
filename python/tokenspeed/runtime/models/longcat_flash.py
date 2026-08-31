@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable as _Callable
 from collections.abc import Iterable as _Iterable
+from functools import partial as _partial
 
 import torch
 import torch.nn as nn
@@ -80,6 +82,12 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3MLP
+from tokenspeed.runtime.models.longcat_dsa import (
+    LongCatDSAAttention as _LongCatDSAAttention,
+)
+from tokenspeed.runtime.models.longcat_dsa import (
+    LongCatDSAIndexerWeightLoaderMixin as _LongCatDSAIndexerWeightLoaderMixin,
+)
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
 )
@@ -380,11 +388,13 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        uses_lsa: bool = False,
     ) -> None:
         super().__init__()
         self.mapping = mapping
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
+        self.uses_lsa = uses_lsa
 
         rope_theta = _get_rope_theta(config)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -394,7 +404,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
         self.self_attn = nn.ModuleList(
             [
-                _DeepseekV3AttentionMLA(
+                (_LongCatDSAAttention if self.uses_lsa else _DeepseekV3AttentionMLA)(
                     config=config,
                     hidden_size=self.hidden_size,
                     num_heads=config.num_attention_heads,
@@ -416,6 +426,17 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                     reduce_attn_results=False,
                     alt_stream=alt_stream,
                     mapping=self.mapping,
+                    **(
+                        {
+                            "computes_selection": branch_id == 0,
+                            "selection_owner_layer_id": layer_id * 2,
+                            "initial_tokens": config.index_init_tokens,
+                            "local_tokens": config.index_local_tokens,
+                            "lora_norm_eps": config.rms_norm_eps,
+                        }
+                        if self.uses_lsa
+                        else {}
+                    ),
                 )
                 for branch_id in range(2)
             ]
@@ -513,6 +534,37 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         )
         return hidden_states, residual
 
+    def _forward_attention(
+        self,
+        branch_id: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: _ForwardContext,
+        out_cache_loc: torch.Tensor,
+        comm_manager: _CommManager,
+        selection,
+    ):
+        attention = self.self_attn[branch_id]
+        if self.uses_lsa:
+            return attention.forward_with_selection(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                out_cache_loc=out_cache_loc,
+                comm_manager=comm_manager,
+                selection=selection,
+            )
+        return (
+            attention(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                out_cache_loc=out_cache_loc,
+                comm_manager=comm_manager,
+            ),
+            selection,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -520,6 +572,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         ctx: _ForwardContext,
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
+        capture_hidden_state: _Callable[[torch.Tensor], None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
@@ -537,12 +590,16 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
-        hidden_states = self.self_attn[0](
-            positions=positions,
-            hidden_states=hidden_states,
-            ctx=ctx,
-            out_cache_loc=out_cache_loc,
-            comm_manager=self.moe_comm,
+        if capture_hidden_state is not None:
+            capture_hidden_state(self.moe_comm.gather_residual(residual, ctx).clone())
+        hidden_states, selection = self._forward_attention(
+            0,
+            positions,
+            hidden_states,
+            ctx,
+            out_cache_loc,
+            self.moe_comm,
+            None,
         )
         hidden_states, residual = self.moe_comm.post_attn_reduce_norm(
             hidden_states,
@@ -570,12 +627,14 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
-        hidden_states = self.self_attn[1](
-            positions=positions,
-            hidden_states=hidden_states,
-            ctx=ctx,
-            out_cache_loc=out_cache_loc,
-            comm_manager=self.branch_comm[1],
+        hidden_states, _ = self._forward_attention(
+            1,
+            positions,
+            hidden_states,
+            ctx,
+            out_cache_loc,
+            self.branch_comm[1],
+            selection,
         )
         hidden_states, residual = self.branch_comm[1].post_attn_reduce_norm(
             hidden_states,
@@ -595,6 +654,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
 class _RuntimeLongcatModel(nn.Module):
     fall_back_to_pt_during_load = False
+    uses_lsa = False
 
     def __init__(
         self,
@@ -620,12 +680,17 @@ class _RuntimeLongcatModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    uses_lsa=self.uses_lsa,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
         self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: set[int] = set()
+        self._dflash_capture_idx_map: dict[int, int] = {}
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs: list[torch.Tensor] | None = None
+        self._dflash_incr_active = False
 
     def _build_embed_tokens(self, config):
         if not config.use_over_embedding:
@@ -652,6 +717,27 @@ class _RuntimeLongcatModel(nn.Module):
             fix_normalize_factor=getattr(config, "ngram_fix_normalize_factor", False),
         )
 
+    def _capture_hidden_state(
+        self,
+        capture_layer: int,
+        captured: torch.Tensor,
+        *,
+        aux_hidden_states: list[torch.Tensor],
+    ) -> None:
+        aux_hidden_states.append(captured)
+
+        capture_idx = self._dflash_capture_idx_map.get(capture_layer)
+        if (
+            not self._dflash_incr_active
+            or capture_idx is None
+            or self._dflash_incremental_callback is None
+            or self._dflash_slot_bufs is None
+        ):
+            return
+        num_tokens = captured.shape[0]
+        self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
+        self._dflash_incremental_callback(capture_idx, num_tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -671,9 +757,12 @@ class _RuntimeLongcatModel(nn.Module):
         aux_hidden_states = [] if self.layers_to_capture else None
         layer = None
         for layer_id, layer in enumerate(self.layers):
+            capture_hidden_state = None
             if aux_hidden_states is not None and layer_id in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                capture_hidden_state = _partial(
+                    self._capture_hidden_state,
+                    layer_id,
+                    aux_hidden_states=aux_hidden_states,
                 )
             with _get_global_expert_distribution_recorder().with_current_layer(
                 layer_id
@@ -684,16 +773,35 @@ class _RuntimeLongcatModel(nn.Module):
                     ctx,
                     out_cache_loc,
                     residual,
+                    capture_hidden_state=capture_hidden_state,
                 )
 
         if not ctx.forward_mode.is_idle() and layer is not None:
-            hidden_states, _ = layer.final_norm_comm.final_norm(
+            hidden_states, final_residual = layer.final_norm_comm.final_norm(
                 hidden_states,
                 residual,
                 ctx,
                 self.norm,
             )
+            final_capture_layer = len(self.layers)
+            if (
+                aux_hidden_states is not None
+                and final_residual is not None
+                and final_capture_layer in self.layers_to_capture
+            ):
+                captured = layer.final_norm_comm.gather_residual(
+                    final_residual, ctx
+                ).clone()
+                self._capture_hidden_state(
+                    final_capture_layer,
+                    captured,
+                    aux_hidden_states=aux_hidden_states,
+                )
         return hidden_states, aux_hidden_states
+
+
+class _RuntimeLongcatDSAModel(_RuntimeLongcatModel):
+    uses_lsa = True
 
 
 class LongcatFlashForCausalLM(_BaseCausalLM):
@@ -790,6 +898,33 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         else:
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        """Capture LongCat layer outputs, including the final decoder layer."""
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [layer_id for layer_id in layer_ids if not 0 <= layer_id < num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to LongCat layer outputs. "
+                f"Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 1}] for {num_layers} target layers."
+            )
+
+        self.capture_aux_hidden_states = True
+        capture_layers = sorted(layer_id + 1 for layer_id in layer_ids)
+        self.model.layers_to_capture = set(capture_layers)
+        self.model._dflash_capture_idx_map = {
+            layer_id: capture_idx for capture_idx, layer_id in enumerate(capture_layers)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
+
     def get_param(self, params_dict, name):
         if name in params_dict:
             return params_dict[name]
@@ -811,6 +946,17 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         ]
         fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
+        indexer_loader = (
+            _LongCatDSAIndexerWeightLoaderMixin()
+            if isinstance(self.model, _RuntimeLongcatDSAModel)
+            else None
+        )
+        pending_fp8_index_k: dict[str, dict[str, torch.Tensor]] = {}
+        loaded_indexer_shards: dict[str, set[int]] = {}
+        indexer_weight_block_size = getattr(
+            self.quant_config, "weight_block_size", None
+        )
         moe_loader = _build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=_ExpertCheckpointSchema(
@@ -846,6 +992,23 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 or ".ngram_embeddings" in name
             ):
                 if embed.load_weight(name, loaded_weight):
+                    continue
+            if ".indexer." in name:
+                if indexer_loader is None:
+                    continue
+                if ".self_attn.1.indexer." in name:
+                    raise RuntimeError(
+                        f"LongCat DSA consumer must not own Indexer weight {name}"
+                    )
+                if indexer_loader.try_load_indexer_projection(
+                    name=name,
+                    loaded_weight=loaded_weight,
+                    params=params_dict,
+                    modules=modules_dict,
+                    pending_fp8=pending_fp8_index_k,
+                    loaded_shards=loaded_indexer_shards,
+                    weight_block_size=indexer_weight_block_size,
+                ):
                     continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -911,6 +1074,12 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 weight_loader = getattr(param, "weight_loader", _default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        if indexer_loader is not None:
+            indexer_loader.validate_indexer_projections(
+                modules=modules_dict,
+                pending_fp8=pending_fp8_index_k,
+                loaded_shards=loaded_indexer_shards,
+            )
         self.post_load_weights()
 
     def post_load_weights(self):
@@ -1006,9 +1175,11 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         return any(fragment.branch_id == branch_id for fragment in embed.spec.fragments)
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
+        embed_module = self.model.embed_tokens
+        if isinstance(embed_module, _LongCatOverEmbedding):
+            embed_module.word_embedding.weight = embed
+        else:
+            embed_module.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -1025,6 +1196,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
 class LongcatCausalLM(LongcatFlashForCausalLM):
     """LongCat-2.0 causal language model entry point."""
+
+    model_cls = _RuntimeLongcatDSAModel
 
 
 FLASHForCausalLM = LongcatFlashForCausalLM

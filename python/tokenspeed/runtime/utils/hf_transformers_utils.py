@@ -95,6 +95,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
 
 _ARCHITECTURE_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "FLASHLocalForCausalLM": FLASHLocalConfig,
+    "LongcatCausalLM": LongcatConfig,
 }
 
 
@@ -548,6 +549,10 @@ _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
     }
 )
 
+_MISTRAL_REGEX_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
+    {"FLASHLocalForCausalLM", "LongcatCausalLM"}
+)
+
 
 def prefers_verbatim_fast_tokenizer(architectures: list[str] | None) -> bool:
     """True if the model's architectures warrant bypassing AutoTokenizer and
@@ -763,6 +768,10 @@ def get_tokenizer(
         auto_tokenizer_kwargs = dict(kwargs)
         if auto_tokenizer_revision is not None:
             auto_tokenizer_kwargs["revision"] = auto_tokenizer_revision
+        if architectures and not _MISTRAL_REGEX_TOKENIZER_ARCHITECTURES.isdisjoint(
+            architectures
+        ):
+            auto_tokenizer_kwargs.setdefault("fix_mistral_regex", True)
 
         try:
             loaded_tokenizer = AutoTokenizer.from_pretrained(

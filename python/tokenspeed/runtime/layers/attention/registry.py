@@ -293,7 +293,20 @@ def _create_attn_backend(
     arch: AttentionArch,
     config: BaseAttnConfig,
 ) -> AttentionBackend:
-    return _get_backend_cls(config.backend_name, arch)(config)
+    # LongCat LSA owns Index-K only on paired physical layers. Its DSA wrapper
+    # already contains the TRT-LLM MLA dense delegate, so keep an explicit
+    # dense selection inside that wrapper. Other DSA families retain their
+    # existing backend-selection behavior.
+    backend_name = (
+        _get_default_backend_name(arch)
+        if (
+            arch == AttentionArch.DSA
+            and config.backend_name == "trtllm_mla"
+            and config.indexer_layer_ids is not None
+        )
+        else config.backend_name
+    )
+    return _get_backend_cls(backend_name, arch)(config)
 
 
 def _create_attn_backend_with_name(
@@ -435,7 +448,14 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
+        uses_channel_beta = (
+            str(getattr(text_config, "linear_method", "")).upper() == "FGBKDA"
+        )
+        linear_attn_backend = KdaAttnBackend(
+            config,
+            kda_backend=kda_backend,
+            enable_verify_replay=not uses_channel_beta,
+        )
     elif is_qwen4_exp(hf_config):
         from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
             Qwen4ExpMambaAttnBackend,

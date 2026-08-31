@@ -101,6 +101,8 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
         f_a_out=None,
         f_b_weight=None,
         beta_raw=torch.empty(1, 1, 2),
+        beta_is_logit=True,
+        qk_l2norm_in_kernel=True,
         seq_len=1,
         num_real_tokens=1,
         lower_bound=-5.0,

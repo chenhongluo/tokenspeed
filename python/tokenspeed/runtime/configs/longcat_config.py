@@ -119,7 +119,7 @@ class LongcatConfig(PretrainedConfig):
         # Over embedding
         oe_neighbor_num: int = 5,
         oe_split_num: int = 4,
-        oe_vocab_size_ratio: float = 100.567,
+        oe_vocab_size_ratio: float | None = None,
         # MTP
         mtp_num_layers: int = 3,
         mtp_disable_over_tokenizer: bool = True,

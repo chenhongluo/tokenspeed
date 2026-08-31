@@ -86,6 +86,11 @@ class OverEmbeddingSpec:
     in the look-back history, hashing stops before that EOS so tokens from the
     preceding sequence cannot affect the current n-gram. Explicit membership
     in ``ignored_token_ids`` remains effective at the current position.
+
+    ``segment_ignored_tokens`` selects Flash-Lite's different policy: ignored
+    tokens delimit n-gram history, and the current ignored token produces no
+    OE activation. The default keeps LongCat-Pro's checkpoint semantics, where
+    any ignored token selects the fragment's final table row.
     """
 
     profile: str
@@ -99,6 +104,7 @@ class OverEmbeddingSpec:
     fragments: tuple[TableFragmentSpec, ...]
     ignored_token_ids: tuple[int, ...] = ()
     eos_token_id: int | None = None
+    segment_ignored_tokens: bool = False
 
     def __post_init__(self) -> None:
         if not self.profile:

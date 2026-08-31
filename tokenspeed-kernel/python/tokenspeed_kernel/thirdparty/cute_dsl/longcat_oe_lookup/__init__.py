@@ -75,6 +75,7 @@ class LongCatOEAppendPackedLookup:
         fragment_configs: tuple[tuple[int, int, int], ...],
         ignored_token_ids: tuple[int, ...],
         eos_token_id: int | None,
+        segment_ignored_tokens: bool,
         enable_pdl: bool,
     ) -> Any:
         import cutlass
@@ -132,6 +133,7 @@ class LongCatOEAppendPackedLookup:
             fragment_configs=fragment_configs,
             ignored_token_ids=ignored_token_ids,
             eos_token_id=eos_token_id,
+            segment_ignored_tokens=segment_ignored_tokens,
             use_pdl=enable_pdl,
         )
         with torch.cuda.device(device):
@@ -164,6 +166,7 @@ class LongCatOEAppendPackedLookup:
         fragment_configs: tuple[tuple[int, int, int], ...],
         ignored_token_ids: tuple[int, ...] = (),
         eos_token_id: int | None = None,
+        segment_ignored_tokens: bool = False,
         enable_pdl: bool = False,
     ) -> None:
         """Launch the packed specialization selected by fragment geometry."""
@@ -174,6 +177,7 @@ class LongCatOEAppendPackedLookup:
             fragment_configs,
             ignored_token_ids,
             eos_token_id,
+            segment_ignored_tokens,
             enable_pdl,
         )
         compiled = self._compiled.get(key)
@@ -187,6 +191,7 @@ class LongCatOEAppendPackedLookup:
                         fragment_configs=fragment_configs,
                         ignored_token_ids=ignored_token_ids,
                         eos_token_id=eos_token_id,
+                        segment_ignored_tokens=segment_ignored_tokens,
                         enable_pdl=enable_pdl,
                     )
                     self._compiled[key] = compiled

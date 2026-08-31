@@ -22,7 +22,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.over_embedding import OverEmbeddingSpec, TableFragmentSpec
+from tokenspeed_kernel.ops.over_embedding import (
+    OverEmbeddingSpec,
+    TableFragmentSpec,
+    project_add_word_,
+)
 
 import tokenspeed.runtime.layers.over_embedding as over_embedding
 from tokenspeed.runtime.layers.over_embedding import (
@@ -62,6 +66,28 @@ def test_flash_lite_profile_matches_checkpoint_geometry() -> None:
     assert spec.branch_count == 12
     assert spec.local_width == 384
     assert [fragment.modulus for fragment in spec.fragments] == [4718593, 4718609]
+
+
+def test_projection_preserves_word_embedding_for_bypassed_tokens() -> None:
+    word = torch.tensor([[3.0, 6.0], [5.0, 7.0]], dtype=torch.bfloat16)
+    activation = torch.tensor([[2.0], [0.0]], dtype=torch.bfloat16)
+    projection = torch.tensor([[9.0, 12.0]], dtype=torch.bfloat16)
+
+    output = project_add_word_(
+        word,
+        activation,
+        projection,
+        scale=3.0,
+        bypass_mask=torch.tensor([False, True]),
+        solution="torch",
+    )
+
+    torch.testing.assert_close(
+        output[0], torch.tensor([7.0, 10.0], dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        output[1], torch.tensor([5.0, 7.0], dtype=torch.bfloat16)
+    )
 
 
 def test_forward_owns_history_publication_and_masks_graph_padding(monkeypatch) -> None:
@@ -132,12 +158,83 @@ def test_forward_owns_history_publication_and_masks_graph_padding(monkeypatch) -
     output = layer(
         torch.tensor([8, 9, 1], dtype=torch.int32),
         torch.tensor([3, 4, 0], dtype=torch.int64),
-        SimpleNamespace(bs=2),
+        SimpleNamespace(
+            bs=2,
+            num_extends=1,
+            attn_backend=SimpleNamespace(spec_num_tokens=1),
+        ),
     )
 
     assert output.shape == (3, 8)
     assert layer.history_token_ids[0, 1:5].tolist() == [6, 7, 8, 9]
     assert layer.pending_prefix_lengths.tolist() == [-1, -1, -1]
+
+
+def test_forward_splits_dflash_verify_rows_before_graph_padding(monkeypatch) -> None:
+    monkeypatch.setattr(
+        over_embedding, "resolve_longcat_oe_spec", lambda **_: _small_spec()
+    )
+    layer = LongCatOverEmbedding(
+        num_embeddings=31,
+        embedding_dim=8,
+        over_embedding_m=6,
+        hashes_per_order=1,
+        max_ngram_order=3,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        params_dtype=torch.bfloat16,
+    )
+    layer.bind_runtime_inputs(
+        req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+        input_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
+        max_request_slots=2,
+        history_capacity=32,
+        padding_req_pool_index=2,
+    )
+
+    def fake_word(input_ids, *, reduce_results=False):
+        assert not reduce_results
+        return torch.zeros((input_ids.numel(), 8), dtype=torch.bfloat16)
+
+    def fake_lookup(
+        input_ids,
+        input_start_offsets,
+        req_pool_indices,
+        active_request_mask,
+        history_token_ids,
+        committed_lengths,
+        oe_tables,
+        **_,
+    ):
+        assert input_start_offsets.tolist() == [0, 8, 16, 24]
+        assert req_pool_indices.tolist() == [0, 1, 2]
+        assert active_request_mask.tolist() == [True, True, False]
+        assert committed_lengths.tolist() == [10, 20, 0]
+        return torch.zeros((input_ids.numel(), 6), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(layer.word_embedding, "forward", fake_word)
+    monkeypatch.setattr(over_embedding, "append_packed_lookup_", fake_lookup)
+    monkeypatch.setattr(
+        over_embedding,
+        "project_add_word_",
+        lambda word_partial, *_args, **_kwargs: word_partial,
+    )
+
+    output = layer(
+        torch.arange(24, dtype=torch.int32),
+        torch.tensor(
+            [*range(10, 18), *range(20, 28), *range(8)],
+            dtype=torch.int64,
+        ),
+        SimpleNamespace(
+            bs=3,
+            num_extends=0,
+            attn_backend=SimpleNamespace(spec_num_tokens=8),
+        ),
+    )
+
+    assert output.shape == (24, 8)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -173,7 +270,13 @@ def test_history_publication_is_cuda_graph_capturable(monkeypatch) -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        layer._prepare_history(input_ids, positions, batch_size=1)
+        layer._prepare_history(
+            input_ids,
+            positions,
+            batch_size=1,
+            num_extends=0,
+            decode_width=1,
+        )
     graph.replay()
     torch.cuda.synchronize()
 

@@ -491,3 +491,92 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+def test_flashinfer_dsa_decode_w8_matches_reference(device: str, require) -> None:
+    require(
+        "attention",
+        "dsa_decode",
+        "flashinfer_trtllm",
+        torch.bfloat16,
+        "q",
+    )
+
+    torch.manual_seed(0)
+    batch_size = 2
+    q_len_per_req = 8
+    tokens = batch_size * q_len_per_req
+    num_heads = 8
+    num_slots = 1024
+    topk = 512
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    q = torch.randn(
+        tokens,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    latent = torch.randn(
+        num_slots,
+        kv_lora_rank,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    rope = torch.randn(
+        num_slots,
+        qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.cat([latent, rope], dim=-1)
+    topk_slots = torch.empty(
+        tokens,
+        topk,
+        device=device,
+        dtype=torch.int32,
+    )
+    for token in range(tokens):
+        topk_slots[token] = torch.randperm(num_slots, device=device)[:topk]
+    topk_lens = torch.full(
+        (tokens,),
+        topk,
+        device=device,
+        dtype=torch.int32,
+    )
+    request_seq_lens = torch.tensor(
+        [600, 900],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    out = dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=q_len_per_req,
+        request_seq_lens=request_seq_lens,
+        solution="flashinfer_trtllm",
+    )
+
+    ref = _dsa_reference(
+        q,
+        latent,
+        rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)

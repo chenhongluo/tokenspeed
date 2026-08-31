@@ -4104,6 +4104,7 @@ def dsa_decode(
     softmax_scale: float,
     page_size: int,
     q_len_per_req: int = 1,
+    request_seq_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
     k_scale: float = 1.0,
     return_lse: bool = False,
@@ -4130,6 +4131,8 @@ def dsa_decode(
         softmax_scale: Scale applied to attention logits.
         page_size: KV cache page size.
         q_len_per_req: Query rows per request.
+        request_seq_lens: Optional visible KV length per request for native
+            multi-row sparse attention.
         logit_cap: Optional logit cap.
         k_scale: KV scale multiplier for FP8 backends.
         return_lse: Whether to return LSE in addition to output.
@@ -4199,6 +4202,7 @@ def dsa_decode(
             softmax_scale=softmax_scale,
             page_size=page_size,
             q_len_per_req=q_len_per_req,
+            request_seq_lens=request_seq_lens,
             logit_cap=logit_cap,
             k_scale=k_scale,
             return_lse=return_lse,
@@ -4310,6 +4314,8 @@ def dsa_prefill_topk(
     q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     candidate_lens_cpu: torch.Tensor | None = None,
+    initial_tokens: int = 0,
+    local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -4346,6 +4352,8 @@ def dsa_prefill_topk(
         candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``.
             DeepGEMM uses it to select chunk launch bounds without synchronizing
             the CUDA stream; other implementations ignore it.
+        initial_tokens: Number of sequence-start candidates forced into top-k.
+        local_tokens: Number of causal-tail candidates forced into top-k.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
@@ -4363,6 +4371,15 @@ def dsa_prefill_topk(
         Tuple of workspace row ids and valid counts. Returned indices are
         absolute row ids into kv_workspace_slots; invalid entries are -1.
     """
+    initial_tokens = int(initial_tokens)
+    local_tokens = int(local_tokens)
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if initial_tokens + local_tokens > int(topk):
+        raise ValueError(
+            "initial_tokens + local_tokens must not exceed topk; "
+            f"got {initial_tokens} + {local_tokens} > {int(topk)}"
+        )
     if candidate_lens_cpu is not None and (
         candidate_lens_cpu.device.type != "cpu"
         or candidate_lens_cpu.shape != (q.shape[0],)
@@ -4408,6 +4425,11 @@ def dsa_prefill_topk(
         "dsa_prefill_topk",
         signature,
         traits=traits,
+        features=(
+            frozenset({"forced_initial_local"})
+            if initial_tokens or local_tokens
+            else None
+        ),
         solution=solution,
         override=override,
     )
@@ -4448,6 +4470,9 @@ def dsa_prefill_topk(
             kernel_kwargs["q_scales"] = q_scales
         if candidate_lens_cpu is not None and kernel.name.startswith("deep_gemm_"):
             kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
+        if initial_tokens or local_tokens:
+            kernel_kwargs["initial_tokens"] = initial_tokens
+            kernel_kwargs["local_tokens"] = local_tokens
         return kernel(**kernel_kwargs)
 
 
@@ -4467,6 +4492,8 @@ def dsa_decode_topk(
     q_scales: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
+    initial_tokens: int = 0,
+    local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -4501,6 +4528,8 @@ def dsa_decode_topk(
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
         plan: Optional opaque backend-specific plan.
+        initial_tokens: Number of sequence-start candidates forced into top-k.
+        local_tokens: Number of causal-tail candidates forced into top-k.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
@@ -4519,6 +4548,15 @@ def dsa_decode_topk(
         or absolute logical offsets according to ``topk_layout``; invalid
         entries are -1.
     """
+    initial_tokens = int(initial_tokens)
+    local_tokens = int(local_tokens)
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if initial_tokens + local_tokens > int(topk):
+        raise ValueError(
+            "initial_tokens + local_tokens must not exceed topk; "
+            f"got {initial_tokens} + {local_tokens} > {int(topk)}"
+        )
     if out is not None and out.shape != (q.shape[0], int(topk)):
         raise ValueError(
             f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
@@ -4582,7 +4620,15 @@ def dsa_decode_topk(
         signature,
         traits=traits,
         features=(
-            frozenset({"logical_offsets"}) if topk_layout == "logical_offsets" else None
+            frozenset(
+                ({"logical_offsets"} if topk_layout == "logical_offsets" else set())
+                | (
+                    {"forced_initial_local"}
+                    if initial_tokens or local_tokens
+                    else set()
+                )
+            )
+            or None
         ),
         solution=solution,
         override=override,
@@ -4626,6 +4672,9 @@ def dsa_decode_topk(
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
+        if initial_tokens or local_tokens:
+            kernel_kwargs["initial_tokens"] = initial_tokens
+            kernel_kwargs["local_tokens"] = local_tokens
         return kernel(**kernel_kwargs)
 
 

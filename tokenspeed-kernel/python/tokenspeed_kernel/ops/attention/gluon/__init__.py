@@ -1752,6 +1752,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("request_seq_lens", None)
         return _dsa_decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1926,6 +1927,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("request_seq_lens", None)
         return _dsa_decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(

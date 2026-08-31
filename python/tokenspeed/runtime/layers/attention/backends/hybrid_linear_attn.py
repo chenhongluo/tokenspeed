@@ -1770,10 +1770,6 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc = self.forward_metadata.query_start_loc
 
         if is_target_verify:
-            if beta_channel_raw is not None:
-                raise NotImplementedError(
-                    "FGBKDA speculative verify is not implemented"
-                )
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
             )
@@ -1803,6 +1799,8 @@ class MambaAttnBackend(AttentionBackend):
                 attn_tp_size=attn_tp_size,
                 head_v_dim=head_v_dim,
                 lower_bound=gate_lower_bound,
+                beta_is_logit=beta_is_logit,
+                qk_l2norm_in_kernel=qk_l2norm_in_kernel,
             )
             if fused_out is not None:
                 return fused_out
@@ -1924,6 +1922,8 @@ class MambaAttnBackend(AttentionBackend):
                 draft_token_num=draft_token_num,
                 seq_len=seq_len,
                 lower_bound=gate_lower_bound,
+                beta_is_logit=beta_is_logit,
+                qk_l2norm_in_kernel=qk_l2norm_in_kernel,
             )
         else:
             core_attn_out, last_recurrent_state = self._prefill_scan(
@@ -1977,6 +1977,8 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
     ) -> torch.Tensor | None:
         """Whole-round verify attempt; ``None`` falls through to the shared flow.
 
@@ -2011,6 +2013,8 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size: Attention tensor-parallel size.
             head_v_dim: Value head dimension.
             lower_bound: KDA decay clamp.
+            beta_is_logit: Whether the recurrent kernel must apply sigmoid.
+            qk_l2norm_in_kernel: Whether the recurrent kernel must normalize Q/K.
 
         Returns:
             The layer output when a fused kernel ran, else None.
@@ -2039,6 +2043,8 @@ class MambaAttnBackend(AttentionBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
     ) -> torch.Tensor:
         """Per-position recurrent scan of a target-verify round.
 
@@ -2068,6 +2074,8 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num: Verified positions per request.
             seq_len: Total tokens in the round (``batch_size * T``).
             lower_bound: KDA decay clamp.
+            beta_is_logit: Whether the recurrent kernel must apply sigmoid.
+            qk_l2norm_in_kernel: Whether the recurrent kernel must normalize Q/K.
 
         Returns:
             ``[1, seq_len, Hv, V]`` layer output.

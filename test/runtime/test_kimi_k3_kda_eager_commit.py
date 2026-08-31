@@ -29,8 +29,17 @@ DEV = "cuda"
 
 
 class _Harness:
-    def __init__(self, *, eager_replay: bool, seed: int = 0):
+    def __init__(
+        self,
+        *,
+        eager_replay: bool,
+        seed: int = 0,
+        verify_width: int = T,
+        channel_beta: bool = False,
+    ):
         torch.manual_seed(seed)
+        self.verify_width = verify_width
+        self.channel_beta = channel_beta
         self.pool = _make_kimi_pool(DEV, usable_pages=24)
         self.contract = self.pool.arena.runtime_contract
         config = SimpleNamespace(
@@ -41,7 +50,7 @@ class _Harness:
             dtype=torch.bfloat16,
             head_dim=D,
             is_draft=False,
-            speculative_num_draft_tokens=T,
+            speculative_num_draft_tokens=verify_width,
             max_bs=8,
         )
         self.backend = KdaAttnBackend(config)
@@ -51,7 +60,7 @@ class _Harness:
         if not eager_replay:
             self.backend._replay_active = False
             self.backend._verify_scratch = None
-            self.backend.preallocate_verify_workspace(config.max_bs, T)
+            self.backend.preallocate_verify_workspace(config.max_bs, verify_width)
         self.layer_ids = list(self.backend._state_layer_ids())
         self.params = {
             layer_id: dict(
@@ -71,11 +80,15 @@ class _Harness:
         def rnd(*shape):
             return torch.randn(*shape, generator=generator).to(DEV, torch.bfloat16)
 
-        return {
-            "mixed_qkv": rnd(bs * T, CONV_DIM),
-            "f_a_out": rnd(bs * T, D_FA),
-            "beta_raw": rnd(bs * T, H),
+        inputs = {
+            "mixed_qkv": rnd(bs * self.verify_width, CONV_DIM),
+            "f_a_out": rnd(bs * self.verify_width, D_FA),
+            "beta_raw": rnd(bs * self.verify_width, H),
         }
+        if self.channel_beta:
+            inputs["beta_channel_raw"] = rnd(bs * self.verify_width, H, D)
+            inputs["beta_raw"] = torch.ones_like(inputs["beta_raw"])
+        return inputs
 
     def prepare_metadata(self, rpis, pages, seq_lens):
         bs = len(rpis)
@@ -109,6 +122,8 @@ class _Harness:
                     mixed_qkv=inputs["mixed_qkv"].clone(),
                     f_a_out=inputs["f_a_out"],
                     beta_raw=inputs["beta_raw"],
+                    beta_channel_raw=inputs.get("beta_channel_raw"),
+                    beta_is_logit=not self.channel_beta,
                     g_raw=None,
                     conv_weights=params["conv_weights"],
                     bias=None,
@@ -123,7 +138,7 @@ class _Harness:
                     f_b_weight=params["f_b_weight"],
                     lower_bound=_LOWER_BOUND,
                     layer_id=layer_id,
-                    seq_len=bs * T,
+                    seq_len=inputs["mixed_qkv"].shape[0],
                     a=None,
                     b=None,
                 )
@@ -173,6 +188,48 @@ def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
             harness.round(rpis, pages, seq_lens, 100 + round_index, accepted)
         _assert_committed_pages_equal(replay, scratch, pages)
         seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
+
+
+def test_fgbkda_w8_verify_matches_eight_single_token_decodes():
+    verify_width = 8
+    verify = _Harness(
+        eager_replay=False,
+        seed=41,
+        verify_width=verify_width,
+        channel_beta=True,
+    )
+    decode = _Harness(
+        eager_replay=False,
+        seed=41,
+        verify_width=1,
+        channel_beta=True,
+    )
+    pages = {group_id: [2 + group] for group, group_id in enumerate(_STATE_GROUPS)}
+    inputs = verify.inputs(bs=1, seed=73)
+    committed_length = 16
+
+    verify.prepare_metadata([0], pages, seq_lens=[committed_length + verify_width])
+    verify_outputs = verify.forward(inputs, bs=1)
+    verify.backend.commit_verified_state(
+        torch.tensor([verify_width], dtype=torch.int32, device=DEV)
+    )
+
+    decode_outputs = [[] for _ in decode.layer_ids]
+    for step in range(verify_width):
+        decode.prepare_metadata([0], pages, seq_lens=[committed_length + step + 1])
+        token_inputs = {name: value[step : step + 1] for name, value in inputs.items()}
+        for layer_index, output in enumerate(decode.forward(token_inputs, bs=1)):
+            decode_outputs[layer_index].append(output.reshape(1, H, D))
+
+    for layer_index, verify_output in enumerate(verify_outputs):
+        reference = torch.cat(decode_outputs[layer_index], dim=0)
+        torch.testing.assert_close(
+            verify_output.reshape(verify_width, H, D).float(),
+            reference.float(),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+    _assert_committed_pages_equal(verify, decode, pages)
 
 
 def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():

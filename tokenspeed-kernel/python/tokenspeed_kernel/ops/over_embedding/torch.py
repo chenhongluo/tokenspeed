@@ -44,9 +44,25 @@ def torch_longcat_oe_project_add_word(
     activation: torch.Tensor,
     projection: torch.Tensor,
     scale: float,
+    bypass_mask: torch.Tensor | None,
 ) -> None:
     """Merge scaled word and local OE projection into word storage."""
     inverse_scale = 1.0 / scale
+    if bypass_mask is not None:
+        original_word = word_partial.clone()
+        word_partial.addmm_(
+            activation,
+            projection,
+            beta=inverse_scale,
+            alpha=inverse_scale,
+        )
+        torch.where(
+            bypass_mask.unsqueeze(-1),
+            original_word,
+            word_partial,
+            out=word_partial,
+        )
+        return
     word_partial.addmm_(
         activation,
         projection,

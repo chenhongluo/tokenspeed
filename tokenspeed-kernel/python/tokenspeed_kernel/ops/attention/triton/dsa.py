@@ -487,6 +487,7 @@ def triton_dsa_decode(
     softmax_scale: float,
     page_size: int,
     q_len_per_req: int = 1,
+    request_seq_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
     k_scale: float = 1.0,
     return_lse: bool = False,

@@ -142,6 +142,56 @@ def kda_recurrent_decode_pool(
     )
 
 
+def kda_recurrent_verify_pool(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    *,
+    h_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    h_pool_out: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    recurrent_layout: str = "k_major",
+    beta_is_logit: bool = True,
+    qk_l2norm_in_kernel: bool = True,
+) -> torch.Tensor:
+    """Verify a dense KDA draft window and save every candidate state.
+
+    ``q``/``k`` are ``[B, T, H, K]``; ``v`` is ``[B, T, Hv, V]``;
+    ``g_raw`` is ``[B, T, Hv, K]``; and ``beta`` is ``[B, T, Hv]``.
+    The scan reads ``h_pool[read_indices]`` and writes each position to
+    ``h_pool_out[write_indices]`` so the caller can commit the accepted row.
+    It returns the attention output ``[B, T, Hv, V]``.
+    """
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+    )
+
+    return fused_recurrent_kda_mtp(
+        q,
+        k,
+        v,
+        g_raw,
+        beta,
+        A_log,
+        dt_bias,
+        h_pool,
+        read_indices,
+        write_indices,
+        h_pool_out=h_pool_out,
+        lower_bound=lower_bound,
+        recurrent_layout=recurrent_layout,
+        use_qk_l2norm_in_kernel=qk_l2norm_in_kernel,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=beta_is_logit,
+    )
+
+
 def kda_recurrent_decode(
     q: torch.Tensor,
     k: torch.Tensor,

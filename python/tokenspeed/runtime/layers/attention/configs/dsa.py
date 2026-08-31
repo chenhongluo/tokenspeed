@@ -49,6 +49,7 @@ class DSAConfig(MLAConfig):
     index_topk: int
     index_head_dim: int
     index_n_heads: int
+    indexer_layer_ids: frozenset[int] | None = None
 
     @classmethod
     def generate(
@@ -72,7 +73,13 @@ class DSAConfig(MLAConfig):
             index_topk=model_config.index_topk,
             index_head_dim=model_config.index_head_dim,
             index_n_heads=model_config.index_n_heads,
+            indexer_layer_ids=getattr(model_config, "indexer_layer_ids", None),
         )
+
+    def has_indexer(self, layer_id: int) -> bool:
+        """Return whether a physical attention layer owns an Index-K plane."""
+
+        return self.indexer_layer_ids is None or layer_id in self.indexer_layer_ids
 
     def cache_cell_size(self) -> int:
         index_k_cell_size = dsa_index_k_row_bytes(

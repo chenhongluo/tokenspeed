@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.attention.triton.capture_payload import (
 )
 from tokenspeed_kernel.ops.attention.triton.linear.kda import (
     kda_recurrent_decode_pool,
+    kda_recurrent_verify_pool,
 )
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
@@ -101,13 +102,15 @@ class KdaAttnBackend(MambaAttnBackend):
         self,
         config: BaseAttnConfig,
         kda_backend: str = "auto",
+        enable_verify_replay: bool = True,
     ) -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
-        self._replay_active = kda_replay_commit_supported(
-            self.dtype, recurrent_layout=self.kda_recurrent_layout
+        self._replay_active = enable_verify_replay and kda_replay_commit_supported(
+            self.dtype,
+            recurrent_layout=self.kda_recurrent_layout,
         )
         self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
         self._replay_uses_raw_gate = (
@@ -560,7 +563,11 @@ class KdaAttnBackend(MambaAttnBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
     ) -> torch.Tensor | None:
+        if not qk_l2norm_in_kernel:
+            return None
         if self._replay_active:
             if f_a_out is None or bias is not None:
                 raise RuntimeError(
@@ -677,12 +684,9 @@ class KdaAttnBackend(MambaAttnBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        beta_is_logit: bool,
+        qk_l2norm_in_kernel: bool,
     ) -> torch.Tensor:
-
-        from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-            fused_recurrent_kda_mtp,
-        )
-
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
@@ -702,7 +706,7 @@ class KdaAttnBackend(MambaAttnBackend):
         write_rows = output_indices[:batch_size]
         state_out = ssm_scratch
 
-        return fused_recurrent_kda_mtp(
+        return kda_recurrent_verify_pool(
             query_b,
             key_b,
             value_b,
@@ -710,12 +714,14 @@ class KdaAttnBackend(MambaAttnBackend):
             beta_b,
             A_log,
             dt_bias,
-            initial_pool,
-            initial_rows,
-            write_rows,
+            h_pool=initial_pool,
+            read_indices=initial_rows,
+            write_indices=write_rows,
             h_pool_out=state_out,
             lower_bound=lower_bound,
             recurrent_layout=self.kda_recurrent_layout,
+            beta_is_logit=beta_is_logit,
+            qk_l2norm_in_kernel=qk_l2norm_in_kernel,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override

@@ -177,7 +177,13 @@ class KimiK3Recipe(CacheRecipe):
     def max_padding_fraction(self) -> float:
         # A draft adds MLA planes of its own; the target-only bound would
         # reject the wider arena they imply.
-        return float("inf") if self.num_draft_layers else 0.25
+        if self.num_draft_layers:
+            return float("inf")
+        # Flash-Lite reuses this cache family but its BF16 recurrent state is
+        # wider than Kimi-K3's state relative to one MLA page.
+        if getattr(self._text_config, "model_type", None) == "flash_kda":
+            return 0.75
+        return 0.25
 
     # ---- fields ----
 

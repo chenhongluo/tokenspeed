@@ -89,5 +89,6 @@ if platform.is_nvidia:
             ),
             ignored_token_ids=spec.ignored_token_ids,
             eos_token_id=spec.eos_token_id,
+            segment_ignored_tokens=spec.segment_ignored_tokens,
             enable_pdl=enable_pdl,
         )

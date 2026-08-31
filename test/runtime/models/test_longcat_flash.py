@@ -20,20 +20,24 @@
 
 """Cheap LongCat-Flash model wiring tests."""
 
-import json
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from torch import nn
 
+from tokenspeed.runtime.configs.model_config import (
+    AttentionArch,
+    _resolve_attention_family,
+    configure_longcat_lsa_attention,
+)
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.models.longcat_flash import (
     LongcatFlashForCausalLM,
     _ensure_longcat_config,
     _get_longcat_moe_quant_config,
+    _LongCatOverEmbedding,
     _RuntimeLongcatModel,
     _RuntimeLongcatMoE,
 )
@@ -55,7 +59,7 @@ class TestLongcatFlashRegistry(unittest.TestCase):
         self.assertIs(cls, LongcatCausalLM)
         self.assertEqual(arch, "LongcatCausalLM")
 
-    def test_mla_and_double_attention_metadata_registered(self):
+    def test_attention_and_double_attention_metadata_registered(self):
         from tokenspeed.runtime.configs import model_config
 
         self.assertIn("LongcatFlashForCausalLM", model_config._MLA_ARCHITECTURES)
@@ -63,7 +67,8 @@ class TestLongcatFlashRegistry(unittest.TestCase):
             "LongcatFlashForCausalLM",
             model_config._DOUBLE_ATTENTION_LAYER_ARCHITECTURES,
         )
-        self.assertIn("LongcatCausalLM", model_config._MLA_ARCHITECTURES)
+        self.assertIn("LongcatCausalLM", model_config._DSA_ARCHITECTURES)
+        self.assertNotIn("LongcatCausalLM", model_config._MLA_ARCHITECTURES)
         self.assertIn(
             "LongcatCausalLM",
             model_config._DOUBLE_ATTENTION_LAYER_ARCHITECTURES,
@@ -71,36 +76,39 @@ class TestLongcatFlashRegistry(unittest.TestCase):
 
 
 class TestLongcatFlashConfig(unittest.TestCase):
-    def test_get_config_loads_longcat_2_checkpoint_shape(self):
-        from tokenspeed.runtime.configs.longcat_config import LongcatConfig
-        from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+    def test_longcat_2_geometry_selects_dsa_with_pair_owners(self):
+        hf_config = SimpleNamespace(
+            architectures=["LongcatCausalLM"],
+            num_layers=38,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=32,
+            index_init_tokens=16,
+            index_local_tokens=1024,
+            cli_factor=2,
+            index_k_norm_type="rms",
+        )
+        runtime_config = SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+            num_attention_layers=76,
+        )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.json"
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "architectures": ["LongcatCausalLM"],
-                        "model_type": "longcat",
-                        "vocab_size": 163840,
-                        "hidden_size": 8192,
-                        "num_layers": 38,
-                        "num_hidden_layers": 76,
-                        "num_attention_heads": 64,
-                        "n_routed_experts": 768,
-                        "moe_topk": 12,
-                        "qk_nope_head_dim": 128,
-                        "qk_rope_head_dim": 64,
-                    }
-                )
-            )
+        attention_family = _resolve_attention_family(hf_config, hf_config)
+        self.assertIs(attention_family.configure, configure_longcat_lsa_attention)
 
-            config = get_config(tmpdir, trust_remote_code=False)
+        attention_family.configure(runtime_config)
 
-        self.assertIsInstance(config, LongcatConfig)
-        self.assertEqual(config.num_hidden_layers, 38)
-        self.assertEqual(config.qk_head_dim, 192)
-        self.assertEqual(config.num_experts_per_tok, 12)
+        self.assertEqual(runtime_config.attention_arch, AttentionArch.DSA)
+        self.assertEqual(runtime_config.index_topk, 2048)
+        self.assertEqual(
+            runtime_config.indexer_layer_ids,
+            frozenset(range(0, 76, 2)),
+        )
 
     def test_config_aliases_are_normalized(self):
         config = SimpleNamespace(
@@ -178,6 +186,27 @@ class TestLongcatFlashConfig(unittest.TestCase):
             eos_token_id=2,
             fix_normalize_factor=False,
         )
+
+    def test_shared_embed_replaces_only_the_oe_word_table(self):
+        model = object.__new__(LongcatFlashForCausalLM)
+        nn.Module.__init__(model)
+        over_embedding = object.__new__(_LongCatOverEmbedding)
+        nn.Module.__init__(over_embedding)
+        over_embedding.word_embedding = nn.Embedding(2, 3)
+        model.model = nn.Module()
+        model.model.embed_tokens = over_embedding
+        model.lm_head = nn.Linear(3, 2, bias=False)
+        shared_embed = nn.Parameter(torch.empty(2, 3))
+        shared_head = nn.Parameter(torch.empty(2, 3))
+
+        with (
+            mock.patch("torch.cuda.empty_cache"),
+            mock.patch("torch.cuda.synchronize"),
+        ):
+            model.set_embed_and_head(shared_embed, shared_head)
+
+        self.assertIs(over_embedding.word_embedding.weight, shared_embed)
+        self.assertIs(model.lm_head.weight, shared_head)
 
 
 class TestLongcatMixedFp8Config(unittest.TestCase):
@@ -305,6 +334,109 @@ class TestLongcatZeroExpert(unittest.TestCase):
             topk_output.topk_ids,
             torch.tensor([[0, 0], [0, 1]]),
         )
+
+
+class _CaptureFinalNorm:
+    def final_norm(self, hidden_states, residual, ctx, norm):
+        return hidden_states + residual + 1000, torch.full_like(hidden_states, 30)
+
+    def gather_residual(self, residual, ctx):
+        return residual + 100
+
+
+class _CaptureLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_delta: int,
+        residual_value: int,
+        captured_value: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_delta = hidden_delta
+        self.residual_value = residual_value
+        self.captured_value = captured_value
+        self.final_norm_comm = _CaptureFinalNorm()
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        ctx,
+        out_cache_loc,
+        residual,
+        capture_hidden_state=None,
+    ):
+        if capture_hidden_state is not None:
+            capture_hidden_state(torch.full_like(hidden_states, self.captured_value))
+        return (
+            hidden_states + self.hidden_delta,
+            torch.full_like(hidden_states, self.residual_value),
+        )
+
+
+class TestLongcatDFlashCapture(unittest.TestCase):
+    @staticmethod
+    def _make_target():
+        model = object.__new__(_RuntimeLongcatModel)
+        nn.Module.__init__(model)
+        model.layers = nn.ModuleList(
+            [
+                _CaptureLayer(
+                    hidden_delta=1,
+                    residual_value=10,
+                    captured_value=110,
+                ),
+                _CaptureLayer(
+                    hidden_delta=1,
+                    residual_value=20,
+                    captured_value=120,
+                ),
+            ]
+        )
+        model.layers_to_capture = set()
+        model.norm = nn.Identity()
+
+        target = object.__new__(LongcatFlashForCausalLM)
+        nn.Module.__init__(target)
+        target.model = model
+        target.capture_aux_hidden_states = False
+        return target
+
+    def test_captures_materialized_completed_layer_residuals(self):
+        target = self._make_target()
+        slots = [torch.empty(1, 1), torch.empty(1, 1)]
+        callbacks = []
+        target.set_dflash_layers_to_capture(
+            [0, 1],
+            incremental_callback=lambda capture_idx, num_tokens: callbacks.append(
+                (capture_idx, num_tokens)
+            ),
+            slot_bufs=slots,
+        )
+        target.model._dflash_incr_active = True
+        ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+
+        output, captures = target.model(
+            input_ids=torch.empty(1, dtype=torch.int64),
+            positions=torch.empty(1, dtype=torch.int64),
+            ctx=ctx,
+            out_cache_loc=torch.empty(1, dtype=torch.int64),
+            input_embeds=torch.ones(1, 1),
+        )
+
+        self.assertEqual(target.model.layers_to_capture, {1, 2})
+        torch.testing.assert_close(captures[0], torch.tensor([[120.0]]))
+        torch.testing.assert_close(captures[1], torch.tensor([[130.0]]))
+        torch.testing.assert_close(output, torch.tensor([[1023.0]]))
+        torch.testing.assert_close(slots[0], torch.tensor([[120.0]]))
+        torch.testing.assert_close(slots[1], torch.tensor([[130.0]]))
+        self.assertEqual(callbacks, [(0, 1), (1, 1)])
+
+    def test_rejects_capture_ids_outside_target_layers(self):
+        target = self._make_target()
+
+        with self.assertRaisesRegex(ValueError, r"valid range is \[0, 1\]"):
+            target.set_dflash_layers_to_capture([2])
 
 
 class TestLongcatCheckpointLoading(unittest.TestCase):

@@ -68,7 +68,6 @@ _MLA_ARCHITECTURES = frozenset(
         "DeepseekV3ForCausalLMNextN",
         "Eagle3DeepseekV2ForCausalLM",
         "FLASHLocalForCausalLM",
-        "LongcatCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
@@ -78,7 +77,7 @@ _MLA_ARCHITECTURES = frozenset(
         "K3DSparkModel",
     }
 )
-_DSA_ARCHITECTURES = frozenset(
+_GLM_DSA_ARCHITECTURES = frozenset(
     {
         "GlmMoeDsaForCausalLM",
         "GlmMoeDsaForCausalLMNextN",
@@ -88,6 +87,8 @@ _DSA_ARCHITECTURES = frozenset(
         "DeepseekV32ForCausalLMNextN",
     }
 )
+_LONGCAT_DSA_ARCHITECTURES = frozenset({"LongcatCausalLM"})
+_DSA_ARCHITECTURES = _GLM_DSA_ARCHITECTURES | _LONGCAT_DSA_ARCHITECTURES
 _MSA_ARCHITECTURES = frozenset(
     {
         "MiniMaxM3SparseForConditionalGeneration",
@@ -170,7 +171,7 @@ def configure_deepseek_v4_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_glm_attention(model_config) -> None:
+def _configure_dsa_geometry(model_config) -> None:
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -190,7 +191,7 @@ def configure_glm_attention(model_config) -> None:
     ]
     if missing_fields:
         raise ValueError(
-            "GLM attention config is missing required fields: "
+            "DSA attention config is missing required fields: "
             + ", ".join(missing_fields)
         )
 
@@ -218,6 +219,47 @@ def configure_glm_attention(model_config) -> None:
         scaling_factor = rope_scaling["factor"]
         mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
         model_config.scaling = model_config.scaling * mscale * mscale
+
+
+def configure_glm_attention(model_config) -> None:
+    _configure_dsa_geometry(model_config)
+
+
+_LONGCAT_LSA_EXPECTED_GEOMETRY = {
+    "index_topk": 2048,
+    "index_head_dim": 128,
+    "index_n_heads": 32,
+    "index_init_tokens": 16,
+    "index_local_tokens": 1024,
+    "cli_factor": 2,
+    "index_k_norm_type": "rms",
+}
+
+
+def configure_longcat_lsa_attention(model_config) -> None:
+    """Configure the supported LongCat-2.0 LSA owner/reuse geometry."""
+
+    attention_config = (
+        model_config.hf_text_config
+        if hasattr(model_config.hf_text_config, "kv_lora_rank")
+        else model_config.hf_config
+    )
+    for field, expected in _LONGCAT_LSA_EXPECTED_GEOMETRY.items():
+        actual = getattr(attention_config, field, None)
+        if actual != expected:
+            raise ValueError(
+                f"Unsupported LongCat LSA {field}: expected {expected}, got {actual}"
+            )
+
+    _configure_dsa_geometry(model_config)
+    model_config.index_init_tokens = attention_config.index_init_tokens
+    model_config.index_local_tokens = attention_config.index_local_tokens
+    model_config.cli_factor = attention_config.cli_factor
+    num_attention_layers = getattr(model_config, "num_attention_layers", None)
+    if num_attention_layers is not None:
+        model_config.indexer_layer_ids = frozenset(
+            range(0, num_attention_layers, model_config.cli_factor)
+        )
 
 
 def configure_mla_attention(model_config) -> None:
@@ -259,8 +301,15 @@ _ATTENTION_FAMILY_SPECS = (
         default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
     ),
     _AttentionFamilySpec(
+        name="LongCat LSA",
+        architectures=_LONGCAT_DSA_ARCHITECTURES,
+        configure=configure_longcat_lsa_attention,
+        default_backend="dsa",
+        supports_target_verify_forward_mode=True,
+    ),
+    _AttentionFamilySpec(
         name="GLM",
-        architectures=_DSA_ARCHITECTURES,
+        architectures=_GLM_DSA_ARCHITECTURES,
         configure=configure_glm_attention,
         default_backend="dsa",
         supports_target_verify_forward_mode=True,
@@ -607,6 +656,13 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
+        if (
+            attention_family is not None
+            and attention_family.configure is configure_longcat_lsa_attention
+        ):
+            self.indexer_layer_ids = frozenset(
+                range(0, self.num_attention_layers, self.cli_factor)
+            )
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization

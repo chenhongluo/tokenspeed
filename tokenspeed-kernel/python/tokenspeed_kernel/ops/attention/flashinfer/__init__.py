@@ -343,7 +343,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         priority=Priority.SPECIALIZED,
         traits={
             "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
             "qk_nope_head_dim": frozenset({128, 192}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
@@ -368,6 +368,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         softmax_scale: float,
         page_size: int,
         q_len_per_req: int = 1,
+        request_seq_lens: torch.Tensor | None = None,
         logit_cap: float = 0.0,
         k_scale: float = 1.0,
         return_lse: bool = False,
@@ -386,15 +387,38 @@ if platform.is_nvidia and platform.is_hopper_plus:
             )
         if q.dim() == 3:
             num_tokens = q.shape[0]
-            q_kernel = q.view(num_tokens, 1, q.shape[1], q.shape[2])
+            num_heads = q.shape[1]
+            head_dim = q.shape[2]
         elif q.dim() == 4:
             num_tokens = q.shape[0] * q.shape[1]
-            q_kernel = q.reshape(num_tokens, 1, q.shape[2], q.shape[3])
+            num_heads = q.shape[2]
+            head_dim = q.shape[3]
         else:
             raise ValueError(f"unsupported q shape {tuple(q.shape)}")
+        native_multi_query = request_seq_lens is not None and q_len_per_req > 1
+        if native_multi_query:
+            if num_tokens % q_len_per_req != 0:
+                raise ValueError(
+                    f"query tokens {num_tokens} must be divisible by "
+                    f"q_len_per_req={q_len_per_req}"
+                )
+            num_reqs = num_tokens // q_len_per_req
+            if request_seq_lens.dim() != 1 or request_seq_lens.numel() != num_reqs:
+                raise ValueError(
+                    "request_seq_lens must contain one entry per request, got "
+                    f"shape={tuple(request_seq_lens.shape)}, requests={num_reqs}"
+                )
+            q_kernel = q.reshape(num_reqs, q_len_per_req, num_heads, head_dim)
+            block_tables = topk_slots.view(num_reqs, q_len_per_req, -1)
+            seq_lens = request_seq_lens.to(
+                device=q.device, dtype=torch.int32
+            ).contiguous()
+        else:
+            q_kernel = q.reshape(num_tokens, 1, num_heads, head_dim)
+            block_tables = topk_slots.view(num_tokens, 1, -1)
+            seq_lens = _topk_lens_or_count(topk_slots, topk_lens)
         kv_dtype = q.dtype if q.dtype == torch.float8_e4m3fn else kv_cache.dtype
         kv = _flashinfer_trtllm_mla_kv_cache(kv_cache, page_size, kv_dtype)
-        seq_lens = _topk_lens_or_count(topk_slots, topk_lens)
         result = trtllm_batch_decode_with_kv_cache_mla(
             query=q_kernel,
             kv_cache=kv,
@@ -402,7 +426,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             qk_nope_head_dim=int(qk_nope_head_dim),
             kv_lora_rank=int(kv_lora_rank),
             qk_rope_head_dim=int(qk_rope_head_dim),
-            block_tables=topk_slots.view(num_tokens, 1, -1),
+            block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=int(max_seqlen_k),
             sparse_mla_top_k=topk_slots.shape[-1],

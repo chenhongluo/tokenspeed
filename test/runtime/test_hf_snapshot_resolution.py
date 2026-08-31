@@ -245,6 +245,59 @@ class HFSnapshotResolutionTests(unittest.TestCase):
         download.assert_not_called()
         self.assertEqual(config.snapshot_value, "from-snapshot")
 
+    def test_longcat_architecture_loads_local_config_without_model_type(self) -> None:
+        from tokenspeed.runtime.configs.longcat_config import LongcatConfig
+
+        with tempfile.TemporaryDirectory() as snapshot:
+            with open(os.path.join(snapshot, "config.json"), "w") as file:
+                json.dump(
+                    {
+                        "architectures": ["LongcatCausalLM"],
+                        "vocab_size": 163840,
+                        "hidden_size": 8192,
+                        "num_layers": 38,
+                        "num_hidden_layers": 76,
+                        "num_attention_heads": 64,
+                        "n_routed_experts": 768,
+                        "moe_topk": 12,
+                        "qk_nope_head_dim": 128,
+                        "qk_rope_head_dim": 64,
+                    },
+                    file,
+                )
+
+            config = get_config(snapshot, trust_remote_code=False)
+
+        self.assertIsInstance(config, LongcatConfig)
+        self.assertEqual(config.num_hidden_layers, 38)
+        self.assertEqual(config.qk_head_dim, 192)
+        self.assertEqual(config.num_experts_per_tok, 12)
+
+    def test_legacy_longcat_flash_does_not_inherit_pro_oe_defaults(self) -> None:
+        from tokenspeed.runtime.configs.longcat_config import LongcatConfig
+        from tokenspeed.runtime.models.longcat_flash import _ensure_longcat_config
+
+        with tempfile.TemporaryDirectory() as snapshot:
+            with open(os.path.join(snapshot, "config.json"), "w") as file:
+                json.dump(
+                    {
+                        "model_type": "longcat",
+                        "architectures": ["LongcatFlashForCausalLM"],
+                        "vocab_size": 131072,
+                        "hidden_size": 6144,
+                        "num_layers": 32,
+                        "num_attention_heads": 48,
+                    },
+                    file,
+                )
+
+            config = get_config(snapshot, trust_remote_code=False)
+
+        self.assertIsInstance(config, LongcatConfig)
+        _ensure_longcat_config(config)
+        self.assertIsNone(config.oe_vocab_size_ratio)
+        self.assertFalse(config.use_over_embedding)
+
     def test_generation_config_uses_revision_pinned_snapshot(self) -> None:
         loaded = SimpleNamespace()
         with (
@@ -458,6 +511,29 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             trust_remote_code=True,
             clean_up_tokenization_spaces=False,
         )
+
+    def test_longcat_tokenizers_enable_mistral_regex_fix(self) -> None:
+        for architecture in ("FLASHLocalForCausalLM", "LongcatCausalLM"):
+            with self.subTest(architecture=architecture):
+                tokenizer = SimpleNamespace(get_added_vocab=dict, init_kwargs={})
+                with (
+                    tempfile.TemporaryDirectory() as snapshot,
+                    patch(
+                        "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
+                        return_value=tokenizer,
+                    ) as from_pretrained,
+                    patch(
+                        "tokenspeed.runtime.utils.hf_transformers_utils.warnings.warn"
+                    ),
+                ):
+                    get_tokenizer(snapshot, architectures=[architecture])
+
+                from_pretrained.assert_called_once_with(
+                    snapshot,
+                    trust_remote_code=False,
+                    clean_up_tokenization_spaces=False,
+                    fix_mistral_regex=True,
+                )
 
     def test_tokenizer_rejects_conflicting_revisions(self) -> None:
         with self.assertRaisesRegex(ValueError, "must match"):

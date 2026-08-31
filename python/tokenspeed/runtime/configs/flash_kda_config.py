@@ -292,8 +292,7 @@ class FLASHLocalConfig(PretrainedConfig):
         emb_split_num: int | None = None,
         emb_neighbor_num: int | None = None,
         # ngram_exclude_sp_token: when True, special tokens (listed in
-        # ``special_token_scope``) bypass the OE n-gram path — they map to the
-        # ignore row so they neither contribute to nor pollute n-gram hashes.
+        # ``special_token_scope``) bypass OE and delimit the n-gram history.
         ngram_exclude_sp_token: bool = False,
         # special_token_scope: comma-separated "start:end" ranges (left-closed,
         # right-open) of token ids excluded from OE n-gram hashing,
@@ -384,9 +383,9 @@ class FLASHLocalConfig(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.moe_renormalize = moe_renormalize
         self.moe_router_activation_func = moe_router_activation_func
-        if self.moe_router_activation_func not in ("softmax", "sigmoid"):
+        if self.moe_router_activation_func != "softmax":
             raise ValueError(
-                "moe_router_activation_func must be 'softmax' or 'sigmoid', got "
+                "Flash-KDA only supports softmax routing; got "
                 f"{self.moe_router_activation_func!r}"
             )
         self.topk_method = topk_method

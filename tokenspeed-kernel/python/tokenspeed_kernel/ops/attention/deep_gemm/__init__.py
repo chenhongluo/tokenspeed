@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     combine_topk_weights,
     local_topk_to_global_slots,
+    mark_forced_initial_local_logits,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import (
@@ -205,6 +206,7 @@ if platform.is_nvidia:
         "dsa_decode_topk",
         name="deep_gemm_dsa_decode_topk",
         solution="deep_gemm",
+        features={"forced_initial_local"},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
@@ -228,7 +230,7 @@ if platform.is_nvidia:
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed"}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
         },
         priority=Priority.PERFORMANT,
     )
@@ -247,6 +249,8 @@ if platform.is_nvidia:
         plan: object | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
+        initial_tokens: int = 0,
+        local_tokens: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert weights.dtype in (torch.float32, torch.bfloat16)
         # Raw weights may be a column-split view of the fused wk_weights_proj
@@ -326,6 +330,16 @@ if platform.is_nvidia:
         # Compact widened view with non-finite scores scrubbed; the
         # length-aware CuTe DSL top-k below consumes it without a copy.
         logits_full = _prepare_logits_for_topk(logits)
+        offsets = torch.arange(
+            1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int32
+        )
+        seq_lens_per_token = (seq_lens.unsqueeze(1) + offsets).reshape(-1)
+        mark_forced_initial_local_logits(
+            logits_full,
+            seq_lens_per_token,
+            initial_tokens=initial_tokens,
+            local_tokens=local_tokens,
+        )
         local_topk_offsets = torch.empty_like(out)
         if _use_cute_dsl_decode_topk():
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
@@ -357,10 +371,6 @@ if platform.is_nvidia:
             # seq_lens_2d is a full-length broadcast (only its last column is
             # read on the hot path), so derive the per-token bound from the
             # per-request seq_lens: seq_lens[req] - (q_len_per_req - 1) + j.
-            offsets = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int32
-            )
-            seq_lens_per_token = (seq_lens.unsqueeze(1) + offsets).reshape(-1)
             col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
             logits.masked_fill_(
                 col_ids.view(1, -1) >= seq_lens_per_token.view(-1, 1), float("-inf")
@@ -382,6 +392,7 @@ if platform.is_nvidia:
         "dsa_prefill_topk",
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
+        features={"forced_initial_local"},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
@@ -424,6 +435,8 @@ if platform.is_nvidia:
         candidate_lens_cpu: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
+        initial_tokens: int = 0,
+        local_tokens: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         q = q.contiguous()
@@ -515,6 +528,12 @@ if platform.is_nvidia:
             )
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+            )
+            mark_forced_initial_local_logits(
+                logits,
+                candidate_lens[start:end],
+                initial_tokens=initial_tokens,
+                local_tokens=local_tokens,
             )
             torch.ops.trtllm.indexer_topk_prefill(
                 logits.contiguous(),

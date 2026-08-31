@@ -133,13 +133,14 @@ class OrdinaryRecipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
-            self.attn_config, self.num_target_layers
+        bytes_per_token = _config_bytes_per_token(
+            self.attn_config,
+            self.num_target_layers,
         )
         if self.draft_attn_config is not None:
-            bytes_per_token += (
-                self.draft_attn_config.cache_cell_size()
-                * _storage_layers(self.draft_attn_config, self.num_draft_layers)
+            bytes_per_token += _config_bytes_per_token(
+                self.draft_attn_config,
+                self.num_draft_layers,
             )
         if bytes_per_token <= 0:
             raise ValueError(
@@ -160,6 +161,23 @@ def _storage_layers(config, num_layers: int) -> int:
         sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
     )
     return group_size if group_size is not None else num_layers
+
+
+def _config_bytes_per_token(config, num_layers: int) -> int:
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        DSAConfig,
+        dsa_index_k_row_bytes,
+    )
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+    storage_layers = _storage_layers(config, num_layers)
+    if not isinstance(config, DSAConfig):
+        return config.cache_cell_size() * storage_layers
+
+    latent_bytes = MLAConfig.cache_cell_size(config) * storage_layers
+    indexer_layers = sum(config.has_indexer(i) for i in range(num_layers))
+    index_bytes = dsa_index_k_row_bytes(config.index_head_dim) * indexer_layers
+    return latent_bytes + index_bytes
 
 
 def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
@@ -192,9 +210,10 @@ def _config_layer_fields(
     from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
     if isinstance(config, DSAConfig):
-        return _mla_layer_fields(config, layer_id, occurrence) + (
-            _index_k_field(config, layer_id),
-        )
+        fields = _mla_layer_fields(config, layer_id, occurrence)
+        if config.has_indexer(local_layer_id):
+            fields += (_index_k_field(config, layer_id),)
+        return fields
     if isinstance(config, MSAConfig):
         fields = _mha_layer_fields(config, layer_id, occurrence)
         if local_layer_id in config.sparse_layer_ids:
