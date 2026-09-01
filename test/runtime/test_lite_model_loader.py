@@ -20,7 +20,9 @@
 
 import importlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -155,6 +157,25 @@ def test_lite_config_derives_hybrid_and_oe_geometry():
     assert config.special_token_ids == tuple(range(4)) + tuple(range(36, 55))
 
 
+def test_lite_config_exposes_linear_tp_cache_geometry():
+    import tokenspeed.runtime.utils.env as env_mod
+
+    config = LiteConfig.from_dict(lite_config_dict())
+    with mock.patch.dict(
+        env_mod.global_server_args_dict,
+        {"mapping": mapping(8)},
+    ):
+        conv, recurrent, conv_dtype, state_dtype, layer_ids = (
+            config.mamba2_cache_params
+        )
+
+    assert conv == (12, 3)
+    assert recurrent == (1, 4, 4)
+    assert conv_dtype == torch.bfloat16
+    assert state_dtype == torch.float32
+    assert layer_ids == config.linear_layer_ids
+
+
 def test_lite_config_fails_closed_on_raw_checkpoint_fields():
     raw = lite_config_dict()
     raw.pop("linear_method")
@@ -183,7 +204,7 @@ def test_get_config_selects_lite_by_architecture_without_model_type(tmp_path):
     config = module.get_config(str(tmp_path), trust_remote_code=False)
 
     assert isinstance(config, LiteConfig)
-    assert config.architectures == ["FLASHLocalForCausalLM"]
+    assert config.architectures == ["LiteForCausalLM"]
 
 
 def test_model_registry_resolves_real_lite_entry_class():
@@ -195,11 +216,11 @@ def test_model_registry_resolves_real_lite_entry_class():
         raise
 
     model_class, architecture = module.ModelRegistry.resolve_model_cls(
-        ["FLASHLocalForCausalLM"]
+        ["LiteForCausalLM"]
     )
 
     assert model_class is FLASHLocalForCausalLM
-    assert architecture == "FLASHLocalForCausalLM"
+    assert architecture == "LiteForCausalLM"
 
 
 def test_real_layout_has_exact_source_count_and_shapes():
@@ -213,6 +234,22 @@ def test_real_layout_has_exact_source_count_and_shapes():
     ).shape == (
         4096,
         128,
+    )
+    q_spec = layout.spec("model.layers.0.self_attn.linear_core.q_proj.weight")
+    forget_spec = layout.spec("model.layers.0.self_attn.linear_core.f_proj.0.weight")
+    beta_spec = layout.spec("model.layers.0.self_attn.linear_core.b_proj.0.weight")
+    assert q_spec.target_name.endswith("self_attn.input_projection.weight")
+    assert q_spec.category == "kda-packed-projection"
+    assert (q_spec.component_id, q_spec.parallel, q_spec.shard_axis) == (
+        0,
+        "linear",
+        0,
+    )
+    assert (forget_spec.component_id, forget_spec.parallel) == (4, None)
+    assert (beta_spec.component_id, beta_spec.parallel) == (5, None)
+    assert (
+        layout.spec("model.layers.0.self_attn.linear_core.b_proj.1.weight").target_name
+        == "model.layers.0.self_attn.beta_b_proj.weight"
     )
     assert layout.spec("model.layers.3.self_attn.kv_b_proj.weight").shape == (
         8192,
@@ -239,7 +276,13 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
 
     assert isinstance(model.model.layers[0].self_attn, LiteKDAParameters)
     assert isinstance(model.model.layers[3].self_attn, LiteMLAParameters)
-    assert model.model.layers[0].self_attn.q_proj.weight.shape == (4, 96)
+    kda = model.model.layers[0].self_attn
+    assert kda.input_projection.weight.shape == (24, 96)
+    assert kda.input_projection.weight.numel() == (4 * 4 + 2 * 4) * 96
+    assert not any(
+        name.startswith(("q_proj.", "k_proj.", "v_proj.", "g_proj.", "f_a_proj."))
+        for name, _ in kda.named_parameters()
+    )
     assert model.model.layers[3].self_attn.q_b_proj.weight.shape == (48, 24)
     assert model.model.layers[0].mlp.experts.w13_weight.shape == (4, 32, 24)
     assert model.model.layers[0].mlp.experts.w2_weight.shape == (4, 24, 16)
@@ -255,6 +298,51 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
     assert model.model.ngram_embeddings.embedders[0].weight.numel() == 0
     assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
     assert model.model.ngram_embeddings.projection.shape == (12, 8, 96)
+
+
+def test_kda_merged_projection_splits_one_gemm_and_materializes_qkv():
+    config = LiteConfig.from_dict(lite_config_dict())
+    layer = LiteKDAParameters(config, mapping(), layer_id=0)
+    torch.manual_seed(1201)
+    with torch.no_grad():
+        layer.input_projection.weight.copy_(
+            torch.randn_like(layer.input_projection.weight).mul_(0.05)
+        )
+    hidden = torch.randn(3, config.hidden_size, dtype=torch.bfloat16)
+
+    qkv, gate, forget_a, beta_a = layer.input_projection(hidden)
+    projected = torch.nn.functional.linear(hidden, layer.input_projection.weight)
+    projection = layer.input_projection.local_projection
+    low_rank = layer.input_projection.head_dim
+
+    assert qkv.is_contiguous()
+    torch.testing.assert_close(qkv, projected[:, : 3 * projection])
+    torch.testing.assert_close(gate, projected[:, 3 * projection : 4 * projection])
+    torch.testing.assert_close(
+        forget_a, projected[:, 4 * projection : 4 * projection + low_rank]
+    )
+    torch.testing.assert_close(beta_a, projected[:, 4 * projection + low_rank :])
+
+
+def test_kda_merged_projection_rejects_invalid_component_shape_and_id():
+    layer = LiteKDAParameters(
+        LiteConfig.from_dict(lite_config_dict()), mapping(8), layer_id=0
+    )
+    projection = layer.input_projection
+
+    with pytest.raises(ValueError, match="component 6"):
+        projection.load_component(6, torch.empty(4, 96, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="shape/dtype"):
+        projection.load_component(0, torch.empty(3, 96, dtype=torch.bfloat16))
+
+
+def test_kda_merged_projection_meta_load_validates_without_copy():
+    config = LiteConfig.from_dict(lite_config_dict())
+    with torch.device("meta"):
+        layer = LiteKDAParameters(config, mapping(8), layer_id=0)
+
+    layer.input_projection.load_component(0, torch.empty(4, 96, dtype=torch.bfloat16))
+    assert layer.input_projection.weight.is_meta
 
 
 def test_model_accepts_bounded_replicated_mla_topology():
@@ -286,6 +374,15 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
     def sentinel(_index, name, tensor):
         if name == "model.layers.0.self_attn.linear_core.q_proj.weight":
             return torch.arange(tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
+        packed_values = {
+            "model.layers.0.self_attn.linear_core.k_proj.weight": 2,
+            "model.layers.0.self_attn.linear_core.v_proj.weight": 3,
+            "model.layers.0.self_attn.linear_core.g_proj.0.weight": 4,
+            "model.layers.0.self_attn.linear_core.f_proj.0.weight": 5,
+            "model.layers.0.self_attn.linear_core.b_proj.0.weight": 6,
+        }
+        if name in packed_values:
+            return torch.full_like(tensor, packed_values[name])
         if name == "model.ngram_embeddings.post_projs.3.weight":
             return torch.arange(tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
         expert_values = {
@@ -304,8 +401,18 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
         "model.layers.0.self_attn.linear_core.q_proj.weight",
         torch.empty((32, 96), dtype=torch.bfloat16),
     )
-    assert torch.equal(model.model.layers[0].self_attn.q_proj.weight, source[4:8])
-    assert "model.layers.0.self_attn.f_a_proj.weight" in loaded
+    merged = model.model.layers[0].self_attn.input_projection.weight
+    assert torch.equal(merged[:4], source[4:8])
+    for start, end, value in (
+        (4, 8, 2),
+        (8, 12, 3),
+        (12, 16, 4),
+        (16, 20, 5),
+        (20, 24, 6),
+    ):
+        assert torch.equal(merged[start:end], torch.full_like(merged[start:end], value))
+    assert "model.layers.0.self_attn.input_projection.weight" in loaded
+    assert "model.layers.0.self_attn.beta_b_proj.weight" in loaded
     assert "model.layers.0.mlp.experts.w13_weight" in loaded
     assert "model.layers.0.mlp.experts.w2_weight" in loaded
     experts = model.model.layers[0].mlp.experts
@@ -327,6 +434,41 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
     assert torch.equal(
         model.model.ngram_embeddings.projection[3], projection_source.t()
     )
+
+
+@pytest.mark.parametrize("rank", [0, 7])
+def test_strict_loader_places_kda_packed_edge_rank_shards(rank):
+    config = LiteConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(config, mapping(8, rank=rank))
+    source = torch.arange(32 * 96, dtype=torch.bfloat16).reshape(32, 96)
+
+    def sentinel(_index, name, tensor):
+        if name == "model.layers.0.self_attn.linear_core.q_proj.weight":
+            return source
+        return tensor
+
+    model.load_weights(weights(model.layout, sentinel))
+
+    expected = source[rank * 4 : (rank + 1) * 4]
+    torch.testing.assert_close(
+        model.model.layers[0].self_attn.input_projection.weight[:4], expected
+    )
+
+
+def test_strict_loader_rejects_duplicate_kda_packed_component(monkeypatch):
+    config = LiteConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(config, mapping())
+    original_spec = model.layout.spec
+
+    def duplicate_component(name):
+        spec = original_spec(name)
+        if name == "model.layers.0.self_attn.linear_core.k_proj.weight":
+            return replace(spec, component_id=0)
+        return spec
+
+    monkeypatch.setattr(model.layout, "spec", duplicate_component)
+    with pytest.raises(ValueError, match="Duplicate Lite KDA projection component 0"):
+        model.load_weights(weights(model.layout))
 
 
 def test_lite_grouped_expert_placement_is_a_bijection() -> None:

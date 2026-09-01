@@ -58,8 +58,15 @@ class _Scale(nn.Module):
     def __init__(self, scale: float) -> None:
         super().__init__()
         self.scale = scale
+        self.residual_calls = 0
 
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, value: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            self.residual_calls += 1
+            residual = residual + value
+            return residual * self.scale, residual
         return value * self.scale
 
 
@@ -117,7 +124,27 @@ def test_decoder_matches_double_residual_oracle() -> None:
     actual = layer(torch.arange(3), hidden, _ctx(), torch.arange(3))
 
     assert torch.equal(actual, 12 * hidden + 2)
+    assert layer.input_layernorm.residual_calls == 0
+    assert layer.post_attention_layernorm.residual_calls == 1
     assert layer.mlp.global_sp_num_tokens is None
+
+
+def test_lite_norm_preserves_fused_residual_semantics_on_cpu() -> None:
+    norm = lite._Norm(4)
+    norm.weight.data.fill_(1)
+    value = torch.tensor([[1.5, -2.0, 3.0, -4.5]], dtype=torch.bfloat16)
+    residual = torch.tensor([[2.0, 1.0, -1.5, 0.5]], dtype=torch.bfloat16)
+    summed = value.float() + residual.float()
+    expected_residual = summed.to(torch.bfloat16)
+    expected = (summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + 1e-6)).to(
+        torch.bfloat16
+    )
+
+    output, residual_out = norm(value, residual)
+
+    assert residual_out is residual
+    assert torch.equal(residual, expected_residual)
+    assert torch.equal(output, expected)
 
 
 def test_kda_reduces_once_and_prefill_passes_token_split(monkeypatch) -> None:
@@ -260,8 +287,11 @@ def test_decoder_residual_path_on_npu() -> None:
     layer.mlp = _MLP(-0.5)
     layer.input_layernorm.weight.data.fill_(1)
     layer.post_attention_layernorm.weight.data.fill_(1)
-    layer = layer.to("npu:0")
+    layer = layer.to(device="npu:0", dtype=torch.bfloat16)
     hidden = torch.arange(192, dtype=torch.bfloat16, device="npu:0").view(2, 96)
+    hidden_before = hidden.cpu().clone()
+
+    assert layer.post_attention_layernorm.weight.dtype == torch.bfloat16
 
     output = layer(
         torch.arange(2, device="npu:0"),
@@ -269,13 +299,20 @@ def test_decoder_residual_path_on_npu() -> None:
         _ctx(),
         torch.arange(2, device="npu:0"),
     )
-    hidden_cpu = hidden.cpu()
-    attention = _rms_oracle(hidden_cpu, config.rms_norm_eps) + 0.25
-    residual = hidden_cpu + attention
-    expected = residual + _rms_oracle(residual, config.rms_norm_eps) - 0.5
+    attention = _rms_oracle(hidden_before, config.rms_norm_eps) + 0.25
+    residual_fp32 = hidden_before.float() + attention.float()
+    residual = residual_fp32.to(torch.bfloat16)
+    moe_input = (
+        residual_fp32
+        * torch.rsqrt(
+            residual_fp32.square().mean(dim=-1, keepdim=True) + config.rms_norm_eps
+        )
+    ).to(torch.bfloat16)
+    expected = residual + moe_input - 0.5
 
     assert torch.isfinite(output).all().item()
     assert output.shape == hidden.shape
+    assert torch.equal(hidden.cpu(), residual)
     assert torch.allclose(output.cpu().float(), expected.float(), atol=0.02, rtol=0.02)
 
 

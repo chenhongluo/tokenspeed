@@ -22,8 +22,10 @@
 
 from typing import Any
 
+import torch
 from transformers.configuration_utils import PretrainedConfig
 
+from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -355,6 +357,27 @@ class LiteConfig(PretrainedConfig):
     @property
     def full_attention_layer_ids(self) -> list[int]:
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
+
+    @property
+    def mamba2_cache_params(self):
+        """Expose Lite KDA state geometry to the target hybrid backend."""
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        tp_size = global_server_args_dict["mapping"].linear_attn.tp_size
+        return (
+            (
+                divide(3 * self.linear_num_heads * self.linear_head_dim, tp_size),
+                self.linear_conv_size - 1,
+            ),
+            (
+                divide(self.linear_num_heads, tp_size),
+                self.linear_head_dim,
+                self.linear_head_dim,
+            ),
+            torch.bfloat16,
+            torch.float32,
+            self.linear_layer_ids,
+        )
 
     @property
     def oe_component_count(self) -> int:

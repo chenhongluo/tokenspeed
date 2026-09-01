@@ -54,6 +54,24 @@ def _inputs(beta_mode: str, *, batch: int = 3, device: str = "cpu"):
     return q, k, v, g_raw, beta, A_log, dt_bias, state
 
 
+def _lite_inputs(seed: int, *, batch: int = 2, device: str = "npu:0"):
+    torch.manual_seed(seed)
+    heads, dim = 4, 128
+    packed = torch.randn(1, batch, heads, 5, dim, device=device, dtype=torch.bfloat16)
+    q, k, v, g_raw, beta = packed.unbind(dim=-2)
+    A_log = torch.linspace(-0.2, 0.2, heads, device=device)
+    dt_bias = torch.randn(heads, dim, device=device) * 0.1
+    state = torch.randn(7, heads, dim, dim, device=device, dtype=torch.float32) * 0.01
+    assert not q.is_contiguous()
+    return q, k, v, g_raw, beta, A_log, dt_bias, state
+
+
+def _noncontiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
+    result = torch.stack((tensor, tensor), dim=-1)[..., 0]
+    assert not result.is_contiguous()
+    return result
+
+
 def _oracle(args, reads, writes, boundaries):
     q, k, v, g_raw, beta_logits, A_log, dt_bias, state = args
     q = F.normalize(q.float(), p=2, dim=-1)
@@ -259,3 +277,138 @@ def test_npu_decode_selection_and_graph_replay_updated_values():
     torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
     torch.testing.assert_close(graph_state, eager_state, atol=0, rtol=0)
     assert torch.isfinite(graph_output).all()
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
+def test_npu_lite_decode_triton_handles_strided_graph_inputs_and_padding():
+    torch.npu.set_device(0)
+    args = _lite_inputs(71)
+    reads = torch.tensor([1, -1], dtype=torch.int32, device="npu:0")
+    writes = torch.tensor([4, -1], dtype=torch.int32, device="npu:0")
+    boundaries = torch.tensor([0, 1, 1], dtype=torch.int32, device="npu:0")
+    initial = args[-1].clone()
+    oracle_a_log = _noncontiguous_copy(args[5])
+
+    eager_state = initial.clone()
+    expected_state = initial.clone()
+    actual = torch_kda_paged_decode(
+        *args[:-1],
+        state_pool=eager_state,
+        read_indices=reads,
+        write_indices=writes,
+        cu_seqlens=boundaries,
+        lower_bound=-5.0,
+    )
+    expected = torch_kda_paged_decode(
+        *args[:5],
+        oracle_a_log,
+        args[6],
+        state_pool=expected_state,
+        read_indices=reads,
+        write_indices=writes,
+        cu_seqlens=boundaries,
+        lower_bound=-5.0,
+    )
+    torch.npu.synchronize()
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
+    torch.testing.assert_close(eager_state, expected_state, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual[:, 1], torch.zeros_like(actual[:, 1]))
+    torch.testing.assert_close(eager_state[0], initial[0], atol=0, rtol=0)
+    torch.testing.assert_close(eager_state[1:4], initial[1:4], atol=0, rtol=0)
+    torch.testing.assert_close(eager_state[5:], initial[5:], atol=0, rtol=0)
+
+    graph_state = initial.clone()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
+        graph_output = torch_kda_paged_decode(
+            *args[:-1],
+            state_pool=graph_state,
+            read_indices=reads,
+            write_indices=writes,
+            cu_seqlens=boundaries,
+            lower_bound=-5.0,
+        )
+    graph_state.copy_(initial)
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(graph_output, expected, atol=1e-4, rtol=1e-5)
+    torch.testing.assert_close(graph_state, expected_state, atol=1e-6, rtol=1e-6)
+
+    for tensor in args[:5]:
+        tensor.copy_(torch.randn_like(tensor))
+    reads.copy_(torch.tensor([1, 2], dtype=torch.int32, device="npu:0"))
+    writes.copy_(torch.tensor([4, 5], dtype=torch.int32, device="npu:0"))
+    boundaries.copy_(torch.arange(3, dtype=torch.int32, device="npu:0"))
+    graph_state.copy_(initial)
+    expected_state.copy_(initial)
+    expected = torch_kda_paged_decode(
+        *args[:5],
+        oracle_a_log,
+        args[6],
+        state_pool=expected_state,
+        read_indices=reads,
+        write_indices=writes,
+        cu_seqlens=boundaries,
+        lower_bound=-5.0,
+    )
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(graph_output, expected, atol=1e-4, rtol=1e-5)
+    torch.testing.assert_close(graph_state, expected_state, atol=1e-6, rtol=1e-6)
+    assert torch.isfinite(graph_output).all()
+    assert torch.isfinite(graph_state).all()
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
+@pytest.mark.parametrize("seed", [81, 82, 83, 84])
+def test_npu_lite_decode_triton_128_step_trajectory(seed: int):
+    torch.npu.set_device(0)
+    args = _lite_inputs(seed)
+    initial = args[-1].clone()
+    actual_state = initial.clone()
+    expected_state = initial.clone()
+    reads = torch.tensor([1, 2], dtype=torch.int32, device="npu:0")
+    boundaries = torch.arange(3, dtype=torch.int32, device="npu:0")
+    oracle_a_log = _noncontiguous_copy(args[5])
+    actual_outputs = []
+    expected_outputs = []
+    for _ in range(128):
+        for tensor in args[:5]:
+            tensor.copy_(torch.randn_like(tensor))
+        expected_outputs.append(
+            torch_kda_paged_decode(
+                *args[:5],
+                oracle_a_log,
+                args[6],
+                state_pool=expected_state,
+                read_indices=reads,
+                write_indices=reads,
+                cu_seqlens=boundaries,
+                lower_bound=-5.0,
+            )
+        )
+        actual_outputs.append(
+            torch_kda_paged_decode(
+                *args[:-1],
+                state_pool=actual_state,
+                read_indices=reads,
+                write_indices=reads,
+                cu_seqlens=boundaries,
+                lower_bound=-5.0,
+            )
+        )
+    actual = torch.stack(actual_outputs)
+    expected = torch.stack(expected_outputs)
+    torch.npu.synchronize()
+    difference = (actual.float() - expected.float()).flatten(1)
+    denominator = expected.float().flatten(1).norm(dim=1).clamp_min(1e-12)
+    assert float(difference.abs().max().cpu()) <= 1e-4
+    assert float((difference.norm(dim=1) / denominator).max().cpu()) <= 1e-3
+    state_difference = actual_state - expected_state
+    state_denominator = expected_state.norm().clamp_min(1e-12)
+    assert float(state_difference.abs().max().cpu()) <= 1e-6
+    assert float((state_difference.norm() / state_denominator).cpu()) <= 1e-6
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(actual_state).all()
+    torch.testing.assert_close(actual_state[0], initial[0], atol=0, rtol=0)
+    torch.testing.assert_close(actual_state[3:], initial[3:], atol=0, rtol=0)

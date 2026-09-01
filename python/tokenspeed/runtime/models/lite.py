@@ -281,13 +281,33 @@ class LiteCheckpointLayout:
         }
         if leaf not in shapes:
             raise ValueError(f"Unexpected Lite KDA weight {name!r}.")
+        packed_components = {
+            "q_proj.weight": 0,
+            "k_proj.weight": 1,
+            "v_proj.weight": 2,
+            "g_proj.0.weight": 3,
+            "f_proj.0.weight": 4,
+            "b_proj.0.weight": 5,
+        }
+        if leaf in packed_components:
+            target = name.replace(f"{core}{leaf}", "input_projection.weight")
+            replicated = leaf in {"f_proj.0.weight", "b_proj.0.weight"}
+            return LiteWeightSpec(
+                name,
+                target,
+                shapes[leaf],
+                torch.bfloat16,
+                "kda-packed-projection",
+                None if replicated else "linear",
+                None if replicated else 0,
+                component_id=packed_components[leaf],
+            )
         target_leaf = {
-            "g_proj.0.weight": "g_proj.weight",
-            "f_proj.0.weight": "f_a_proj.weight",
+            "b_proj.1.weight": "beta_b_proj.weight",
             "f_proj.1.weight": "f_b_proj.weight",
         }.get(leaf, leaf)
         target = name.replace(f"{core}{leaf}", target_leaf)
-        replicated = {"b_proj.0.weight", "f_proj.0.weight", "o_norm.weight"}
+        replicated = {"o_norm.weight"}
         shard_axis = 1 if leaf == "o_proj.weight" else 0
         return LiteWeightSpec(
             name,
@@ -338,9 +358,45 @@ class LiteCheckpointLayout:
 
 
 class _Weight(nn.Module):
-    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        weight_nz: Literal["standard", "transposed"] | None = None,
+    ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+        self.weight_nz = weight_nz
+        self._weight_nz_prepared = False
+        self._weight_nz_transposed = False
+
+    def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
+        if (
+            self.weight_nz is None
+            or self._weight_nz_prepared
+            or self.weight.device.type != "npu"
+        ):
+            return
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if (
+            not global_server_args_dict.get("npu_enable_weight_nz", False)
+            or global_server_args_dict.get("disaggregation_mode") != "decode"
+        ):
+            return
+        import tokenspeed_kernel
+
+        transposed = self.weight_nz == "transposed"
+        self.weight.data = tokenspeed_kernel.prepare_weight_nz(
+            self.weight.data, transpose=transposed
+        )
+        self._weight_nz_transposed = transposed
+        self._weight_nz_prepared = True
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._weight_nz_transposed:
+            return torch.matmul(hidden_states, self.weight)
+        return F.linear(hidden_states, self.weight)
 
 
 def _all_reduce(tensor: torch.Tensor, group: tuple[int, ...]) -> torch.Tensor:
@@ -360,8 +416,14 @@ class _Norm(_Weight):
         super().__init__((size,), torch.bfloat16)
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
+            if residual is not None:
+                return hidden_states, residual
             return hidden_states
         if hidden_states.device.type in ("cuda", "npu"):
             from tokenspeed_kernel.ops.layernorm import rmsnorm
@@ -370,15 +432,84 @@ class _Norm(_Weight):
                 hidden_states,
                 self.weight.data,
                 self.variance_epsilon,
+                residual=residual,
             )
-        hidden_fp32 = hidden_states.float()
-        return (
-            hidden_fp32
+        normalized = hidden_states.float()
+        if residual is not None:
+            normalized = normalized + residual.float()
+            residual.copy_(normalized.to(residual.dtype))
+        output = (
+            normalized
             * torch.rsqrt(
-                hidden_fp32.square().mean(dim=-1, keepdim=True) + self.variance_epsilon
+                normalized.square().mean(dim=-1, keepdim=True) + self.variance_epsilon
             )
             * self.weight.float()
         ).to(hidden_states.dtype)
+        if residual is not None:
+            return output, residual
+        return output
+
+
+class _LiteKDAMergedProjection(nn.Module):
+    component_count = 6
+
+    def __init__(self, hidden_size: int, local_projection: int, head_dim: int):
+        super().__init__()
+        self.local_projection = local_projection
+        self.head_dim = head_dim
+        self._rows = (
+            local_projection,
+            local_projection,
+            local_projection,
+            local_projection,
+            head_dim,
+            head_dim,
+        )
+        self._offsets = (
+            0,
+            local_projection,
+            2 * local_projection,
+            3 * local_projection,
+            4 * local_projection,
+            4 * local_projection + head_dim,
+        )
+        self.weight = nn.Parameter(
+            torch.empty(sum(self._rows), hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+
+    def load_component(self, component_id: int, local_weight: torch.Tensor) -> None:
+        if component_id < 0 or component_id >= self.component_count:
+            raise ValueError(f"Invalid Lite KDA projection component {component_id}.")
+        rows = self._rows[component_id]
+        expected = (rows, self.weight.shape[1])
+        if (
+            tuple(local_weight.shape) != expected
+            or local_weight.dtype != self.weight.dtype
+        ):
+            raise ValueError(
+                f"Lite KDA projection component {component_id} has "
+                f"shape/dtype {tuple(local_weight.shape)}/{local_weight.dtype}; "
+                f"expected {expected}/{self.weight.dtype}."
+            )
+        if not self.weight.is_meta:
+            start = self._offsets[component_id]
+            self.weight.data[start : start + rows].copy_(
+                local_weight.to(device=self.weight.device)
+            )
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        projected = F.linear(hidden_states, self.weight)
+        projection = self.local_projection
+        low_rank = self.head_dim
+        return (
+            projected[:, : 3 * projection].contiguous(),
+            projected[:, 3 * projection : 4 * projection],
+            projected[:, 4 * projection : 4 * projection + low_rank],
+            projected[:, 4 * projection + low_rank :],
+        )
 
 
 class _VocabEmbedding(_Weight):
@@ -424,7 +555,9 @@ class _SharedExpert(nn.Module):
         local_ffn = config.ffn_hidden_size // dense_tp_size
         self.gate_proj = _Weight((local_ffn, config.hidden_size), torch.bfloat16)
         self.up_proj = _Weight((local_ffn, config.hidden_size), torch.bfloat16)
-        self.down_proj = _Weight((config.hidden_size, local_ffn), torch.bfloat16)
+        self.down_proj = _Weight(
+            (config.hidden_size, local_ffn), torch.bfloat16, weight_nz="standard"
+        )
 
 
 class _PackedExperts(nn.Module):
@@ -486,7 +619,9 @@ class LiteGroupedMoEParameters(nn.Module):
             (config.hidden_size // dense_tp, config.hidden_size), torch.bfloat16
         )
         self.proj_output = _Weight(
-            (config.hidden_size, config.hidden_size // dense_tp), torch.bfloat16
+            (config.hidden_size, config.hidden_size // dense_tp),
+            torch.bfloat16,
+            weight_nz="standard",
         )
         self.shared_experts = _SharedExpert(config, dense_tp)
         self._moe_plan: dict[str, Any] | None = None
@@ -810,10 +945,9 @@ class LiteKDAParameters(nn.Module):
         self.local_num_heads = config.linear_num_heads // tp
         self.head_dim = config.linear_head_dim
         self.projection = projection
-        self.q_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
-        self.k_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
-        self.v_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
-        self.g_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
+        self.input_projection = _LiteKDAMergedProjection(
+            config.hidden_size, local_projection, config.linear_head_dim
+        )
         self.q_conv1d = _Weight(
             (local_projection, 1, config.linear_conv_size), torch.bfloat16
         )
@@ -824,12 +958,8 @@ class LiteKDAParameters(nn.Module):
             (local_projection, 1, config.linear_conv_size), torch.bfloat16
         )
         self.conv_weights: torch.Tensor | None = None
-        self.b_proj = nn.Sequential(
-            _Weight((config.linear_head_dim, config.hidden_size), torch.bfloat16),
-            _Weight((local_projection, config.linear_head_dim), torch.bfloat16),
-        )
-        self.f_a_proj = _Weight(
-            (config.linear_head_dim, config.hidden_size), torch.bfloat16
+        self.beta_b_proj = _Weight(
+            (local_projection, config.linear_head_dim), torch.bfloat16
         )
         self.f_b_proj = _Weight(
             (local_projection, config.linear_head_dim), torch.bfloat16
@@ -842,7 +972,11 @@ class LiteKDAParameters(nn.Module):
             torch.empty(local_projection, dtype=torch.float32), requires_grad=False
         )
         self.o_norm = _Norm(config.linear_head_dim)
-        self.o_proj = _Weight((config.hidden_size, local_projection), torch.bfloat16)
+        self.o_proj = _Weight(
+            (config.hidden_size, local_projection),
+            torch.bfloat16,
+            weight_nz="standard",
+        )
 
     def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
         if self.conv_weights is not None:
@@ -868,17 +1002,8 @@ class LiteKDAParameters(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        qkv = torch.cat(
-            [
-                F.linear(hidden_states, projection.weight)
-                for projection in (self.q_proj, self.k_proj, self.v_proj)
-            ],
-            dim=-1,
-        )
-        output_gate = F.linear(hidden_states, self.g_proj.weight)
-        f_a_out = F.linear(hidden_states, self.f_a_proj.weight)
-        beta_down = F.linear(hidden_states, self.b_proj[0].weight)
-        beta_logits = F.linear(beta_down, self.b_proj[1].weight)
+        qkv, output_gate, f_a_out, beta_down = self.input_projection(hidden_states)
+        beta_logits = F.linear(beta_down, self.beta_b_proj.weight)
         conv_weights = self.conv_weights
         if conv_weights is None:
             self.process_weights_after_loading()
@@ -956,15 +1081,20 @@ class LiteMLAParameters(nn.Module):
             torch.bfloat16,
         )
         self.q_a_proj = _Weight(
-            (config.q_lora_rank, config.hidden_size), torch.bfloat16
+            (config.q_lora_rank, config.hidden_size),
+            torch.bfloat16,
+            weight_nz="transposed",
         )
         self.q_a_layernorm = _Norm(config.q_lora_rank)
         self.q_b_proj = _Weight(
-            (config.num_attention_heads * qk_dim, config.q_lora_rank), torch.bfloat16
+            (config.num_attention_heads * qk_dim, config.q_lora_rank),
+            torch.bfloat16,
+            weight_nz="standard",
         )
         self.kv_a_proj_with_mqa = _Weight(
             (config.kv_lora_rank + config.qk_rope_head_dim, config.hidden_size),
             torch.bfloat16,
+            weight_nz="transposed",
         )
         self.kv_a_layernorm = _Norm(config.kv_lora_rank)
         self.kv_b_proj = _Weight(
@@ -978,6 +1108,7 @@ class LiteMLAParameters(nn.Module):
         self.o_proj = _Weight(
             (config.hidden_size, config.num_attention_heads * config.v_head_dim),
             torch.bfloat16,
+            weight_nz="standard",
         )
         self.attn_mqa = PagedAttention(
             config.num_attention_heads,
@@ -1027,8 +1158,8 @@ class LiteMLAParameters(nn.Module):
     def _project_q_latent(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_a = F.linear(hidden_states, self.q_a_proj.weight)
-        latent = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight)
+        q_a = self.q_a_proj(hidden_states)
+        latent = self.kv_a_proj_with_mqa(hidden_states)
         kv_a = latent[..., : self.config.kv_lora_rank]
         if hidden_states.device.type == "npu":
             from tokenspeed_kernel.ops.attention import mla_normalize_project_query
@@ -1220,8 +1351,7 @@ class LiteDecoderLayer(nn.Module):
             hidden_states = _all_reduce(
                 hidden_states, self.mapping.linear_attn.tp_group
             )
-        residual = residual + hidden_states
-        hidden_states = self.post_attention_layernorm(residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         global_sp_num_tokens = (
             ctx.global_num_tokens
             if self.mapping.world_size == 8 and self.mapping.attn.cp_size == 8
@@ -1721,7 +1851,7 @@ class LiteModel(nn.Module):
         return self.norm(hidden_states), None
 
 
-class FLASHLocalForCausalLM(nn.Module):
+class LiteForCausalLM(nn.Module):
     """Lite causal LM with strict checkpoint ownership."""
 
     def __init__(self, config: LiteConfig, mapping: Any, **_kwargs: Any) -> None:
@@ -1866,8 +1996,10 @@ class FLASHLocalForCausalLM(nn.Module):
             local_expert_ids=self._local_expert_ids(),
         )
         expected_targets = set(params)
+        modules = dict(self.named_modules())
         seen_sources: set[str] = set()
         loaded_targets: set[str] = set()
+        packed_components: dict[str, set[int]] = {}
 
         for name, loaded_weight in weights:
             if name in seen_sources:
@@ -1912,6 +2044,30 @@ class FLASHLocalForCausalLM(nn.Module):
                         loaded_weight.t().to(device=param.device)
                     )
                 loaded_targets.add(spec.target_name)
+                continue
+            if spec.category == "kda-packed-projection":
+                if spec.component_id is None:
+                    raise ValueError(
+                        f"Missing Lite KDA component for {spec.source_name!r}."
+                    )
+                module_name = spec.target_name.removesuffix(".weight")
+                module = modules.get(module_name)
+                if not isinstance(module, _LiteKDAMergedProjection):
+                    raise ValueError(
+                        f"Missing Lite KDA projection target {module_name!r}."
+                    )
+                components = packed_components.setdefault(spec.target_name, set())
+                if spec.component_id in components:
+                    raise ValueError(
+                        f"Duplicate Lite KDA projection component "
+                        f"{spec.component_id} for {spec.target_name!r}."
+                    )
+                module.load_component(
+                    spec.component_id, self._local_weight(spec, loaded_weight)
+                )
+                components.add(spec.component_id)
+                if len(components) == module.component_count:
+                    loaded_targets.add(spec.target_name)
                 continue
             if spec.target_name in loaded_targets:
                 raise ValueError(
@@ -1983,4 +2139,7 @@ class FLASHLocalForCausalLM(nn.Module):
         )
 
 
-EntryClass = FLASHLocalForCausalLM
+# Keep direct imports used by the checkpoint probes while the runtime registry
+# uses the collision-free internal architecture name.
+FLASHLocalForCausalLM = LiteForCausalLM
+EntryClass = LiteForCausalLM

@@ -62,3 +62,24 @@ def test_add_rmsnorm_updates_residual(dtype: torch.dtype) -> None:
     assert residual_out is residual
     torch.testing.assert_close(residual, expected_residual, atol=0, rtol=0)
     torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("tokens", [1, 2])
+def test_add_rmsnorm_supports_npu_graph(tokens: int) -> None:
+    x = torch.randn(tokens, 768, device="npu", dtype=torch.bfloat16)
+    seed = torch.randn_like(x)
+    residual = torch.empty_like(x)
+    weight = torch.randn(768, device="npu", dtype=torch.bfloat16)
+    expected_residual = x + seed
+    expected = _reference(expected_residual, weight, 1e-6)
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
+        residual.copy_(seed)
+        result, residual_out = rmsnorm(x, weight, 1e-6, residual=residual)
+    graph.replay()
+    torch.npu.synchronize()
+
+    assert residual_out is residual
+    torch.testing.assert_close(residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)

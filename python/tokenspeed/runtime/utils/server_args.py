@@ -287,6 +287,7 @@ class ServerArgs:
 
     # Runtime options
     disable_pdl: bool = False
+    npu_enable_weight_nz: bool = False
     enable_prefix_caching: bool = True
     disable_kvstore: bool = False
     enforce_eager: bool = False
@@ -1830,6 +1831,11 @@ class ServerArgs:
             "--disable-pdl",
             action="store_true",
             help="Disable PDL launch.",
+        )
+        parser.add_argument(
+            "--npu-enable-weight-nz",
+            action="store_true",
+            help="Prepare selected Lite Decode weights in Ascend FRACTAL_NZ format.",
         )
         prefix_cache_group = parser.add_mutually_exclusive_group()
         prefix_cache_group.add_argument(

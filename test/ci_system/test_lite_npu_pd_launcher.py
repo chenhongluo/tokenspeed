@@ -141,6 +141,8 @@ def test_check_prints_the_bounded_8p8d_commands_without_side_effects(tmp_path):
     assert "--max-cudagraph-capture-size 2" in decode
     assert "--disaggregation-mode prefill" in prefill
     assert "--disaggregation-mode decode" in decode
+    assert "--npu-enable-weight-nz" not in prefill
+    assert "--npu-enable-weight-nz" in decode
     assert "--pd-disaggregation" in gateway
     assert "--prefill grpc://127.0.0.1:" in gateway
     assert "--decode grpc://127.0.0.1:" in gateway
@@ -227,6 +229,28 @@ def test_check_rejects_metrics_port_occupied_on_wildcard_address(tmp_path):
     assert result.returncode == 2
     assert "metrics listener unavailable at 0.0.0.0" in result.stderr
     assert not Path(env["LITE_PD_LOG_DIR"]).exists()
+
+
+def test_check_can_disable_decode_weight_nz(tmp_path):
+    env = _env(tmp_path)
+    env["LITE_DECODE_WEIGHT_NZ"] = "0"
+
+    result = _check(env)
+
+    assert result.returncode == 0, result.stderr
+    prefill, decode, _gateway = result.stdout.splitlines()
+    assert "--npu-enable-weight-nz" not in prefill
+    assert "--npu-enable-weight-nz" not in decode
+
+
+def test_check_rejects_invalid_decode_weight_nz(tmp_path):
+    env = _env(tmp_path)
+    env["LITE_DECODE_WEIGHT_NZ"] = "yes"
+
+    result = _check(env)
+
+    assert result.returncode == 2
+    assert "LITE_DECODE_WEIGHT_NZ must be 0 or 1" in result.stderr
 
 
 def test_normal_mode_preflights_the_native_mooncake_abi():

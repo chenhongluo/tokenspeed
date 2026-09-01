@@ -282,15 +282,21 @@ def test_lite_kda_projects_featurewise_beta_and_applies_output_gate():
     cached_conv_weights = layer.conv_weights
     layer.process_weights_after_loading()
     assert layer.conv_weights is cached_conv_weights
-    beta_down = F.linear(hidden, layer.b_proj[0].weight)
-    beta_expected = F.linear(beta_down, layer.b_proj[1].weight)
+    projection = layer.input_projection.local_projection
+    low_rank = layer.input_projection.head_dim
+    merged_weight = layer.input_projection.weight
+    beta_down = F.linear(
+        hidden,
+        merged_weight[4 * projection + low_rank : 4 * projection + 2 * low_rank],
+    )
+    beta_expected = F.linear(beta_down, layer.beta_b_proj.weight)
     torch.testing.assert_close(backend.kwargs["beta_raw"], beta_expected)
     assert backend.kwargs["beta_raw"].shape == (2, 2 * 3)
     assert backend.kwargs["output_gate"] is None
 
-    gate = torch.sigmoid(F.linear(hidden, layer.g_proj.weight).float()).to(
-        torch.bfloat16
-    )
+    gate = torch.sigmoid(
+        F.linear(hidden, merged_weight[3 * projection : 4 * projection]).float()
+    ).to(torch.bfloat16)
     normalized = core.float() * torch.rsqrt(
         core.float().square().mean(-1, keepdim=True) + config.rms_norm_eps
     )
@@ -379,7 +385,8 @@ def test_ascend_lite_model_uses_fused_output_epilogue():
         for parameter in layer.parameters():
             parameter.zero_()
         identity = torch.eye(width, dtype=torch.bfloat16, device="npu")
-        layer.g_proj.weight.copy_(identity)
+        gate_start = 3 * width
+        layer.input_projection.weight[gate_start : gate_start + width].copy_(identity)
         layer.o_norm.weight.fill_(1)
         layer.o_proj.weight.copy_(identity)
 
@@ -406,7 +413,10 @@ def test_ascend_lite_model_uses_fused_output_epilogue():
         ctx,
         torch.arange(2, dtype=torch.int32, device="npu"),
     )
-    gate = F.linear(hidden, layer.g_proj.weight)
+    gate = F.linear(
+        hidden,
+        layer.input_projection.weight[gate_start : gate_start + width],
+    )
     expected = _lite_output_epilogue_oracle(
         core, gate, layer.o_norm.weight, eps, heads, dim
     )

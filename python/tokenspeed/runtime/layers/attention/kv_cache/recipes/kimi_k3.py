@@ -191,6 +191,8 @@ class KimiK3Recipe(CacheRecipe):
     def _kda_shapes(self):
         """(conv shape, recurrent shape) per rank, validated against tp size."""
         tp_size = self.attn_config.attn_tp_size
+        if getattr(self._text_config, "model_type", None) == "lite":
+            tp_size = self.server_args.mapping.linear_attn.tp_size
         if tp_size <= 0:
             raise ValueError(f"tp_size must be positive, got {tp_size}")
         cache_dtype = self.attn_config.kv_cache_dtype

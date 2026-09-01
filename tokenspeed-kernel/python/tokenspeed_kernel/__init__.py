@@ -101,6 +101,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     mm,
     prepare_fp8_linear,
+    prepare_weight_nz,
     warmup_prepared_fp8_linears,
 )
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
@@ -150,6 +151,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_weight_nz",
     "warmup_prepared_fp8_linears",
     # attention
     "mha_plan",

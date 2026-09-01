@@ -265,7 +265,7 @@ class ModelExecutorConfig:
             getattr(text_config, "ple_layer_ids", None)
             or getattr(text_config, "indexer_n_heads", None) is not None
         )
-        lite_has_host_oe = "FLASHLocalForCausalLM" in (
+        lite_has_host_oe = "LiteForCausalLM" in (
             getattr(text_config, "architectures", None) or ()
         )
         disable_prefill_graph = (

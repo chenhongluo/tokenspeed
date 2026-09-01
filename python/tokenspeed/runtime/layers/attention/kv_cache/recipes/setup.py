@@ -185,7 +185,7 @@ def prepare_cache_setup(
         raise ValueError(f"unsupported cache model family: {family}")
     hf_config = model_config.hf_config
     text_config = getattr(hf_config, "text_config", hf_config)
-    if family == "kimi_k3" and "FLASHLocalForCausalLM" in (
+    if family == "kimi_k3" and "LiteForCausalLM" in (
         getattr(text_config, "architectures", None) or ()
     ):
         recipe = LiteRecipe

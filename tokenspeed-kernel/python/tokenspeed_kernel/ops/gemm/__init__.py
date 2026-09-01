@@ -99,11 +99,20 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_weight_nz",
     "warmup_prepared_fp8_linears",
 ]
 
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
+
+
+def prepare_weight_nz(weight: torch.Tensor, *, transpose: bool = False) -> torch.Tensor:
+    if not _platform.is_npu:
+        raise RuntimeError("Weight-NZ preparation requires an Ascend NPU platform.")
+    from tokenspeed_kernel_npu.ops.gemm import prepare_weight_nz as prepare
+
+    return prepare(weight, transpose=transpose)
 
 
 class _PreparedFp8Linear(torch.nn.Module):

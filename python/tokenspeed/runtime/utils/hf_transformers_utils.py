@@ -560,7 +560,7 @@ _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
 )
 
 _MISTRAL_REGEX_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
-    {"FLASHLocalForCausalLM", "LongcatCausalLM"}
+    {"FLASHLocalForCausalLM", "LiteForCausalLM", "LongcatCausalLM"}
 )
 
 

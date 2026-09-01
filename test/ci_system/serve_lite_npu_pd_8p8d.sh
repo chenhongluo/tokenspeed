@@ -37,6 +37,7 @@ MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-8192}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-2}
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-1024}
 PREFIX_GRANULARITY=${PREFIX_GRANULARITY:-64}
+LITE_DECODE_WEIGHT_NZ=${LITE_DECODE_WEIGHT_NZ:-1}
 LOG_DIR=${LITE_PD_LOG_DIR:-.ci-artifacts/lite-npu-pd-8p8d}
 
 fail() {
@@ -83,6 +84,7 @@ positive_int MAX_TOTAL_TOKENS "$MAX_TOTAL_TOKENS"
 positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS"
 positive_int CHUNKED_PREFILL_SIZE "$CHUNKED_PREFILL_SIZE"
 positive_int PREFIX_GRANULARITY "$PREFIX_GRANULARITY"
+[[ $LITE_DECODE_WEIGHT_NZ =~ ^[01]$ ]] || fail "LITE_DECODE_WEIGHT_NZ must be 0 or 1"
 ((MAX_MODEL_LEN <= 4096)) || fail "MAX_MODEL_LEN exceeds the bounded 4096-token admission"
 ((MAX_TOTAL_TOKENS <= 8192)) || fail "MAX_TOTAL_TOKENS exceeds the bounded 8192-token admission"
 ((MAX_NUM_SEQS <= 2)) || fail "MAX_NUM_SEQS exceeds the bounded BS2 admission"
@@ -231,6 +233,9 @@ DECODE_CMD=(
   --dist-init-addr "127.0.0.1:$DECODE_DIST_PORT"
   --disaggregation-mode decode
 )
+if [[ $LITE_DECODE_WEIGHT_NZ == 1 ]]; then
+  DECODE_CMD+=(--npu-enable-weight-nz)
+fi
 GATEWAY_CMD=(
   "$PYTHON" -m smg launch
   --pd-disaggregation

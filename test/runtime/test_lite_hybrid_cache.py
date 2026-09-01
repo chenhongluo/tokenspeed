@@ -33,7 +33,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
 )
 
-_ARCHITECTURE = "FLASHLocalForCausalLM"
+_ARCHITECTURE = "LiteForCausalLM"
 _STATE_GROUPS = tuple(f"{LINEAR_ATTENTION}_{index}" for index in range(3))
 
 
@@ -57,10 +57,6 @@ def _lite_recipe(
     overlap_schedule_depth: int = 0,
 ) -> Any:
     try:
-        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-            LinearAttnConfig,
-        )
         from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.lite import LiteRecipe
     except ModuleNotFoundError as exc:
@@ -70,40 +66,30 @@ def _lite_recipe(
 
     text_config = LiteConfig()
     text_config.architectures = [_ARCHITECTURE]
-    linear = LinearAttnConfig(
-        num_k_heads=text_config.linear_num_heads,
-        num_v_heads=text_config.linear_num_heads,
-        head_k_dim=text_config.linear_head_dim,
-        head_v_dim=text_config.linear_head_dim,
-        conv_kernel_size=text_config.linear_conv_size,
-        layer_ids=tuple(text_config.linear_layer_ids),
-        tp_size=tp_size,
-    )
-    mla = MLAConfig(
+    attn_config = MLAConfig(
+        device=device,
+        context_len=token_limit,
         backend_name="mla",
         num_attention_heads=text_config.num_attention_heads,
         num_kv_heads=text_config.num_key_value_heads,
         head_dim=text_config.qk_nope_head_dim + text_config.qk_rope_head_dim,
         attn_tp_size=1,
-        kv_lora_rank=text_config.kv_lora_rank,
-        qk_nope_head_dim=text_config.qk_nope_head_dim,
-        qk_rope_head_dim=text_config.qk_rope_head_dim,
-        v_head_dim=text_config.v_head_dim,
-        scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
-        kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
-    )
-    attn_config = AttnConfig(
-        device=device,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method=None,
         prefix_granularity=128,
         max_bs=max_bs,
         max_graph_bs=max_bs,
-        context_len=token_limit,
-        pd_disaggregation_enabled=True,
         speculative_num_draft_tokens=1,
-        components=(mla, linear),
+        kv_lora_rank=text_config.kv_lora_rank,
+        qk_nope_head_dim=text_config.qk_nope_head_dim,
+        qk_rope_head_dim=text_config.qk_rope_head_dim,
+        v_head_dim=text_config.v_head_dim,
+        scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
+        kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+        layer_types=tuple(text_config.layer_types),
+        max_scheduled_tokens=128,
+        pd_disaggregation_enabled=True,
     )
     return LiteRecipe(
         server_args=SimpleNamespace(
@@ -111,6 +97,9 @@ def _lite_recipe(
             chunked_prefill_size=128,
             speculative_algorithm=None,
             speculative_num_draft_tokens=1,
+            mapping=SimpleNamespace(
+                linear_attn=SimpleNamespace(tp_size=tp_size),
+            ),
         ),
         model_config=SimpleNamespace(hf_config=text_config),
         attn_config=attn_config,
@@ -181,12 +170,8 @@ def _accelerator_device() -> str:
 
 def test_lite_is_registered_as_the_existing_hybrid_mla_kda_family() -> None:
     try:
-        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-            LinearAttnConfig,
-        )
         from tokenspeed.runtime.layers.attention.registry import (
             _HYBRID_MLA_KDA_ARCHITECTURES,
-            _LINEAR_ATTN_CLS,
         )
     except ModuleNotFoundError as exc:
         if exc.name == "compressed_tensors":
@@ -198,7 +183,6 @@ def test_lite_is_registered_as_the_existing_hybrid_mla_kda_family() -> None:
         raise
 
     assert _ARCHITECTURE in _HYBRID_MLA_KDA_ARCHITECTURES
-    assert _LINEAR_ATTN_CLS[_ARCHITECTURE] is LinearAttnConfig
 
 
 def test_replicated_mla_service_keeps_full_component_geometry() -> None:
@@ -222,13 +206,26 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
         moe_ep_size=8,
     )
     server_args = SimpleNamespace(
+        device="cpu",
         mapping=mapping,
         attn_tp_size=8,
         attention_backend="mla",
         drafter_attention_backend=None,
+        speculative_algorithm=None,
+        spec_context_pad=0,
+        kv_cache_dtype="bfloat16",
+        prefix_granularity=128,
+        max_cudagraph_capture_size=8,
+        max_num_seqs=8,
+        data_parallel_size=None,
+        kv_cache_quant_method=None,
+        chunked_prefill_size=128,
+        disaggregation_mode="prefill",
     )
     model_config = SimpleNamespace(
         hf_config=text_config,
+        context_len=4096,
+        dtype=torch.bfloat16,
         num_attention_heads=text_config.num_attention_heads,
         num_key_value_heads=text_config.num_key_value_heads,
         head_dim=text_config.qk_nope_head_dim + text_config.qk_rope_head_dim,
@@ -239,14 +236,14 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
         scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
     )
 
-    kwargs = MLAConfig._spec_kwargs(server_args, model_config, is_draft=False)
+    config = MLAConfig.generate(server_args, model_config, is_draft=False)
 
-    assert kwargs["attn_tp_size"] == 1
-    assert kwargs["num_attention_heads"] == text_config.num_attention_heads
+    assert config.attn_tp_size == 1
+    assert config.num_attention_heads == text_config.num_attention_heads
 
     text_config.architectures = ["OtherForCausalLM"]
-    kwargs = MLAConfig._spec_kwargs(server_args, model_config, is_draft=False)
-    assert kwargs["attn_tp_size"] == 8
+    config = MLAConfig.generate(server_args, model_config, is_draft=False)
+    assert config.attn_tp_size == 8
 
 
 @pytest.mark.parametrize(
@@ -517,7 +514,7 @@ def test_lite_graph_state_indices_refresh_without_reallocation() -> None:
         raise
 
     recipe, pool = _pool()
-    backend = MambaAttnBackend(recipe.attn_config, recipe.attn_config.components[0])
+    backend = MambaAttnBackend(recipe.attn_config)
     backend.set_kv_pool(pool)
     backend.init_cuda_graph_state(2)
     backend.init_forward_metadata_capture_cuda_graph(
