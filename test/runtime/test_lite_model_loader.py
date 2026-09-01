@@ -91,17 +91,27 @@ def lite_config_dict(**overrides):
 
 def mapping(world_size=1, rank=0, role="prefill"):
     size = world_size
+    dense_size = size if role == "decode" else 1
+    world_group = tuple(range(world_size))
     return SimpleNamespace(
         world_size=world_size,
         rank=rank,
         pp_size=1,
-        dense=SimpleNamespace(tp_size=size, tp_rank=rank),
-        linear_attn=SimpleNamespace(tp_size=size, tp_rank=rank),
-        moe=SimpleNamespace(ep_size=size, ep_rank=rank),
+        dense=SimpleNamespace(
+            tp_size=dense_size,
+            tp_rank=rank if role == "decode" else 0,
+            tp_group=world_group if role == "decode" else (rank,),
+        ),
+        linear_attn=SimpleNamespace(tp_size=size, tp_rank=rank, tp_group=world_group),
+        moe=SimpleNamespace(ep_size=size, ep_rank=rank, ep_group=world_group),
         attn=SimpleNamespace(
             tp_size=1,
             cp_size=size if role == "prefill" else 1,
             dp_size=size if role == "decode" else 1,
+            cp_rank=rank if role == "prefill" else 0,
+            dp_rank=rank if role == "decode" else 0,
+            cp_group=world_group if role == "prefill" else (rank,),
+            dp_group=world_group if role == "decode" else (rank,),
         ),
     )
 
@@ -223,8 +233,11 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
     assert isinstance(model.model.layers[3].self_attn, LiteMLAParameters)
     assert model.model.layers[0].self_attn.q_proj.weight.shape == (4, 96)
     assert model.model.layers[3].self_attn.q_b_proj.weight.shape == (48, 24)
-    assert tuple(model.model.layers[0].mlp.experts) == ("12", "13", "14", "15")
-    assert model.model.layers[0].mlp.proj_input.weight.shape == (12, 96)
+    assert model.model.layers[0].mlp.experts.w13_weight.shape == (4, 32, 24)
+    assert model.model.layers[0].mlp.experts.w2_weight.shape == (4, 24, 16)
+    expected_dense = 96 if role == "prefill" else 12
+    assert model.model.layers[0].mlp.proj_input.weight.shape == (expected_dense, 96)
+    assert model.model.layers[0].mlp.proj_output.weight.shape == (96, expected_dense)
     assert model.model.layers[0].mlp.expert_groups[
         0
     ].router.classifier.weight.shape == (
@@ -244,6 +257,13 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
     def sentinel(_index, name, tensor):
         if name == "model.layers.0.self_attn.linear_core.q_proj.weight":
             return torch.arange(tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
+        expert_values = {
+            "model.layers.0.mlp.experts.1.gate_proj.weight": 1,
+            "model.layers.0.mlp.experts.1.up_proj.weight": 2,
+            "model.layers.0.mlp.experts.1.down_proj.weight": 3,
+        }
+        if name in expert_values:
+            return torch.full_like(tensor, expert_values[name])
         return tensor
 
     loaded = model.load_weights(weights(layout, sentinel))
@@ -255,10 +275,32 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
     )
     assert torch.equal(model.model.layers[0].self_attn.q_proj.weight, source[4:8])
     assert "model.layers.0.self_attn.f_a_proj.weight" in loaded
-    assert "model.layers.0.mlp.experts.4.gate_proj.weight" in loaded
-    assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in loaded
+    assert "model.layers.0.mlp.experts.w13_weight" in loaded
+    assert "model.layers.0.mlp.experts.w2_weight" in loaded
+    experts = model.model.layers[0].mlp.experts
+    assert torch.equal(
+        experts.w13_weight[0, :16], torch.ones_like(experts.w13_weight[0, :16])
+    )
+    assert torch.equal(
+        experts.w13_weight[0, 16:], torch.full_like(experts.w13_weight[0, 16:], 2)
+    )
+    assert torch.equal(experts.w2_weight[0], torch.full_like(experts.w2_weight[0], 3))
+    assert model._local_expert_ids() == (1, 9, 17, 25)
     assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
     assert model.model.ngram_embeddings.embedders[0].weight.shape == (13, 8)
+
+
+def test_lite_grouped_expert_placement_is_a_bijection() -> None:
+    models = [
+        FLASHLocalForCausalLM(
+            LiteConfig.from_dict(lite_config_dict()), mapping(8, rank=rank)
+        )
+        for rank in range(8)
+    ]
+
+    assert sorted(
+        expert for model in models for expert in model._local_expert_ids()
+    ) == list(range(32))
 
 
 @pytest.mark.parametrize(

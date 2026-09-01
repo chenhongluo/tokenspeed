@@ -27,7 +27,6 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 
 
 @dataclass(frozen=True)
@@ -76,14 +75,24 @@ def _build_default_expert_plan(
     num_experts: int,
     ep_rank: int,
     ep_size: int,
+    local_expert_ids: Sequence[int] | None = None,
 ) -> list[ExpertWeightPlanEntry]:
-    # Expert ownership is assumed to be a contiguous per-rank range here.
-    # EPLB-aware remapping would need a different planning step.
     num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
-    start_expert = num_local_experts * ep_rank
+    if local_expert_ids is None:
+        start_expert = num_local_experts * ep_rank
+        local_expert_ids = range(start_expert, start_expert + num_local_experts)
+    elif (
+        len(local_expert_ids) != num_local_experts
+        or len(set(local_expert_ids)) != num_local_experts
+        or any(
+            expert_id < 0 or expert_id >= num_experts for expert_id in local_expert_ids
+        )
+    ):
+        raise ValueError(
+            "local_expert_ids must contain exactly one valid source ID per local expert"
+        )
     expert_plan: list[ExpertWeightPlanEntry] = []
-    for local_expert_id in range(num_local_experts):
-        expert_id = start_expert + local_expert_id
+    for local_expert_id, expert_id in enumerate(local_expert_ids):
         expert_plan.extend(
             (
                 ExpertWeightPlanEntry(
@@ -422,6 +431,10 @@ class MoECheckpointLoader:
                         "which the fused local-tensor loader cannot apply; load a "
                         "pre-quantized checkpoint or drop --quantization fp8."
                     )
+                from tokenspeed.runtime.model_loader.weight_utils import (
+                    default_weight_loader,
+                )
+
                 if tensor_to_load.dtype == torch.float8_e5m2:
                     default_weight_loader(param, local_experts.to(torch.bfloat16))
                 else:
@@ -454,6 +467,7 @@ def build_moe_checkpoint_loader(
     num_experts: int | None = None,
     ep_rank: int = 0,
     ep_size: int = 1,
+    local_expert_ids: Sequence[int] | None = None,
     fused_gate_up_as_w13: bool = False,
     include_bias: bool = False,
     fused_load_style: str = "per_expert",
@@ -469,6 +483,7 @@ def build_moe_checkpoint_loader(
             num_experts=num_experts,
             ep_rank=ep_rank,
             ep_size=ep_size,
+            local_expert_ids=local_expert_ids,
         )
         global_expert_plan = _build_global_expert_name_plan(
             expert_schema,

@@ -114,6 +114,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_plan,
     moe_process_weights,
     moe_sigmoid_bias_topk,
+    moe_softmax_bias_topk,
     moe_softmax_topk,
     native_latent_moe_available,
 )
@@ -220,6 +221,7 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "moe_softmax_bias_topk",
     "moe_softmax_topk",
     # mhc
     "mhc_fused_hc",

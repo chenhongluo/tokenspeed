@@ -25,7 +25,6 @@ from torch import nn
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.loaders import make_weight_loader
-from tokenspeed.runtime.utils import set_weight_attrs
 
 
 def create_dense_weight_pair(
@@ -61,8 +60,8 @@ def create_dense_weight_pair(
     layer.register_parameter("w2_weight", w2_weight)
 
     weight_loader = make_weight_loader(spec)
-    set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
-    set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
+    w13_weight.weight_loader = weight_loader
+    w2_weight.weight_loader = weight_loader
 
     if with_bias:
         w13_weight_bias = torch.nn.Parameter(
@@ -76,8 +75,8 @@ def create_dense_weight_pair(
         layer.register_parameter("w13_weight_bias", w13_weight_bias)
         layer.register_parameter("w2_weight_bias", w2_weight_bias)
         bias_loader = make_weight_loader(spec, is_bias=True)
-        set_weight_attrs(w13_weight_bias, {"weight_loader": bias_loader})
-        set_weight_attrs(w2_weight_bias, {"weight_loader": bias_loader})
+        w13_weight_bias.weight_loader = bias_loader
+        w2_weight_bias.weight_loader = bias_loader
 
     return ispp
 

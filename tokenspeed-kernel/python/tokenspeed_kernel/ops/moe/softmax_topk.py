@@ -118,6 +118,52 @@ def moe_softmax_topk(
     )
 
 
+def moe_softmax_bias_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    *,
+    routed_scaling_factor: float = 1.0,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select experts with biased softmax scores and unbiased route weights."""
+    if router_logits.ndim != 2:
+        raise ValueError("router_logits must have shape [tokens, experts]")
+    tokens, experts = router_logits.shape
+    if not router_logits.is_floating_point():
+        raise ValueError("router_logits must have a floating-point dtype")
+    if correction_bias.shape != (experts,):
+        raise ValueError("correction_bias must have shape [experts]")
+    if correction_bias.device != router_logits.device:
+        raise ValueError("correction_bias and router_logits must share a device")
+    if correction_bias.dtype != router_logits.dtype:
+        raise ValueError("correction_bias and router_logits must share a dtype")
+    if not 0 < topk <= experts:
+        raise ValueError(f"topk must be in [1, {experts}], got {topk}")
+    if tokens == 0:
+        shape = (0, topk)
+        return (
+            torch.empty(shape, device=router_logits.device, dtype=torch.float32),
+            torch.empty(shape, device=router_logits.device, dtype=torch.int32),
+        )
+
+    if solution is None and not Platform.get().is_npu:
+        solution = "torch"
+    kernel = select_kernel(
+        "moe",
+        "softmax_bias_topk",
+        format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
+        solution=solution,
+    )
+    return kernel(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        enable_pdl=pdl_enabled(),
+    )
+
+
 @register_kernel(
     "moe",
     "softmax_topk",
@@ -146,4 +192,34 @@ def torch_softmax_topk(
     return topk_weights, topk_ids
 
 
-__all__ = ["moe_softmax_topk", "torch_softmax_topk"]
+@register_kernel(
+    "moe",
+    "softmax_bias_topk",
+    name="torch_softmax_bias_topk",
+    solution="torch",
+    signatures=format_signatures("router_logits", "dense", set(_SUPPORTED_DTYPES)),
+    priority=Priority.PORTABLE,
+    tags={"portability", "reference"},
+)
+def torch_softmax_bias_topk(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch reference for selection-only biased softmax routing."""
+    del enable_pdl
+    scores = torch.softmax(router_logits.float(), dim=-1)
+    topk_ids = torch.topk(scores + correction_bias.float(), topk, dim=-1).indices
+    topk_weights = scores.gather(1, topk_ids) * routed_scaling_factor
+    return topk_weights, topk_ids.to(torch.int32)
+
+
+__all__ = [
+    "moe_softmax_bias_topk",
+    "moe_softmax_topk",
+    "torch_softmax_bias_topk",
+    "torch_softmax_topk",
+]

@@ -21,6 +21,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import tokenspeed_kernel.ops.moe.ascend  # noqa: F401
+
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
@@ -49,6 +51,7 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "moe_softmax_bias_topk",
     "moe_softmax_topk",
 ]
 
@@ -61,7 +64,10 @@ from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
-from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.softmax_topk import (  # noqa: E402
+    moe_softmax_bias_topk,
+    moe_softmax_topk,
+)
 
 
 @dataclass(frozen=True)

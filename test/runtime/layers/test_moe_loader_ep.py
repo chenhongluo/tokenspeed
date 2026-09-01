@@ -54,3 +54,31 @@ def test_checkpoint_plan_rejects_uneven_or_out_of_range_ep() -> None:
             ep_rank=8,
             ep_size=8,
         )
+
+
+def test_checkpoint_plan_accepts_explicit_local_expert_order() -> None:
+    plan = _build_default_expert_plan(
+        _KIMI3_SCHEMA,
+        num_experts=32,
+        ep_rank=1,
+        ep_size=8,
+        local_expert_ids=(1, 9, 17, 25),
+    )
+
+    assert [entry.checkpoint_weight_name for entry in plan[::3]] == [
+        "experts.1.w1.",
+        "experts.9.w1.",
+        "experts.17.w1.",
+        "experts.25.w1.",
+    ]
+    assert [entry.local_expert_id for entry in plan[::3]] == [0, 1, 2, 3]
+
+    for invalid in ((1, 9, 17), (1, 1, 17, 25), (1, 9, 17, 32)):
+        with pytest.raises(ValueError, match="local_expert_ids"):
+            _build_default_expert_plan(
+                _KIMI3_SCHEMA,
+                num_experts=32,
+                ep_rank=1,
+                ep_size=8,
+                local_expert_ids=invalid,
+            )
