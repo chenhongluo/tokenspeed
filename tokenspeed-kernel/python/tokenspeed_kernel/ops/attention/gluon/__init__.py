@@ -341,6 +341,7 @@ if current_platform().is_amd:
             {torch.float16, torch.bfloat16},
         ),
         priority=Priority.SPECIALIZED,
+        traits={"beta_mode": frozenset({"scalar"})},
         tags={"amd", "gfx950", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
@@ -366,6 +367,7 @@ if current_platform().is_amd:
             {torch.float16, torch.bfloat16},
         ),
         priority=Priority.SPECIALIZED,
+        traits={"beta_mode": frozenset({"scalar"})},
         tags={"amd", "gfx1250", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx1250(**kwargs) -> KdaPrefillResult:
@@ -392,6 +394,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "beta_mode": frozenset({"scalar"}),
             "indexed_state": frozenset({True}),
             "single_token": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
@@ -641,6 +644,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "beta_mode": frozenset({"scalar"}),
             "indexed_state": frozenset({True}),
             "single_token": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),

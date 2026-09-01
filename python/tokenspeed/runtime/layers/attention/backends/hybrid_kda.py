@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_batched_replay_uses_raw_gate,
+    kda_causal_conv1d,
     kda_paged_decode,
     kda_paged_prefill,
 )
@@ -388,6 +389,119 @@ class KdaAttnBackend(MambaAttnBackend):
         else:
             return g_raw
 
+    @staticmethod
+    def _featurewise_beta(
+        beta_raw: torch.Tensor | None,
+        num_heads: int,
+        head_dim: int,
+    ) -> bool:
+        if beta_raw is None:
+            raise ValueError("KDA requires beta logits")
+        if beta_raw.shape[-1] == num_heads:
+            return False
+        if beta_raw.shape[-1] == num_heads * head_dim:
+            return True
+        raise ValueError("KDA beta width must be local heads or local heads * head_dim")
+
+    @classmethod
+    def _reshape_beta(
+        cls,
+        beta_raw: torch.Tensor,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        if cls._featurewise_beta(beta_raw, num_heads, head_dim):
+            return beta_raw.view(1, seq_len, num_heads, head_dim)
+        return beta_raw.view(1, seq_len, num_heads)
+
+    @override
+    def _causal_conv_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_weights: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        *,
+        beta_raw: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        if not self._featurewise_beta(beta_raw, num_heads, head_dim):
+            return super()._causal_conv_decode(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                bias,
+                activation,
+                read_indices,
+                write_indices,
+            )
+        return kda_causal_conv1d(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            read_indices,
+            write_indices,
+            self.forward_metadata.query_start_loc,
+            bias=bias,
+            activation=activation,
+            decode=True,
+        )
+
+    @override
+    def _causal_conv_prefill(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_weights: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        seq_lens_cpu: torch.Tensor | None,
+        *,
+        beta_raw: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        if not self._featurewise_beta(beta_raw, num_heads, head_dim):
+            return super()._causal_conv_prefill(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                bias,
+                activation,
+                state_indices,
+                query_start_loc,
+                has_initial_states,
+                seq_lens_cpu,
+            )
+        boundaries_cpu = None
+        if seq_lens_cpu is not None:
+            boundaries_cpu = torch.zeros(
+                len(seq_lens_cpu) + 1, dtype=torch.int64, device="cpu"
+            )
+            torch.cumsum(seq_lens_cpu.to(torch.int64), dim=0, out=boundaries_cpu[1:])
+        elif query_start_loc.device.type == "cpu":
+            boundaries_cpu = query_start_loc.to(torch.int64)
+        return kda_causal_conv1d(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            state_indices,
+            state_indices,
+            query_start_loc,
+            cu_seqlens_cpu=boundaries_cpu,
+            bias=bias,
+            has_initial_state=has_initial_states,
+            activation=activation,
+        )
+
     @override
     def _decode(
         self,
@@ -421,6 +535,8 @@ class KdaAttnBackend(MambaAttnBackend):
             return None
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
+        if self._featurewise_beta(beta_raw, num_value_heads, head_v_dim):
+            return None
         result = try_kda_fused_paged_decode(
             mixed_qkv,
             conv_weights,
@@ -492,7 +608,7 @@ class KdaAttnBackend(MambaAttnBackend):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, num_value_heads, head_v_dim)
         g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
-        beta_kda = beta_raw.view(1, seq_len, num_value_heads)
+        beta_kda = self._reshape_beta(beta_raw, seq_len, num_value_heads, head_k_dim)
 
         if qk_l2norm_in_kernel:
             core_attn_out = kda_paged_decode(
@@ -566,6 +682,11 @@ class KdaAttnBackend(MambaAttnBackend):
         beta_is_logit: bool,
         qk_l2norm_in_kernel: bool,
     ) -> torch.Tensor | None:
+        num_value_heads = value_dim // attn_tp_size // head_v_dim
+        if self._featurewise_beta(beta_raw, num_value_heads, head_v_dim):
+            raise NotImplementedError(
+                "Lite featurewise-beta KDA speculative verify is not implemented"
+            )
         if not qk_l2norm_in_kernel:
             return None
         if self._replay_active:
@@ -594,7 +715,6 @@ class KdaAttnBackend(MambaAttnBackend):
                     ),
                     rows,
                 )
-            num_value_heads = value_dim // attn_tp_size // head_v_dim
             if layer_id not in self._replay_weights:
                 # Parameters are stable objects; model weight updates copy into
                 # their storage, so binding their pointers once cannot stale.
@@ -639,7 +759,6 @@ class KdaAttnBackend(MambaAttnBackend):
         if f_a_out is None or bias is not None:
             return None
         else:
-            num_value_heads = value_dim // attn_tp_size // head_v_dim
             return try_kda_fused_paged_verify(
                 mixed_qkv,
                 conv_weights,
@@ -854,7 +973,7 @@ class KdaAttnBackend(MambaAttnBackend):
             1, seq_len, num_value_heads, head_k_dim
         )
 
-        beta_kda = beta_raw.view(1, seq_len, num_value_heads)
+        beta_kda = self._reshape_beta(beta_raw, seq_len, num_value_heads, head_k_dim)
 
         query, key, value, g_kda, beta_kda = _slice_kda_prefill_inputs(
             num_real_tokens, query, key, value, g_kda, beta_kda

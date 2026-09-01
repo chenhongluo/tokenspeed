@@ -176,6 +176,7 @@ cython_debug/
 Build/
 build-*/
 build_*/
+tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/_public_kda_ops/
 
 # CMake generated files
 CMakeFiles/

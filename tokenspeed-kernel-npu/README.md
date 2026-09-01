@@ -21,6 +21,17 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
+Lite KDA can additionally build the pinned public AscendC operator subset:
+
+```bash
+test/ci_system/install_public_kda_ops.sh
+```
+
+This command builds against the active CANN/PyTorch ABI and installs the
+generated artifact below this package. It does not install vLLM-Ascend as a
+Python dependency. Set `TOKENSPEED_PUBLIC_KDA_SOURCE_DIR` to an exact prepared
+public checkout when the build host has no network access.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

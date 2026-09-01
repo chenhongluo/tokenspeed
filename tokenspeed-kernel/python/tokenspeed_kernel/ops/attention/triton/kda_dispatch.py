@@ -341,6 +341,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
     traits={
+        "beta_mode": frozenset({"scalar"}),
         "indexed_state": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     },
@@ -547,7 +548,10 @@ def triton_nvidia_kda_batched_replay_commit(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={
+        "beta_mode": frozenset({"scalar"}),
+        "recurrent_layout": frozenset({"k_major"}),
+    },
     tags={"nvidia", "paged_cache"},
 )
 def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
@@ -568,7 +572,10 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={
+        "beta_mode": frozenset({"scalar"}),
+        "recurrent_layout": frozenset({"k_major"}),
+    },
     tags={"nvidia", "paged_cache"},
 )
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
@@ -585,7 +592,10 @@ def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={
+        "beta_mode": frozenset({"scalar"}),
+        "recurrent_layout": frozenset({"k_major"}),
+    },
     tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:

@@ -29,6 +29,7 @@ from typing import Any, Literal
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from tokenspeed.runtime.configs.lite_config import LiteConfig
 
@@ -384,11 +385,17 @@ class LiteGroupedMoEParameters(nn.Module):
 
 
 class LiteKDAParameters(nn.Module):
-    def __init__(self, config: LiteConfig, mapping: Any) -> None:
+    def __init__(self, config: LiteConfig, mapping: Any, layer_id: int) -> None:
         super().__init__()
         tp = mapping.linear_attn.tp_size
         projection = config.linear_num_heads * config.linear_head_dim
         local_projection = projection // tp
+        self.config = config
+        self.mapping = mapping
+        self.layer_id = layer_id
+        self.local_num_heads = config.linear_num_heads // tp
+        self.head_dim = config.linear_head_dim
+        self.projection = projection
         self.q_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
         self.k_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
         self.v_proj = _Weight((local_projection, config.hidden_size), torch.bfloat16)
@@ -402,6 +409,7 @@ class LiteKDAParameters(nn.Module):
         self.v_conv1d = _Weight(
             (local_projection, 1, config.linear_conv_size), torch.bfloat16
         )
+        self.conv_weights: torch.Tensor | None = None
         self.b_proj = nn.Sequential(
             _Weight((config.linear_head_dim, config.hidden_size), torch.bfloat16),
             _Weight((local_projection, config.linear_head_dim), torch.bfloat16),
@@ -422,8 +430,101 @@ class LiteKDAParameters(nn.Module):
         self.o_norm = _Norm(config.linear_head_dim)
         self.o_proj = _Weight((config.hidden_size, local_projection), torch.bfloat16)
 
-    def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
-        raise NotImplementedError("Lite KDA execution is implemented in phase 3.")
+    def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
+        if self.conv_weights is not None:
+            return
+        self.conv_weights = torch.cat(
+            [
+                conv.weight.squeeze(1)
+                for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
+            ],
+            dim=0,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: Any,
+        out_cache_loc: torch.Tensor,
+        comm_manager: Any = None,
+        **_kwargs: Any,
+    ) -> torch.Tensor:
+        del positions, comm_manager
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        qkv = torch.cat(
+            [
+                F.linear(hidden_states, projection.weight)
+                for projection in (self.q_proj, self.k_proj, self.v_proj)
+            ],
+            dim=-1,
+        )
+        output_gate = F.linear(hidden_states, self.g_proj.weight)
+        f_a_out = F.linear(hidden_states, self.f_a_proj.weight)
+        beta_down = F.linear(hidden_states, self.b_proj[0].weight)
+        beta_logits = F.linear(beta_down, self.b_proj[1].weight)
+        conv_weights = self.conv_weights
+        if conv_weights is None:
+            self.process_weights_after_loading()
+            conv_weights = self.conv_weights
+        assert conv_weights is not None
+
+        core_output = ctx.attn_backend.forward(
+            q=None,
+            k=None,
+            v=None,
+            layer=None,
+            out_cache_loc=out_cache_loc,
+            token_to_kv_pool=ctx.token_to_kv_pool,
+            forward_mode=ctx.forward_mode,
+            bs=ctx.bs,
+            mixed_qkv=qkv,
+            conv_weights=conv_weights,
+            bias=None,
+            activation="silu",
+            key_dim=self.projection,
+            value_dim=self.projection,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
+            head_k_dim=self.head_dim,
+            head_v_dim=self.head_dim,
+            f_a_out=f_a_out,
+            f_b_weight=self.f_b_proj.weight,
+            beta_raw=beta_logits,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            lower_bound=self.config.linear_attn_config["gate_lower_bound"],
+            output_gate=None,
+            norm_weight=None,
+            norm_eps=None,
+            layer_id=self.layer_id,
+            seq_len=hidden_states.shape[0],
+        ).reshape(-1, self.local_num_heads, self.head_dim)
+
+        if core_output.device.type in ("cuda", "npu"):
+            from tokenspeed_kernel.ops.activation.triton import (
+                rmsnorm_gated_sigmoid,
+            )
+
+            gated = rmsnorm_gated_sigmoid(
+                core_output.flatten(1).contiguous(),
+                output_gate,
+                self.o_norm.weight,
+                self.config.rms_norm_eps,
+                self.local_num_heads,
+                self.head_dim,
+            )
+        else:
+            core_fp32 = core_output.float()
+            normalized = core_fp32 * torch.rsqrt(
+                core_fp32.square().mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
+            )
+            normalized = (normalized * self.o_norm.weight.float()).to(core_output.dtype)
+            output_gate = output_gate.reshape_as(normalized)
+            gated = normalized * torch.sigmoid(output_gate.float()).to(normalized.dtype)
+            gated = gated.flatten(1)
+        return F.linear(gated, self.o_proj.weight)
 
 
 class LiteMLAParameters(nn.Module):
@@ -468,7 +569,7 @@ class LiteDecoderLayer(nn.Module):
         super().__init__()
         self.input_layernorm = _Norm(config.hidden_size)
         self.self_attn = (
-            LiteKDAParameters(config, mapping)
+            LiteKDAParameters(config, mapping, layer_id)
             if config.is_kda_layer(layer_id)
             else LiteMLAParameters(config)
         )

@@ -150,6 +150,7 @@ __all__ = [
     "gdn_decode_mtp",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
+    "kda_causal_conv1d",
     "kda_paged_prefill",
     "kda_recurrent_layout",
     "kda_paged_decode",
@@ -1494,6 +1495,131 @@ def kda_recurrent_layout() -> str:
     return "v_major" if v_major else "k_major"
 
 
+def _kda_beta_mode(q: torch.Tensor, beta_logits: torch.Tensor) -> str:
+    if beta_logits.shape == q.shape[:-1]:
+        return "scalar"
+    if beta_logits.shape == q.shape:
+        return "featurewise"
+    raise ValueError(
+        "KDA beta logits must be scalar [1,tokens,heads] or featurewise "
+        "[1,tokens,heads,key_dim]"
+    )
+
+
+def kda_causal_conv1d(
+    projected: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    decode: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run packed KDA causal-conv and publish state to independent pages."""
+    if projected.ndim != 2 or weight.ndim != 2 or conv_state.ndim != 3:
+        raise ValueError("KDA causal-conv expects 2D input/weight and 3D state")
+    channels, width = weight.shape
+    if width != 4 or projected.shape[1] != channels:
+        raise ValueError("KDA causal-conv requires matching width-4 channels")
+    if conv_state.shape[1:] != (channels, width - 1):
+        raise ValueError("KDA causal-conv state shape does not match its weight")
+    if projected.dtype != weight.dtype or conv_state.dtype != projected.dtype:
+        raise ValueError("KDA causal-conv input, weight, and state dtypes must match")
+    if projected.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("KDA causal-conv requires bfloat16 or float16 tensors")
+    if read_indices.ndim != 1 or write_indices.shape != read_indices.shape:
+        raise ValueError("KDA causal-conv read/write indices must be matching vectors")
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() != read_indices.numel() + 1:
+        raise ValueError("KDA causal-conv boundaries must match the request count")
+    if cu_seqlens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("KDA causal-conv boundaries must use int32 or int64")
+    if read_indices.dtype not in (torch.int32, torch.int64) or (
+        write_indices.dtype != read_indices.dtype
+    ):
+        raise ValueError("KDA causal-conv indices must use int32 or int64")
+    if bias is not None and (
+        bias.shape != (channels,) or bias.dtype != projected.dtype
+    ):
+        raise ValueError("KDA causal-conv bias must match the channels and dtype")
+    if has_initial_state is not None and has_initial_state.shape != read_indices.shape:
+        raise ValueError("KDA causal-conv initial-state mask must match its indices")
+    if has_initial_state is not None and has_initial_state.dtype != torch.bool:
+        raise ValueError("KDA causal-conv initial-state mask must be boolean")
+    if activation not in (None, "silu", "swish"):
+        raise ValueError(f"Unsupported KDA causal-conv activation {activation!r}")
+    if decode and projected.shape[0] != read_indices.numel():
+        raise ValueError("KDA causal-conv Decode requires one row per request")
+    if not decode and (
+        not isinstance(cu_seqlens_cpu, torch.Tensor)
+        or cu_seqlens_cpu.device.type != "cpu"
+        or cu_seqlens_cpu.dtype != torch.int64
+        or cu_seqlens_cpu.numel() != cu_seqlens.numel()
+    ):
+        raise ValueError("KDA causal-conv Prefill requires host int64 boundaries")
+    device_tensors = [weight, conv_state, read_indices, write_indices, cu_seqlens]
+    if bias is not None:
+        device_tensors.append(bias)
+    if has_initial_state is not None:
+        device_tensors.append(has_initial_state)
+    if any(tensor.device != projected.device for tensor in device_tensors):
+        raise ValueError("KDA causal-conv device tensors must share one device")
+
+    traits = {
+        "forward_mode": "decode" if decode else "prefill",
+        "batch_class": "large" if read_indices.numel() >= 16 else "small",
+        "activation": "none" if activation is None else "silu",
+        "width": width,
+    }
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_causal_conv1d",
+            _attention_format_signature(projected=projected, weight=weight),
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if override is not None or solution is not None:
+            raise
+        from tokenspeed_kernel.ops.attention.kda_reference import (
+            torch_kda_causal_conv1d,
+        )
+
+        return torch_kda_causal_conv1d(
+            projected,
+            weight,
+            conv_state,
+            read_indices,
+            write_indices,
+            cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens,
+            bias=bias,
+            has_initial_state=has_initial_state,
+            activation=activation,
+        )
+    return kernel(
+        projected=projected,
+        weight=weight,
+        conv_state=conv_state,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        bias=bias,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        decode=decode,
+        require_public=override is not None or solution == "public_kda",
+    )
+
+
 def kda_paged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1516,7 +1642,8 @@ def kda_paged_prefill(
     Args:
         q/k/g_raw: Packed tensors ``[1, total_tokens, heads, key_dim]``.
         v: Values ``[1, total_tokens, heads, value_dim]``.
-        beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
+        beta_logits: Raw scalar logits ``[1, total_tokens, heads]`` or
+            featurewise logits ``[1, total_tokens, heads, key_dim]``.
         A_log/dt_bias: FP32 gate parameters.
         initial_state: One backend-owned recurrent state per sequence.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
@@ -1542,14 +1669,13 @@ def kda_paged_prefill(
         raise ValueError("KDA q, k, and g_raw must have identical shapes")
     if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
         raise ValueError("KDA v must match q through the head dimension")
-    if beta_logits.shape != q.shape[:-1]:
-        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    beta_mode = _kda_beta_mode(q, beta_logits)
     num_sequences = cu_seqlens.numel() - 1
     if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
         raise ValueError("KDA initial_state must contain one row per sequence")
     if (
         not isinstance(cu_seqlens_cpu, torch.Tensor)
-        or cu_seqlens_cpu.is_cuda
+        or cu_seqlens_cpu.device.type != "cpu"
         or cu_seqlens_cpu.dtype != torch.int64
         or cu_seqlens_cpu.numel() != cu_seqlens.numel()
     ):
@@ -1563,6 +1689,7 @@ def kda_paged_prefill(
         "attention",
         "kda_paged_prefill",
         _attention_format_signature(q=q, k=k, v=v),
+        traits={"beta_mode": beta_mode},
         solution=solution,
         override=override,
     )
@@ -1572,7 +1699,7 @@ def kda_paged_prefill(
     relayout = supported is not None and recurrent_layout not in supported
     if relayout:
         initial_state = initial_state.transpose(-1, -2).contiguous()
-    result = kernel(
+    kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -1585,6 +1712,9 @@ def kda_paged_prefill(
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
     )
+    if spec is not None and spec.solution == "public_kda":
+        kwargs["require_public"] = override is not None or solution == "public_kda"
+    result = kernel(**kwargs)
     if relayout:
         # Hand the final state back in the caller's layout (a view; no copy).
         return KdaPrefillResult(result.out, result.final_state.transpose(-1, -2))
@@ -1614,7 +1744,8 @@ def kda_paged_decode(
     Args:
         q/k/g_raw: Packed tensors ``[1, batch, heads, key_dim]``.
         v: Packed values ``[1, batch, heads, value_dim]``.
-        beta_logits: Raw beta logits ``[1, batch, heads]``.
+        beta_logits: Raw scalar logits ``[1, batch, heads]`` or featurewise
+            logits ``[1, batch, heads, key_dim]``.
         A_log/dt_bias: FP32 gate parameters.
         state_pool: Backend-owned recurrent-state pool.
         read_indices/write_indices: Independent source/destination rows.
@@ -1635,8 +1766,7 @@ def kda_paged_decode(
         raise ValueError("KDA decode q, k, and g_raw must have identical shapes")
     if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
         raise ValueError("KDA decode v must match q through the head dimension")
-    if beta_logits.shape != q.shape[:-1]:
-        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    beta_mode = _kda_beta_mode(q, beta_logits)
     num_sequences = read_indices.numel()
     if read_indices.ndim != 1 or write_indices.shape != (num_sequences,):
         raise ValueError("KDA decode requires one read/write index per sequence")
@@ -1651,6 +1781,7 @@ def kda_paged_decode(
             "indexed_state": True,
             "single_token": q.shape[1] == num_sequences,
             "recurrent_layout": recurrent_layout,
+            "beta_mode": beta_mode,
         },
         solution=solution,
         override=override,

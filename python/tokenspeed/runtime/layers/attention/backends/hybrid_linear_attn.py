@@ -1520,14 +1520,17 @@ class MambaAttnBackend(AttentionBackend):
         # Stride-aware fused decoders consume packed projection views directly.
         # Preserve the shared fallback's established compact input layout.
         mixed_qkv = mixed_qkv.contiguous()
-        mixed_qkv = causal_conv1d_update(
+        mixed_qkv = self._causal_conv_decode(
             mixed_qkv,
             conv_states,
             conv_weights,
             bias,
             activation,
-            conv_state_indices=read_indices,
-            output_state_indices=state_out_blocks.view(-1, 1),
+            read_indices,
+            state_out_blocks,
+            beta_raw=beta_raw,
+            num_heads=value_dim // attn_tp_size // head_v_dim,
+            head_dim=head_v_dim,
         )
 
         query, key, value = torch.split(
@@ -1573,6 +1576,27 @@ class MambaAttnBackend(AttentionBackend):
             output_gate=output_gate,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+        )
+
+    def _causal_conv_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_weights: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        **_kwargs,
+    ) -> torch.Tensor:
+        return causal_conv1d_update(
+            mixed_qkv,
+            conv_states,
+            conv_weights,
+            bias,
+            activation,
+            conv_state_indices=read_indices,
+            output_state_indices=write_indices.view(-1, 1),
         )
 
     def _decode(
@@ -1852,18 +1876,20 @@ class MambaAttnBackend(AttentionBackend):
                 num_real_tokens = int(sum(int(x) for x in extend_seq_lens_cpu))
                 scrub_padding_tail(num_real_tokens, mixed_qkv, a, b)
 
-            mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv_t,
+            mixed_qkv = self._causal_conv_prefill(
+                mixed_qkv,
+                conv_states,
                 conv_weights,
                 bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=conv_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+                activation,
+                conv_cache_indices,
+                query_start_loc,
+                has_initial_states,
+                extend_seq_lens_cpu,
+                beta_raw=beta_raw,
+                num_heads=value_dim // attn_tp_size // head_v_dim,
+                head_dim=head_v_dim,
+            )[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -1952,6 +1978,31 @@ class MambaAttnBackend(AttentionBackend):
             ssm_states[state_out_long] = last_recurrent_state
 
         return core_attn_out
+
+    def _causal_conv_prefill(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_weights: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        seq_lens_cpu: torch.Tensor | None,
+        **_kwargs,
+    ) -> torch.Tensor:
+        return causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            conv_weights,
+            bias,
+            activation=activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states,
+            cache_indices=state_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+        ).transpose(0, 1)
 
     def _verify(
         self,

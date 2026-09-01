@@ -12,6 +12,7 @@ from tokenspeed_kernel.ops import attention as attention_ops
 from tokenspeed_kernel.ops.attention import (
     KdaPrefillResult,
     _attention_format_signature,
+    kda_causal_conv1d,
     kda_paged_decode,
     kda_paged_prefill,
     kda_recurrent_layout,
@@ -31,6 +32,43 @@ from tokenspeed_kernel.selection import (
 # K3 serving values: gate lower bound from the config, RMSNorm eps from the model.
 LOWER_BOUND = -5.0
 NORM_EPS = 1e-6
+
+
+@pytest.mark.parametrize(
+    ("decode", "batch_size", "batch_class"),
+    [(True, 2, "small"), (False, 15, "small"), (False, 16, "large")],
+)
+def test_kda_causal_conv_routes_by_mode_and_request_count(
+    monkeypatch, decode, batch_size, batch_class
+) -> None:
+    captured = {}
+
+    def fake_select(*_args, **kwargs):
+        captured.update(kwargs["traits"])
+        return SelectedKernel("fake_kda_causal_conv", lambda **call: call["projected"])
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select)
+    tokens = batch_size if decode else batch_size * 2
+    projected = torch.zeros(tokens, 4, dtype=torch.bfloat16)
+    boundaries = torch.arange(0, tokens + 1, 1 if decode else 2, dtype=torch.int64)
+    output = kda_causal_conv1d(
+        projected,
+        torch.zeros(4, 4, dtype=torch.bfloat16),
+        torch.zeros(batch_size + 1, 4, 3, dtype=torch.bfloat16),
+        torch.arange(batch_size, dtype=torch.int32),
+        torch.arange(1, batch_size + 1, dtype=torch.int32),
+        boundaries,
+        cu_seqlens_cpu=None if decode else boundaries,
+        decode=decode,
+    )
+
+    assert output is projected
+    assert captured == {
+        "forward_mode": "decode" if decode else "prefill",
+        "batch_class": batch_class,
+        "activation": "silu",
+        "width": 4,
+    }
 
 
 @pytest.mark.parametrize(
@@ -63,7 +101,7 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
         registry,
         "get_by_name",
         lambda name: (
-            SimpleNamespace(traits=traits)
+            SimpleNamespace(traits=traits, solution="fake")
             if name == selected.name
             else original_get_by_name(name)
         ),
@@ -92,6 +130,50 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
     else:
         assert captured["initial_state"] is initial_state
         assert result.final_state is initial_state
+
+
+@pytest.mark.parametrize(
+    ("spec_solution", "requested_solution", "expected"),
+    [
+        ("public_kda", None, False),
+        ("public_kda", "public_kda", True),
+        ("torch", "torch", None),
+    ],
+)
+def test_kda_prefill_only_sends_require_public_to_public_kernel(
+    monkeypatch, spec_solution, requested_solution, expected
+) -> None:
+    captured = {}
+
+    def fake_kernel(**kwargs):
+        captured.update(kwargs)
+        return KdaPrefillResult(torch.empty(0), kwargs["initial_state"])
+
+    selected = SelectedKernel("fake_kda_prefill", fake_kernel)
+    monkeypatch.setattr(
+        attention_ops, "select_kernel", lambda *_args, **_kwargs: selected
+    )
+    registry = KernelRegistry.get()
+    monkeypatch.setattr(
+        registry,
+        "get_by_name",
+        lambda _name: SimpleNamespace(traits={}, solution=spec_solution),
+    )
+    q = torch.empty(1, 1, 1, 2)
+    kda_paged_prefill(
+        q,
+        q,
+        q,
+        q,
+        torch.empty(1, 1, 1),
+        torch.empty(1),
+        torch.empty(1, 2),
+        initial_state=torch.empty(1, 1, 2, 2),
+        cu_seqlens=torch.tensor([0, 1]),
+        cu_seqlens_cpu=torch.tensor([0, 1], dtype=torch.int64),
+        solution=requested_solution,
+    )
+    assert captured.get("require_public") is expected
 
 
 @pytest.mark.parametrize(
