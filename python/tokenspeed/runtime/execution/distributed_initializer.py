@@ -167,6 +167,7 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
+        pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
         if config.mapping.has_pp:

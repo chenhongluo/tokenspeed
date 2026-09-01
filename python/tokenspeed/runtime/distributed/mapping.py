@@ -312,6 +312,41 @@ class VisionTowerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
+class LinearAttnLayerMapping(MappingBase):
+    """Parallel mapping for head-sharded linear-attention layers."""
+
+    def __init__(
+        self,
+        rank: int | None = None,
+        world_size: int = 1,
+        tp_size: int | None = None,
+    ):
+        super().__init__(rank, world_size)
+        self.tp_size, self.dp_size = _resolve_parallelism_sizes(
+            self.world_size, tp_size, None
+        )
+
+    @cached_property
+    def has_tp(self) -> bool:
+        return self.tp_size > 1
+
+    @cached_property
+    def tp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def tp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def dp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.dp_size, stride=self.tp_size)
+
+    @cached_property
+    def dp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
+
+
 class Mapping(MappingBase):
 
     def __init__(
@@ -329,6 +364,7 @@ class Mapping(MappingBase):
         moe_dp_size: int | None = None,
         vision_tp_size: int | None = None,
         vision_dp_size: int | None = None,
+        linear_attn_tp_size: int | None = None,
         pp_size: int = 1,
         pp_layer_partition: tuple[int, ...] | None = None,
         nprocs_per_node: int | None = None,
@@ -384,6 +420,15 @@ class Mapping(MappingBase):
             tp_size=vision_tp_size,
             dp_size=vision_dp_size,
         )
+        self.linear_attn = LinearAttnLayerMapping(
+            rank=rank,
+            world_size=stage_world_size,
+            tp_size=(
+                linear_attn_tp_size
+                if linear_attn_tp_size is not None
+                else self.attn.tp_size
+            ),
+        )
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
         )
@@ -397,6 +442,7 @@ class Mapping(MappingBase):
         self.dense.rank = rank
         self.moe.rank = rank
         self.vision.rank = rank
+        self.linear_attn.rank = rank
 
     @cached_property
     def has_pp(self) -> bool:

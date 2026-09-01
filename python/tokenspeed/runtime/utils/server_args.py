@@ -323,6 +323,7 @@ class ServerArgs:
     nprocs_per_node: int | None = None
     world_size: int | None = None
     attn_tp_size: int | None = None
+    linear_attn_tp_size: int | None = None
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
@@ -664,6 +665,7 @@ class ServerArgs:
             moe_dp_size=moe_dp_size,
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
+            linear_attn_tp_size=self.linear_attn_tp_size,
             pp_size=pp_size,
             pp_layer_partition=self.pp_layer_partition,
             nprocs_per_node=nprocs_per_node,
@@ -2028,6 +2030,12 @@ class ServerArgs:
             help="Specify tp size for dense part. Defaults to the attention "
             "replica width (attn_tp_size x attn_cp_size): the full world without "
             "DP attention, one replica with it.",
+        )
+        parser.add_argument(
+            "--linear-attn-tp-size",
+            type=int,
+            default=ServerArgs.linear_attn_tp_size,
+            help="Specify TP size for linear-attention layers. Defaults to attention TP.",
         )
         parser.add_argument(
             "--moe-tp-size",

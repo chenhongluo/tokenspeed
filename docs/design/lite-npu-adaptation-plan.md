@@ -9,7 +9,9 @@
   shared/identity-zero expert 和 n-gram embedding（OE）；
 - 唯一完整服务形态为 8 个 Prefill rank + 8 个 Decode rank，共 16 rank，不使用 PP；
 - Prefill 使用 eager，Decode 使用固定 batch 的 NPU graph，并启用 Decode overlap；
-- P/D 间正确传输 MLA cache 和 KDA state，Decode 直接把 KDA state 接收到 live state slot；
+- 首轮先用 EP8 和已有权重切分完成静态权重装载、有限上下文 Eager 服务和精度闭环；
+- CP/KVP 分布式 KV Cache、P/D 分片传输和 KDA direct-to-live 统一放到最后 TODO，
+  不作为首轮服务和融合算子验收的前置条件；
 - 补齐参考实现中已经准入的全部优化，并新增 Lite KDA 前置 projection 合并、
   packed QKV causal convolution 和 featurewise-beta 融合；
 - 对 Grouped MoE 执行三组受控实验，分别隔离四组 executor 合并收益和 group-to-rank 物理放置收益，
@@ -62,8 +64,18 @@ Lite 应在这些接口上做最小增量，不应复制第二套 hybrid attenti
 | 静态权重缺口（尚未计 cache/runtime） | 41.464 |
 
 因此，完整模型不设计单卡或四卡过渡服务，直接使用 16 rank 的 8P8D；`N=1` 仅允许加载被测
-shard/子模块或使用小尺寸合成 tensor。8P8D 的历史估算为每 P/D rank 静态权重约
-15.732/16.380 GiB，具备给 cache 和 runtime 留出空间的容量条件。
+shard/子模块或使用小尺寸合成 tensor。目标 checkpoint 的完整加载账本已给出更严格的
+EP8 后单 rank 口径：
+
+| 角色 | Parameter storage | Post-load derived | 逻辑 resident static | 910B 可用 HBM 中的静态余量 |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill | 17.234249 GiB | 0.054928 GiB | **17.289177 GiB** | 约 43.360 GiB |
+| Decode | 13.440303 GiB | 0.054928 GiB | **13.495231 GiB** | 约 47.154 GiB |
+
+其中 routed expert 由 EP8 切分，MLA 权重仍是每 rank 复制，OE 主表仍完整留在 host。因此
+**EP8 已足以解决静态权重能否装入 64 GiB 910B 的问题**，并可为有限上下文 Eager/smoke
+留出充足空间。该结论不包含 2M 长上下文或高并发容量；这两项仍需要最后 TODO 中的
+分布式 KV Cache。
 
 | 能力 | TokenSpeed 当前状态 | Lite 需要补齐 |
 | --- | --- | --- |
@@ -74,8 +86,8 @@ shard/子模块或使用小尺寸合成 tensor。8P8D 的历史估算为每 P/D 
 | Grouped MoE | 已有 grouped top-k 和 zero-expert 映射基础 | 四组路由、执行和 NPU kernel |
 | OE / n-gram embedding | Qwen4-Exp 有相近工程实现 | Lite hash、排除规则、归一化和 host residency |
 | recurrent state Decode graph | 已有通用 capture/replay | Lite NPU kernel graph-safe 化和 BS1/BS2 验证 |
-| P/D cache transfer | 已有通用 contract | CP/KVP 分片和 KDA direct-to-live |
-| P 侧 CP、D 侧 KVP | MLA CachePD 尚未支持 | page ownership、partial attention、LSE merge 和 transfer mapping |
+| P/D cache transfer | 已有通用 contract | 最后 TODO：CP/KVP 分片和 KDA direct-to-live |
+| P 侧 CP、D 侧 KVP | MLA CachePD 尚未支持 | 最后 TODO：page ownership、partial attention、LSE merge 和 transfer mapping |
 
 ## 3. 模型契约
 
@@ -150,46 +162,24 @@ zero-expert 命中和 pair 内 hot expert 仍可能造成实际 GMM 负载偏斜
 
 Lite OE 与 Qwen4-Exp PLE 的数学不同，只复用存储、加载和历史管理模式。
 
-## 4. 并行与 Cache 设计
+## 4. 首轮并行与本地 Cache 设计
 
 每个角色固定使用 `N=8` 个 rank，共 16 rank，并保持 `PP=1`、`DP=1`。本计划不实现或验收
 4P4D、单角色 4 rank 或完整模型单卡服务。
 
 | 角色 | MLA | KDA | MoE | Dense/shared 权重 |
 | --- | --- | --- | --- | --- |
-| Prefill | CP/SP N，eager | linear-attention TP N | EP N；阶段 6 选择 flattened placement | 复用现有 dense mapping |
-| Decode | KVP N，Q 复制、history 分片 | linear-attention TP N | EP N；与 P 使用同一 expert placement | 复用现有 dense mapping |
+| Prefill | 权重每 rank 复制；eager 使用有限的本地/replicated history | linear-attention TP8 | EP8；阶段 6 选择 flattened placement | TP1 |
+| Decode | 权重每 rank 复制；eager 使用有限的本地/replicated history | linear-attention TP8 | EP8；与 P 使用同一 expert placement | TP8 |
 
-当前 `Mapping` 已经可以表达 attention TP/CP/DP、linear-attention TP 和 MoE EP。
-缺失的是 CachePD 对 CP/KVP 的理解，因此新增逻辑应放在 cache layout 和 transfer planner，
-而不是创建模型专用 parallelism framework。
+首轮只使用上表中的权重/计算切分：EP8 负责将 1536 个 routed expert 均分为
+192 个/rank，KDA 使用已有 linear-attention TP8，P/D 继续使用已验证的 dense/shared 映射。
+MLA 的有限上下文页和 KDA request state 先使用本地、有界的 correctness 布局，不在首轮
+实现跨 rank KV page ownership、partial output/LSE merge 或 P/D cache fragment 转换。
 
-### 4.1 Prefill CP/SP
-
-- 将 packed prompt token 分散到 N 个 rank，同时保持全局 causal position 和每个请求的 segment 边界；
-- 每个 rank 只写入自己负责的 MLA page，以及 linear-attention TP 对应的 KDA state shard；
-- MLA partial output 必须通过 output + LSE 合并，不能直接平均；
-- Prefill graph 保持关闭，Chunked Prefill 继续使用 eager pipeline。
-
-### 4.2 Decode KVP
-
-- historical MLA page 分散到 N 个 rank；
-- 按 attention ABI 的要求复制 query 和 current-token projection；
-- 每个 rank 计算本地 partial attention 和 LSE；
-- 通过 TokenSpeed 通用 `attn_merge_state` API 合并；
-- Ascend 实现通过 kernel registry 接入，runtime 不直接调用 `torch_npu`；
-- 本地 history 为空的 rank 必须贡献 zero output 和 negative-infinite LSE，
-  合并后与单 rank reference 一致。
-
-### 4.3 P/D Transfer 和 KDA One-copy
-
-- 扩展通用 cache transfer schema，描述 P-CP source fragment 到 D-KVP destination 的映射；
-- 模型执行前校验 peer layout，不满足固定 8P8D 切分时立即失败；
-- MLA page 只传输到其 D owner；
-- Decode live KDA conv/recurrent slot 直接作为接收目标；
-- 不允许再分配第二份完整 KDA staging cache；
-- 只有在 transfer completion 和 device stream ordering 都满足后才能发布 slot；
-- abort/reuse 不能暴露半写入 state。
+`Mapping` 虽已能表达 attention TP/CP/DP、linear-attention TP 和 MoE EP，但这不等于 CachePD
+已经支持 CP/KVP。相关工作不删除，统一移到文末“最后 TODO：分布式 KV Cache”，
+并与首轮功能/精度验收解耦。
 
 ## 5. NPU Kernel 策略
 
@@ -274,6 +264,9 @@ Lite OE 与 Qwen4-Exp PLE 的数学不同，只复用存储、加载和历史管
 - 为每个 KDA group 建立固定地址的 Decode graph metadata；
 - KDA state slot 按最大 live request 数分配，与普通 token KV capacity 分开计算。
 
+本阶段只定义单 rank/有界请求的 tensor 几何、本地 page/state 生命周期和 graph-stable
+metadata，不实现跨 rank MLA KV page 存储、CP/KVP owner 或 PD fragment transfer。
+
 测试：
 
 - N=1/8 下 byte-exact field shape、packing、capacity、block zeroing、page reuse 和 pointer stability；
@@ -319,9 +312,7 @@ state fingerprint 一致；此处不加载完整模型。
 
 交付：
 
-- 注册 MLA query normalize/project、latent Prefill/Decode attention、value projection 和
-  attention-state merge 的 Ascend 实现；
-- partitioned attention 返回 output 和 LSE；
+- 注册 MLA query normalize/project、本地 latent Prefill/Decode attention 和 value projection 的 Ascend 实现；
 - 复用现有 in-place sigmoid output gate；
 - MLA HW prolog 必须先通过目标 shape 上板。
 
@@ -332,6 +323,7 @@ state fingerprint 一致；此处不加载完整模型。
 - 不支持的 HW prolog shape 必须 fail closed。
 
 准入门槛：单 rank 子模块 eager MLA 对齐；HW prolog 未通过精度和收益测试时保持关闭。
+partitioned attention 的 output/LSE 和跨 rank merge 属于分布式 KV Cache TODO。
 
 ### 阶段 6：Grouped MoE、Shared Expert 和 Zero Expert
 
@@ -408,61 +400,21 @@ B 相对 A 证明四次 dispatch/GMM/finalize 合并为一次且无性能或内�
 准入门槛：16 rank 全部完成目标 shard 加载，P/D 角色内 eager 输出与冻结 reference 一致；每 rank
 权重和 collective 符合 8P8D 声明，静态权重通过实际内存账本。此阶段不宣称 HTTP 服务已端到端可用。
 
-### 阶段 9：Prefill CP/SP 和 Decode KVP
-
-这一阶段拆成三个独立提交。
-
-#### 9A：Prefill CP/SP
-
-- prompt workload 和 MLA history page 分片；
-- 正确合并 output/LSE；
-- 验证 global position、chunk boundary 和 cache ownership。
-
-#### 9B：Decode KVP
-
-- query 复制、history page 分片、本地 attention、output/LSE merge；
-- 覆盖 empty-owner rank 和 current-token；
-- 验证固定 KVP8。
-
-#### 9C：统一 Cache Ownership Metadata
-
-- ownership map 只在 cache recipe/transfer schema 中维护一份；
-- 不允许模型侧维护第二套 block table。
-
-准入门槛：P-CP8 和 D-KVP8 分别与 non-partitioned oracle 对齐后，才能进入 PD 分离。
-
-### 阶段 10：PD 分离和 KDA One-copy State
-
-交付：
-
-- 扩展 CachePD topology/transfer planner，支持 P-CP8 到 D-KVP8；
-- 只传输目标 owner 所需的 MLA page；
-- KDA state 直接接收到 Decode live slot；
-- 实现 completion、publication、abort、retry 和 reuse ordering。
-
-测试：
-
-- contract mismatch 在服务 ready 前失败；
-- source/destination page 和 state fingerprint；
-- late-admission concurrent Decode；
-- transfer 中止和 slot reuse；
-- memory A/B 证明第二份完整 KDA state 已删除。
-
-准入门槛：PD 数据面与冻结 transfer oracle 一致，Decode 只有一份 live KDA state allocation。
-
-### 阶段 11：8P8D Eager 完整服务
+### 阶段 9：8P8D 有限上下文 Eager 完整服务
 
 交付：
 
 - eager 模式拉起唯一目标拓扑 8P8D 的完整 Lite HTTP 服务；
-- 使用适合 smoke 的小 KV pool 先闭环，再按目标容量做内存准入；
+- 使用适合 smoke 的小型本地 KV pool，MLA history 不做 CP/KVP 跨 rank 分片；
+- 如 P/D 分离需要 cache 传输，先复用现有非分片整页/1:1-rank correctness contract，
+  不引入 fragment ownership 或 direct-to-live 内存优化；
 - health、model-list、确定性 completion、multi-turn、concurrent smoke；
 - 对冻结请求执行全链路 NaN/Inf 和逐层定位开关。
 
 准入门槛：8P8D 服务稳定且输出确定，冻结请求与 reference 对齐；每 rank 静态权重、cache 和 runtime
-均通过实际内存账本。此阶段仍关闭 graph 和 overlap。
+均通过实际内存账本。此阶段仍关闭 graph 和 overlap，也不声称 2M/高并发容量。
 
-### 阶段 12：Decode Graph 和 Overlap
+### 阶段 10：Decode Graph 和 Overlap
 
 交付：
 
@@ -479,25 +431,25 @@ B 相对 A 证明四次 dispatch/GMM/finalize 合并为一次且无性能或内�
 - sequential BS1、steady BS2、late-admission BS2；
 - graph compile count 和 pointer stability；
 - overlap off/on 对齐；
-- PD admission 期间不存在 use-after-free。
+- 本地 cache slot admission 期间不存在 use-after-free。
 
 准入门槛：graph 和 overlap 只能改变性能，不能改变输出或 state。
 
-### 阶段 13：累计准入参考实现已有优化
+### 阶段 11：累计准入参考实现已有优化
 
 不重复实现前面已经完成的内容。本阶段新增剩余的 loader/layer 优化，并进行累计服务 A/B。
 
 | 优化 | 实现阶段 |
 | --- | --- |
-| Fused add + RMSNorm | 阶段 13 |
+| Fused add + RMSNorm | 阶段 11 |
 | P/D fused MoE top-k | 阶段 6 |
-| Decode-only Weight-NZ | 阶段 13 |
+| Decode-only Weight-NZ | 阶段 11 |
 | Packed conv、recurrent KDA、chunk KDA | 阶段 4 |
 | Grouped MoE flattened executor 与 group-to-rank placement | 阶段 6 |
 | OE block projection | 阶段 7 |
 | In-place MLA output gate | 阶段 5 |
-| KDA direct-to-live PD state | 阶段 10 |
-| P eager/overlap-off，D graph/overlap-on | 阶段 12 |
+| KDA direct-to-live PD state | 最后 TODO |
+| P eager/overlap-off，D graph/overlap-on | 阶段 10 |
 
 Fused add + RMSNorm 和 Weight-NZ 分别使用独立实现/测试提交和独立服务 A/B。
 
@@ -506,9 +458,9 @@ MLA HW prolog 在目标 shape 不支持时继续 fail closed。Continuous Decode
 准入门槛：每项优化必须在目标 shape 上带来可测收益，或显著降低内存，并且没有精度回退。
 被拒绝的候选需要记录结论，不能以半启用状态留在生产路径。
 
-### 阶段 14：Lite 新增优化
+### 阶段 12：Lite 新增优化
 
-#### 14A：单次合并 Hidden-state Projection
+#### 12A：单次合并 Hidden-state Projection
 
 扩展现有 Kimi packed projection/loader，将以下权重放入一个 rank-local buffer：
 
@@ -523,14 +475,14 @@ head-sharded row 和 replicated low-rank row 保持原有 shard 语义。
 - projection latency 降低；
 - Prefill live activation 增量可接受。
 
-#### 14B：Packed QKV Causal Conv
+#### 12B：Packed QKV Causal Conv
 
-从 projection、权重加载、conv state、kernel call、cache transfer 一直到 graph capture，
+从 projection、权重加载、conv state、kernel call、本地 cache state 一直到 graph capture，
 全链路保持 packed QKV。禁止在每个 Decode step 临时执行三路 `torch.cat`。
 
 准入门槛：只有一次 conv launch，state/output 对齐，并带来 Decode latency 收益。
 
-#### 14C：Featurewise-beta 融合
+#### 12C：Featurewise-beta 融合
 
 - 首先新增一个 fused prepare kernel，完成 Q/K L2Norm、`sqrt(sigmoid(beta))` 和 K/V scale；
 - Prefill chunk KDA 前保留这一个 prepare launch；
@@ -545,19 +497,19 @@ head-sharded row 和 replicated low-rank row 保持原有 shard 语义。
 - 不产生额外的大临时 tensor；
 - Decode 消除独立 beta-prepare launch。
 
-### 阶段 15：最终验收
+### 阶段 13：首轮最终验收
 
 最终验收必须运行累计配置，不能只验证孤立 leaf。
 
 - 完成 unit/kernel test suite；
 - 执行完整 `pre-commit run --all-files`；
 - 完成 N=8 operator-board matrix；
-- 8P8D 服务 readiness、确定性 smoke、并发、late admission、长上下文、retraction 和清理；
+- 8P8D 有限上下文服务 readiness、确定性 smoke、有界并发、late admission、retraction 和清理；
 - 使用与冻结 reference 完全相同的 EvalScope prompt/evaluator 跑 GSM8K 前 100 条；
 - 记录逐条输出、完成率、API error 和 NaN/Inf；
 - 记录 Prefill throughput、TTFT、Decode TPOT、graph compile count、HBM 拆分、
-  cache capacity、host OE memory、PD transfer bytes，以及 MoE 的 per-rank/pair route 与 GMM active-token 分布；
-- 对阶段 13/14 所有优化做累计 off/on A/B；
+  本地 cache capacity、host OE memory，以及 MoE 的 per-rank/pair route 与 GMM active-token 分布；
+- 对阶段 11/12 所有优化做累计 off/on A/B；
 - 保存 exact source SHA、launcher 参数、artifact manifest，并确保进程和端口清理干净。
 
 最终门槛：
@@ -565,8 +517,7 @@ head-sharded row 和 replicated low-rank row 保持原有 shard 语义。
 - GSM8K 100/100 请求完成，无 API error、空输出；
 - 确定性输出相对冻结 reference 无回退；
 - P 使用 eager，D 使用已准入 graph batch 和 overlap；
-- 唯一目标拓扑 8P8D 达到生产可用；
-- 不存在重复的完整 KDA transfer state；
+- 唯一目标拓扑 8P8D 完成有限上下文功能、精度和优化验收；
 - 每张 NPU 上不存在完整 OE table；
 - 每项启用的优化都有独立证据，以及 rollback switch 或 kernel-selection fallback。
 
@@ -574,10 +525,12 @@ head-sharded row 和 replicated low-rank row 保持原有 shard 语义。
 
 关键路径固定为：
 
-`model/load -> cache -> KDA/MLA/MoE/OE 单卡子模块 eager -> 8P8D 权重/角色内切分
--> CP8/KVP8 -> PD one-copy -> 8P8D 全模型 eager 服务 -> graph/overlap -> fusion -> 最终验收`
+`model/load -> 本地 cache metadata -> KDA/MLA/MoE/OE 单卡子模块 eager
+-> EP8 为核心的 8P8D 权重/角色内切分 -> 有限上下文 8P8D 全模型 eager 服务
+-> graph/overlap -> fusion -> 首轮最终验收 -> 分布式 KV Cache TODO`
 
-在 eager state 未对齐前不开始 graph 调试；在 P-CP 和 D-KVP 未分别对齐 non-partitioned oracle 前不开始 PD 调试。
+在 eager state 未对齐前不开始 graph 调试。CP8/KVP8、跨 rank page ownership 和 PD fragment transfer
+不再阻塞 Eager、graph 或融合算子验收；它们只在首轮闭环后进入最后 TODO。
 Projection packing 和 conv packing 放在功能 kernel 之后，确保问题能够局部归因。
 
 ## 8. 已知风险与停止条件
@@ -585,13 +538,13 @@ Projection packing 和 conv packing 放在功能 kernel 之后，确保问题能
 | 风险 | 最早判别实验 | 处理方式 |
 | --- | --- | --- |
 | 公开 KDA kernel ABI 只支持 scalar beta | 4-token featurewise-beta board | 保留标准 recurrence + Lite fused prepare，再增量扩展 ABI |
-| Ascend MLA 无法返回可用 LSE | 两路 partial attention board | 先补 registered MLA solution，再做 KVP |
-| CachePD 的 CP 限制不仅是 rank planner | 8P8D synthetic transfer contract | 扩展通用 topology/fragment 层，不新增模型侧 transfer |
+| Ascend MLA 无法返回可用 LSE | 最后 TODO 的两路 partial attention board | 不阻塞本地 MLA；做 KVP 前补 registered MLA solution |
+| CachePD 的 CP 限制不仅是 rank planner | 最后 TODO 的 8P8D synthetic transfer contract | 扩展通用 topology/fragment 层，不新增模型侧 transfer |
 | EP8 grouped collective 不支持目标 shape | router + identity expert distributed leaf | 保留 fixed-shape native HCCL fallback，记录 fused path 不支持 |
 | group-major 两卡一组只改善 pair 级、却放大 pair 内 hot-expert 偏斜 | 阶段 6 的 A/B/C route 与 GMM 计数 | C 未优于 B 时保留 flattened-interleaved，不引入未验证的 EPLB |
 | MLA HW prolog 不支持目标 hidden size | 真实 shape direct board | 保持关闭 |
 | Host OE staging 成为 Prefill 瓶颈 | row/block hit rate 和 transfer profile | 只有测到瓶颈后才增加 block batching/prefetch |
-| Graph 覆盖新接收的 KDA state | late-admission state fingerprint | 修复 live-slot publication/fence，禁止恢复第二份完整 staging cache |
+| Graph 覆盖新接收的 KDA state | 最后 TODO 的 late-admission state fingerprint | 修复 live-slot publication/fence，禁止恢复第二份完整 staging cache |
 
 ## 9. 首轮最终验收的非目标
 
@@ -600,7 +553,41 @@ Projection packing 和 conv packing 放在功能 kernel 之后，确保问题能
 - continuous multi-step Decode scheduling；
 - speculative decoding 或 draft model；
 - 新的通用 parallelism framework；
+- 2M 级等效 KV 容量与高并发容量准入；
+- Prefill CP8/SP、Decode KVP8 以及与之配套的分布式 KV page storage；
 - Megatron golden 对齐；
 - checkpoint 本身未提供的强制低比特模型转换。
 
 这些工作在 BF16/等价 checkpoint 路径以及全部目标优化验收完成后再单独规划。
+
+## 10. 最后 TODO：分布式 KV Cache 与 PD 内存优化
+
+以下工作保留为独立后续，不阻塞阶段 9--13 的有限上下文服务、graph、融合和
+GSM8K 前 100 条验收。每项仍必须先有独立设计，再实现、上板和提交。
+
+### TODO A：Prefill CP/SP 分布式 MLA Cache
+
+- 将 packed prompt token 分散到 8 个 rank，保持全局 causal position 和 request segment 边界；
+- 每 rank 只写自己负责的 MLA history page；
+- 返回 partial output + LSE，通过统一 `attn_merge_state` 合并；
+- 验证 chunk boundary、empty owner、page ownership 和 non-partitioned oracle。
+
+### TODO B：Decode KVP8 分布式 MLA Cache
+
+- 复制 query/current-token projection，historical MLA page 按 owner 分散到 8 rank；
+- 每 rank 计算本地 partial attention/LSE，empty owner 贡献 zero output/-inf LSE；
+- 用同一份 ownership metadata 驱动 cache recipe、block table 和 transfer planner；
+- 与 non-partitioned oracle 对齐并验证固定 KVP8。
+
+### TODO C：P/D Fragment Transfer 和 KDA One-copy
+
+- 扩展通用 CachePD topology/transfer planner，表达 P-CP8 owner 到 D-KVP8 owner 的分片映射；
+- MLA page 只传给目标 D owner；
+- Decode live KDA conv/recurrent slot 直接作为接收目标，删除第二份完整 staging state；
+- 验证 completion/publication、abort/retry/reuse、late admission 和 graph stream ordering。
+
+### TODO D：长上下文容量验收
+
+- 按 2M 口径重做每 rank 静态权重、MLA KV、KDA state、graph/runtime/workspace 账本；
+- 运行长上下文、高并发、retraction、late admission 和内存回收；
+- 只有 TODO A--C 的精度、one-copy 和容量证据都通过后，才声称 2M/高并发生产准入。

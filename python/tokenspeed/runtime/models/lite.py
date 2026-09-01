@@ -340,9 +340,64 @@ class _Weight(nn.Module):
         self.weight = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
 
 
+def _all_reduce(tensor: torch.Tensor, group: tuple[int, ...]) -> torch.Tensor:
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+    return all_reduce(tensor, group)
+
+
+def _logits_metadata(ctx: Any) -> Any:
+    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+
+    return LogitsMetadata.from_forward_context(ctx)
+
+
 class _Norm(_Weight):
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, eps: float = 1e-6) -> None:
         super().__init__((size,), torch.bfloat16)
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        if hidden_states.device.type in ("cuda", "npu"):
+            from tokenspeed_kernel.ops.layernorm import rmsnorm
+
+            return rmsnorm(
+                hidden_states,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+        hidden_fp32 = hidden_states.float()
+        return (
+            hidden_fp32
+            * torch.rsqrt(
+                hidden_fp32.square().mean(dim=-1, keepdim=True) + self.variance_epsilon
+            )
+            * self.weight.float()
+        ).to(hidden_states.dtype)
+
+
+class _VocabEmbedding(_Weight):
+    def __init__(self, config: LiteConfig, mapping: Any) -> None:
+        tp = mapping.dense.tp_size
+        if config.vocab_size % tp:
+            raise ValueError("Lite vocab size must be divisible by dense TP.")
+        super().__init__((config.vocab_size // tp, config.hidden_size), torch.bfloat16)
+        self.vocab_size = config.vocab_size
+        self.tp_rank = mapping.dense.tp_rank
+        self.tp_size = tp
+        self.tp_group = mapping.dense.tp_group
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.tp_size == 1:
+            return F.embedding(input_ids.clamp(0, self.vocab_size - 1), self.weight)
+        start = self.tp_rank * self.weight.shape[0]
+        valid = (input_ids >= start) & (input_ids < start + self.weight.shape[0])
+        local_ids = (input_ids - start).masked_fill(~valid, 0)
+        output = F.embedding(local_ids, self.weight)
+        output.masked_fill_(~valid.unsqueeze(-1), 0)
+        return _all_reduce(output, self.tp_group)
 
 
 class _Router(nn.Module):
@@ -1129,17 +1184,50 @@ class LiteMLAParameters(nn.Module):
 class LiteDecoderLayer(nn.Module):
     def __init__(self, config: LiteConfig, mapping: Any, layer_id: int) -> None:
         super().__init__()
-        self.input_layernorm = _Norm(config.hidden_size)
+        self.mapping = mapping
+        self.is_kda = config.is_kda_layer(layer_id)
+        self.input_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = (
             LiteKDAParameters(config, mapping, layer_id)
-            if config.is_kda_layer(layer_id)
+            if self.is_kda
             else LiteMLAParameters(config, mapping, layer_id)
         )
-        self.post_attention_layernorm = _Norm(config.hidden_size)
+        self.post_attention_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.mlp = LiteGroupedMoEParameters(config, mapping)
 
-    def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
-        raise NotImplementedError("Lite decoder execution is not connected yet.")
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: Any,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        if ctx.forward_mode.is_idle():
+            return hidden_states
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            out_cache_loc=out_cache_loc,
+        )
+        if self.is_kda and self.mapping.linear_attn.tp_size > 1:
+            hidden_states = _all_reduce(
+                hidden_states, self.mapping.linear_attn.tp_group
+            )
+        residual = residual + hidden_states
+        hidden_states = self.post_attention_layernorm(residual)
+        global_sp_num_tokens = (
+            ctx.global_num_tokens
+            if self.mapping.world_size == 8 and self.mapping.attn.cp_size == 8
+            else None
+        )
+        hidden_states = self.mlp(
+            hidden_states, global_sp_num_tokens=global_sp_num_tokens
+        )
+        return residual + hidden_states
 
 
 class LiteNgramParameters(nn.Module):
@@ -1596,20 +1684,34 @@ class LiteOEStatePreparer:
 class LiteModel(nn.Module):
     def __init__(self, config: LiteConfig, mapping: Any) -> None:
         super().__init__()
-        dense_tp = mapping.dense.tp_size
-        self.embed_tokens = _Weight(
-            (config.vocab_size // dense_tp, config.hidden_size), torch.bfloat16
-        )
+        self.embed_tokens = _VocabEmbedding(config, mapping)
         self.layers = nn.ModuleList(
             LiteDecoderLayer(config, mapping, layer_id)
             for layer_id in range(config.num_hidden_layers)
         )
-        self.norm = _Norm(config.hidden_size)
+        self.norm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.ngram_embeddings = LiteNgramParameters(config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: Any,
+        out_cache_loc: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.ngram_embeddings.project_and_merge(
+            hidden_states,
+            self.ngram_embeddings.prepared_raw_oe(input_ids.numel()),
+            input_ids,
+        )
+        for layer in self.layers:
+            hidden_states = layer(positions, hidden_states, ctx, out_cache_loc)
+        return self.norm(hidden_states), None
 
 
 class FLASHLocalForCausalLM(nn.Module):
-    """Phase-1 Lite model: exact parameter ownership and strict loading."""
+    """Lite causal LM with strict checkpoint ownership."""
 
     def __init__(self, config: LiteConfig, mapping: Any, **_kwargs: Any) -> None:
         super().__init__()
@@ -1621,6 +1723,22 @@ class FLASHLocalForCausalLM(nn.Module):
         self.lm_head = _Weight(
             (config.vocab_size // mapping.dense.tp_size, config.hidden_size),
             torch.bfloat16,
+        )
+        self.logits_processor = self._create_logits_processor()
+
+    def _create_logits_processor(self) -> Any | None:
+        npu = getattr(torch, "npu", None)
+        if not torch.cuda.is_available() and not (
+            npu is not None and npu.is_available()
+        ):
+            return None
+        from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+
+        return LogitsProcessor(
+            self.config,
+            tp_rank=self.mapping.dense.tp_rank,
+            tp_size=self.mapping.dense.tp_size,
+            tp_group=self.mapping.dense.tp_group,
         )
 
     @staticmethod
@@ -1663,8 +1781,31 @@ class FLASHLocalForCausalLM(nn.Module):
         if mismatches:
             raise ValueError("Invalid Lite role mapping: " + ", ".join(mismatches))
 
-    def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
-        raise NotImplementedError("Lite numerical forward is connected in phases 3-7.")
+    @torch.no_grad()
+    def forward(
+        self,
+        ctx: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        **_kwargs: Any,
+    ) -> Any:
+        if self.logits_processor is None:
+            raise RuntimeError(
+                "Lite causal-LM forward requires an accelerator runtime."
+            )
+        hidden_states, _ = self.model(
+            input_ids,
+            positions,
+            ctx,
+            out_cache_loc,
+        )
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            _logits_metadata(ctx),
+        )
 
     def initialize_external_inputs(
         self,
