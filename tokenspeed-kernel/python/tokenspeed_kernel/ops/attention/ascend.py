@@ -48,6 +48,18 @@ if current_platform().is_npu:
         mha_extend_with_kvcache as _mha_extend_with_kvcache,
     )
     from tokenspeed_kernel_npu.ops.mha import mha_prefill as _mha_prefill
+    from tokenspeed_kernel_npu.ops.mla import attn_merge_state as _attn_merge_state
+    from tokenspeed_kernel_npu.ops.mla import (
+        mla_decode_with_kvcache as _mla_decode_with_kvcache,
+    )
+    from tokenspeed_kernel_npu.ops.mla import (
+        mla_extend_with_kvcache as _mla_extend_with_kvcache,
+    )
+    from tokenspeed_kernel_npu.ops.mla import (
+        mla_normalize_project_query as _mla_normalize_project_query,
+    )
+    from tokenspeed_kernel_npu.ops.mla import mla_prefill as _mla_prefill
+    from tokenspeed_kernel_npu.ops.mla import mla_project_value as _mla_project_value
 
     _CAPABILITY = CapabilityRequirement(vendors=frozenset({"ascend"}))
     _DTYPES = {torch.float16, torch.bfloat16}
@@ -107,6 +119,114 @@ if current_platform().is_npu:
     )
     def mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_normalize_project_query",
+        name="ascend_mla_normalize_project_query",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(
+            ("query", "kv", "projection_weight", "out"), "dense", _DTYPES
+        ),
+        priority=Priority.PERFORMANT,
+        traits={"split_output": frozenset({False})},
+        tags={"portability"},
+    )
+    def mla_normalize_project_query(**kwargs):
+        return _mla_normalize_project_query(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_project_value",
+        name="ascend_mla_project_value",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("attention", "weight", "out"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT,
+        traits={
+            "gate_kind": frozenset({"none", "sigmoid"}),
+            "inputs_contiguous": frozenset({True}),
+        },
+        tags={"portability"},
+    )
+    def mla_project_value(**kwargs):
+        return _mla_project_value(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_prefill",
+        name="ascend_mla_prefill",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT,
+        traits={
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+        tags={"portability"},
+    )
+    def mla_prefill(**kwargs):
+        return _mla_prefill(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        name="ascend_mla_extend_with_kvcache",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "kv_cache"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT,
+        traits={
+            "page_size": frozenset({128}),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "is_causal": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+        tags={"portability"},
+    )
+    def mla_extend_with_kvcache(**kwargs):
+        return _mla_extend_with_kvcache(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="ascend_mla_decode_with_kvcache",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "kv_cache"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT,
+        traits={
+            "page_size": frozenset({128}),
+            "q_len": frozenset({1}),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+        tags={"portability"},
+    )
+    def mla_decode_with_kvcache(**kwargs):
+        return _mla_decode_with_kvcache(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "attn_merge_state",
+        name="ascend_attn_merge_state",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("out_a", "out_b"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT,
+        traits={},
+        tags={"portability"},
+    )
+    def attn_merge_state(**kwargs):
+        return _attn_merge_state(**kwargs)
 
     @register_kernel(
         "attention",
@@ -201,10 +321,16 @@ if current_platform().is_npu:
 
 
 __all__ = [
+    "attn_merge_state",
     "kda_causal_conv1d",
     "kda_paged_decode",
     "kda_paged_prefill",
     "mha_decode_with_kvcache",
     "mha_extend_with_kvcache",
     "mha_prefill",
+    "mla_decode_with_kvcache",
+    "mla_extend_with_kvcache",
+    "mla_normalize_project_query",
+    "mla_prefill",
+    "mla_project_value",
 ]
