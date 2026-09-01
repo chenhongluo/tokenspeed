@@ -179,7 +179,7 @@ if current_platform().is_npu:
         signatures=format_signatures(("q", "kv_cache"), "dense", _DTYPES),
         priority=Priority.PERFORMANT,
         traits={
-            "page_size": frozenset({128}),
+            "page_size": frozenset({64, 128}),
             "qk_nope_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),

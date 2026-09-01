@@ -162,6 +162,25 @@ def test_lite_mla_nope_auxiliary_is_preserved_without_rotation():
     assert torch.equal(q.view(3, 2, 3)[..., -1], q_auxiliary)
 
 
+def test_lite_mla_cached_extend_uses_absorbed_attention():
+    layer = _layer()
+    layer.process_weights_after_loading()
+    hidden = torch.randn(2, 8, dtype=torch.bfloat16)
+    events = []
+    ctx = _ctx(
+        ForwardMode.EXTEND,
+        torch.randn(2, 2, 3, dtype=torch.bfloat16),
+        events,
+    )
+    ctx.attn_backend.chunked_prefill_metadata.use_absorbed_cached_extend = True
+
+    output = layer(torch.arange(2), hidden, ctx, torch.tensor([3, 5]))
+
+    assert output.shape == hidden.shape
+    assert events == ["write", "attention"]
+    assert torch.isfinite(output).all()
+
+
 @pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
 def test_ascend_lite_mla_model_path_uses_registered_projection(mode):
@@ -230,35 +249,47 @@ def test_ascend_lite_mla_prefill_and_lse_match_oracle():
 
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
 def test_ascend_lite_mla_absorbed_extend_crosses_page_boundary():
-    from tokenspeed_kernel_npu.ops.mla import mla_extend_with_kvcache
+    from tokenspeed_kernel import (
+        mla_extend_with_kvcache,
+        mla_use_absorbed_extend,
+    )
 
     torch.manual_seed(5505)
     q_lengths = (2, 3)
     cache_lengths = (5, 129)
     q = torch.randn(sum(q_lengths), 32, 576, dtype=torch.bfloat16, device="npu")
-    cache = torch.randn(4, 128, 1, 576, dtype=torch.bfloat16, device="npu")
-    table = torch.tensor([[1, 0], [2, 3]], dtype=torch.int32, device="npu")
+    cache = torch.randn(5, 64, 1, 576, dtype=torch.bfloat16, device="npu")
+    table = torch.tensor([[1, -1, -1], [2, 3, 4]], dtype=torch.int32, device="npu")
     cu_q = torch.tensor([0, 2, 5], dtype=torch.int32, device="npu")
     cu_kv = torch.tensor([0, 5, 134], dtype=torch.int32, device="npu")
     lengths = torch.tensor(cache_lengths, dtype=torch.int64, device="npu")
 
+    assert mla_use_absorbed_extend(
+        q_dtype=q.dtype,
+        kv_dtype=cache.dtype,
+        num_q_heads=q.shape[1],
+        page_size=cache.shape[1],
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        max_seqlen_q=max(q_lengths),
+    )
     output, lse = mla_extend_with_kvcache(
-        q,
-        cache,
-        table,
-        lengths,
-        cu_q,
-        cu_kv,
-        3,
-        129,
-        128,
-        512,
-        64,
-        192**-0.5,
-        True,
-        0.0,
-        True,
-        None,
+        q=q,
+        kv_cache=cache,
+        page_table=table,
+        cache_seqlens=lengths,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(cache_lengths),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=192**-0.5,
+        is_causal=True,
+        return_lse=True,
+        solution="torch_npu",
     )
 
     expected_output = []
@@ -267,7 +298,8 @@ def test_ascend_lite_mla_absorbed_extend_crosses_page_boundary():
     for row, (q_length, cache_length) in enumerate(
         zip(q_lengths, cache_lengths, strict=True)
     ):
-        key = cache[table[row].long()].reshape(-1, 576)[:cache_length]
+        page_count = math.ceil(cache_length / cache.shape[1])
+        key = cache[table[row, :page_count].long()].reshape(-1, 576)[:cache_length]
         query = q[start : start + q_length]
         logits = torch.einsum("thd,sd->hts", query.float(), key.float()) * 192**-0.5
         query_positions = cache_length - q_length + torch.arange(q_length, device="npu")

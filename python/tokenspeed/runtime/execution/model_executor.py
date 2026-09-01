@@ -1548,7 +1548,7 @@ class ModelExecutor:
                             ],
                             graph_tokens=(
                                 self.forward_step.padded_bs(bs, ctx)
-                                * (self.config.spec_num_tokens or 1)
+                                * self.forward_step.max_tokens_per_req
                                 if use_graph
                                 else None
                             ),

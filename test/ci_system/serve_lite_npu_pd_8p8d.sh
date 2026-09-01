@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lite 8P8D bounded eager serving on one 16-NPU node.
+# Lite 8P8D bounded serving: Prefill eager, Decode graph BS1/BS2.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -204,10 +204,8 @@ COMMON_ARGS=(
   --attention-backend mla
   --kda-backend auto
   --sampling-backend greedy
-  --enforce-eager
   --disable-prefill-graph
   --disable-pdl
-  --disable-overlap-schedule
   --disable-autotune
   --disable-kvstore
   --disaggregation-transfer-backend mooncake
@@ -216,6 +214,9 @@ COMMON_ARGS=(
 PREFILL_CMD=(
   "$PYTHON" -m smg_grpc_servicer.tokenspeed
   "${COMMON_ARGS[@]}"
+  --no-enable-prefix-caching
+  --disable-overlap-schedule
+  --enforce-eager
   --port "$PREFILL_PORT"
   --dist-init-addr "127.0.0.1:$PREFILL_DIST_PORT"
   --disaggregation-bootstrap-port "$PREFILL_BOOTSTRAP_PORT"
@@ -224,6 +225,8 @@ PREFILL_CMD=(
 DECODE_CMD=(
   "$PYTHON" -m smg_grpc_servicer.tokenspeed
   "${COMMON_ARGS[@]}"
+  --cudagraph-capture-sizes 1 2
+  --max-cudagraph-capture-size 2
   --port "$DECODE_PORT"
   --dist-init-addr "127.0.0.1:$DECODE_DIST_PORT"
   --disaggregation-mode decode

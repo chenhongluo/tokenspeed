@@ -125,12 +125,20 @@ def test_check_prints_the_bounded_8p8d_commands_without_side_effects(tmp_path):
             "--prefix-granularity 64",
             "--attention-backend mla",
             "--sampling-backend greedy",
-            "--enforce-eager",
             "--disable-prefill-graph",
             "--disable-pdl",
-            "--disable-overlap-schedule",
         ):
             assert flag in command
+    assert "--enforce-eager" in prefill
+    assert "--no-enable-prefix-caching" in prefill
+    assert "--disable-overlap-schedule" in prefill
+    assert "--cudagraph-capture-sizes" not in prefill
+    assert "--max-cudagraph-capture-size" not in prefill
+    assert "--enforce-eager" not in decode
+    assert "--no-enable-prefix-caching" not in decode
+    assert "--disable-overlap-schedule" not in decode
+    assert "--cudagraph-capture-sizes 1 2" in decode
+    assert "--max-cudagraph-capture-size 2" in decode
     assert "--disaggregation-mode prefill" in prefill
     assert "--disaggregation-mode decode" in decode
     assert "--pd-disaggregation" in gateway
