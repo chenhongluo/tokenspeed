@@ -98,4 +98,4 @@ exact Python processes: 0
 NPU0--7 running processes: 0
 ```
 
-测试未启动完整服务，也未占用 NPU8--15。阶段 6D 至此闭环，下一阶段进入 Lite decoder block 集成。
+测试未启动完整服务，也未占用 NPU8--15。阶段 6D 至此闭环，下一阶段进入 OE 正确性和 host residency。

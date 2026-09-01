@@ -417,25 +417,32 @@ class MambaAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MambaAttnBackend requires a KV pool with a runtime cache contract"
             )
-        state_group_ids = tuple(
-            spec.group_id for spec in contract.group_specs if spec.family == "state"
-        )
-        if not state_group_ids:
-            raise RuntimeError(
-                "MambaAttnBackend requires at least one state-family cache group"
-            )
         if getattr(kv_pool, "state_group_by_layer", None) is None or not callable(
             getattr(kv_pool, "get_component", None)
         ):
             raise RuntimeError(
                 "MambaAttnBackend requires state_group_by_layer and get_component()"
             )
+        state_group_ids = tuple(dict.fromkeys(kv_pool.state_group_by_layer.values()))
+        if not state_group_ids:
+            raise RuntimeError(
+                "MambaAttnBackend requires at least one layer-owned state group"
+            )
+        specs = {spec.group_id: spec for spec in contract.group_specs}
+        invalid = [
+            group_id
+            for group_id in state_group_ids
+            if group_id not in specs or specs[group_id].family != "state"
+        ]
+        if invalid:
+            raise RuntimeError(
+                "MambaAttnBackend layer-owned groups must be published as state: "
+                f"{invalid}"
+            )
         self._state_group_ids = state_group_ids
         self.state_paging_active = True
         checkpoint_granularities = {
-            spec.checkpoint_granularity
-            for spec in contract.group_specs
-            if spec.family == "state"
+            specs[group_id].checkpoint_granularity for group_id in state_group_ids
         }
         if len(checkpoint_granularities) != 1 or None in checkpoint_granularities:
             raise RuntimeError(

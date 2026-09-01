@@ -24,7 +24,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
 
 from tokenspeed.runtime.configs.lite_config import LiteConfig
 from tokenspeed.runtime.models.lite import (
@@ -222,6 +221,10 @@ def test_real_layout_has_exact_source_count_and_shapes():
         4_718_615,
         256,
     )
+    assert (
+        layout.spec("model.ngram_embeddings.post_projs.11.weight").target_name
+        == "model.ngram_embeddings.projection"
+    )
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
@@ -244,9 +247,9 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
         12,
         24,
     )
-    assert isinstance(
-        model.model.ngram_embeddings.embedders[0].weight, nn.UninitializedParameter
-    )
+    assert model.model.ngram_embeddings.embedders[0].weight.numel() == 0
+    assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
+    assert model.model.ngram_embeddings.projection.shape == (12, 8, 96)
 
 
 def test_strict_loader_covers_rename_shards_experts_and_host_oe():
@@ -256,6 +259,8 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
 
     def sentinel(_index, name, tensor):
         if name == "model.layers.0.self_attn.linear_core.q_proj.weight":
+            return torch.arange(tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
+        if name == "model.ngram_embeddings.post_projs.3.weight":
             return torch.arange(tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
         expert_values = {
             "model.layers.0.mlp.experts.1.gate_proj.weight": 1,
@@ -288,6 +293,14 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
     assert model._local_expert_ids() == (1, 9, 17, 25)
     assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
     assert model.model.ngram_embeddings.embedders[0].weight.shape == (13, 8)
+    projection_source = sentinel(
+        0,
+        "model.ngram_embeddings.post_projs.3.weight",
+        torch.empty((96, 8), dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        model.model.ngram_embeddings.projection[3], projection_source.t()
+    )
 
 
 def test_lite_grouped_expert_placement_is_a_bijection() -> None:

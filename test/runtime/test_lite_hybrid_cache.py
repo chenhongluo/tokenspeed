@@ -62,15 +62,14 @@ def _lite_recipe(
             LinearAttnConfig,
         )
         from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-            KimiK3Recipe,
-        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.lite import LiteRecipe
     except ModuleNotFoundError as exc:
         if exc.name == "compressed_tensors":
             pytest.skip("full attention config dependencies are not installed")
         raise
 
     text_config = LiteConfig()
+    text_config.architectures = [_ARCHITECTURE]
     linear = LinearAttnConfig(
         num_k_heads=text_config.linear_num_heads,
         num_v_heads=text_config.linear_num_heads,
@@ -106,7 +105,7 @@ def _lite_recipe(
         speculative_num_draft_tokens=1,
         components=(mla, linear),
     )
-    return KimiK3Recipe(
+    return LiteRecipe(
         server_args=SimpleNamespace(
             max_total_tokens=token_limit,
             chunked_prefill_size=128,
@@ -232,12 +231,18 @@ def test_lite_layout_is_byte_exact_at_tp8_and_tp1(
         FULL_ATTENTION: 7,
         **{group_id: 7 for group_id in _STATE_GROUPS},
     }
-    assert tuple(specs) == (_STATE_GROUPS[0], FULL_ATTENTION, *_STATE_GROUPS[1:])
+    assert tuple(specs) == (
+        _STATE_GROUPS[0],
+        FULL_ATTENTION,
+        *_STATE_GROUPS[1:],
+        "lite_oe",
+    )
     assert specs[FULL_ATTENTION].transfer_policy == "full_suffix"
     assert all(
         specs[group_id].transfer_policy == "latest_snapshot"
         for group_id in _STATE_GROUPS
     )
+    assert specs["lite_oe"].transfer_policy == "latest_snapshot"
     assert fields["layer.0.conv_state"].shape == conv_shape
     assert fields["layer.0.conv_state"].dtype == "bfloat16"
     assert fields["layer.0.recurrent_state"].shape == recurrent_shape
@@ -247,9 +252,51 @@ def test_lite_layout_is_byte_exact_at_tp8_and_tp1(
     group_packing = dict(layout.group_packing)
     assert group_packing[FULL_ATTENTION] == packing[0]
     assert all(group_packing[group_id] == packing[1] for group_id in _STATE_GROUPS)
+    assert group_packing["lite_oe"] == plane_bytes // 12
     assert len(layout.plane_bytes) == 7
     assert {size for _, size in layout.plane_bytes} == {plane_bytes}
     assert layout.lcm_block_bytes == parent_bytes
+
+
+def test_lite_oe_does_not_move_existing_kimi_fields() -> None:
+    try:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+            KimiK3Recipe,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+    except ModuleNotFoundError as exc:
+        if exc.name == "compressed_tensors":
+            pytest.skip("full attention config dependencies are not installed")
+        raise
+
+    recipe, _, layout = _layout(8)
+    baseline = KimiK3Recipe(
+        server_args=recipe.server_args,
+        model_config=recipe.model_config,
+        attn_config=recipe.attn_config,
+        draft_model_config=recipe.draft_model_config,
+        draft_attn_config=recipe.draft_attn_config,
+        cache_budget_bytes=recipe.cache_budget_bytes,
+        decode_input_tokens=recipe.decode_input_tokens,
+        overlap_schedule_depth=recipe.overlap_schedule_depth,
+    )
+    baseline_groups = baseline.groups()
+    baseline_layout = pack(
+        baseline_groups,
+        prefix_granularity=baseline.prefix_granularity,
+        cache_blocks_per_lcm_block=baseline.packing(baseline_groups),
+        alignment=baseline.alignment,
+        max_padding_fraction=baseline.max_padding_fraction,
+    )
+
+    assert (
+        tuple(field for field in layout.fields if field.group_id != "lite_oe")
+        == baseline_layout.fields
+    )
+    assert (
+        tuple(item for item in layout.group_packing if item[0] != "lite_oe")
+        == baseline_layout.group_packing
+    )
 
 
 def test_lite_tp8_capacity_accounts_for_history_and_request_state() -> None:
@@ -261,8 +308,136 @@ def test_lite_tp8_capacity_accounts_for_history_and_request_state() -> None:
         overlap_schedule_depth=1,
     )
 
-    assert recipe.parents_needed(layout, token_limit) == 9984
-    assert recipe.token_capacity(layout, 9984) == token_limit
+    assert recipe.parents_needed(layout, token_limit) == 9985
+    assert recipe.token_capacity(layout, 9985) == token_limit
+
+
+def test_lite_pd_manifest_restores_only_the_latest_oe_context() -> None:
+    from test.runtime.test_lite_model_loader import lite_config_dict
+
+    from tokenspeed.runtime.models.lite import (
+        LiteNgramParameters,
+        LiteOEStatePreparer,
+    )
+    from tokenspeed.runtime.pd.cache_protocol import (
+        CacheTransferContract,
+        build_cache_block_manifest,
+    )
+
+    _, groups, unbound = _layout(8)
+    plan = unbound.bind(2)
+    contract = CacheTransferContract(
+        plan=plan,
+        group_specs=tuple(spec for spec, _ in groups),
+    )
+    tables = {
+        spec.group_id: torch.tensor([[1, 2]], dtype=torch.int32) for spec, _ in groups
+    }
+    operation = SimpleNamespace(block_tables_arrays=lambda: tables)
+    manifest = build_cache_block_manifest(
+        operation,
+        layout=contract,
+        request_row=0,
+        prefix_len=0,
+        prompt_len=129,
+    )
+    oe_blocks = next(group for group in manifest.groups if group.group_id == "lite_oe")
+    assert oe_blocks.block_ids == (2,)
+    assert plan.field("layer.0.lite.oe.context").payload_bytes == 12
+
+    config = LiteConfig.from_dict(lite_config_dict())
+    layer = LiteNgramParameters(config)
+    for table_id, table in enumerate(layer.embedders):
+        table.weight.data = torch.arange(
+            config.oe_table_rows(table_id) * config.oe_hidden_size,
+            dtype=torch.bfloat16,
+        ).reshape(config.oe_table_rows(table_id), config.oe_hidden_size)
+    source_pages = torch.zeros((3, 3), dtype=torch.int32)
+    destination_pages = torch.zeros_like(source_pages)
+    prefill = LiteOEStatePreparer(
+        layer,
+        context_pages=source_pages,
+        checkpoint_granularity=128,
+        max_request_slots=1,
+        max_graph_tokens=1,
+        device="cpu",
+    )
+    prompt = torch.arange(5, 133).remainder(config.vocab_size)
+    prefill.prepare(
+        request_ids=["request"],
+        request_pool_indices=[0],
+        input_ids=prompt,
+        lengths=[128],
+        before_lengths=[0],
+        block_table=tables["lite_oe"],
+    )
+    prefill.prepare(
+        request_ids=["request"],
+        request_pool_indices=[0],
+        input_ids=torch.tensor([13]),
+        lengths=[1],
+        before_lengths=[128],
+        block_table=tables["lite_oe"],
+    )
+    destination_pages[oe_blocks.block_ids[0]].copy_(
+        source_pages[oe_blocks.block_ids[0]]
+    )
+
+    decode = LiteOEStatePreparer(
+        layer,
+        context_pages=destination_pages,
+        checkpoint_granularity=128,
+        max_request_slots=1,
+        max_graph_tokens=1,
+        device="cpu",
+    )
+    next_token = torch.tensor([17])
+    uninterrupted = prefill.prepare(
+        request_ids=["request"],
+        request_pool_indices=[0],
+        input_ids=next_token,
+        lengths=[1],
+        before_lengths=[129],
+        block_table=tables["lite_oe"],
+    )
+    restored = decode.prepare(
+        request_ids=["request"],
+        request_pool_indices=[0],
+        input_ids=next_token,
+        lengths=[1],
+        before_lengths=[129],
+        block_table=tables["lite_oe"],
+    )
+
+    assert decode.restore_count == 1
+    assert torch.equal(restored, uninterrupted)
+    assert torch.equal(destination_pages[2], source_pages[2])
+
+
+def test_lite_setup_dispatches_to_the_oe_recipe() -> None:
+    try:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+            prepare_cache_setup,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "compressed_tensors":
+            pytest.skip("full attention config dependencies are not installed")
+        raise
+
+    recipe = _lite_recipe(8)
+    setup = prepare_cache_setup(
+        family="kimi_k3",
+        server_args=recipe.server_args,
+        model_config=recipe.model_config,
+        attn_config=recipe.attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=recipe.cache_budget_bytes,
+        decode_input_tokens=recipe.decode_input_tokens,
+        overlap_schedule_depth=recipe.overlap_schedule_depth,
+    )
+
+    assert setup.spec.memory_plan.field("layer.0.lite.oe.context").shape == (3,)
 
 
 def test_lite_pool_binds_one_arena_and_distinct_layer_views() -> None:

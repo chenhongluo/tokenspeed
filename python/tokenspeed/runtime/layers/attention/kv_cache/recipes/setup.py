@@ -38,6 +38,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
     KimiK3Recipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.lite import LiteRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     OrdinaryRecipe,
 )
@@ -182,6 +183,12 @@ def prepare_cache_setup(
     recipe = _RECIPES.get(family)
     if recipe is None:
         raise ValueError(f"unsupported cache model family: {family}")
+    hf_config = model_config.hf_config
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if family == "kimi_k3" and "FLASHLocalForCausalLM" in (
+        getattr(text_config, "architectures", None) or ()
+    ):
+        recipe = LiteRecipe
     return recipe(
         server_args=server_args,
         model_config=model_config,

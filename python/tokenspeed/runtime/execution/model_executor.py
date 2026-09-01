@@ -265,10 +265,14 @@ class ModelExecutorConfig:
             getattr(text_config, "ple_layer_ids", None)
             or getattr(text_config, "indexer_n_heads", None) is not None
         )
+        lite_has_host_oe = "FLASHLocalForCausalLM" in (
+            getattr(text_config, "architectures", None) or ()
+        )
         disable_prefill_graph = (
             bool(server_args.disable_prefill_graph)
             or (model_config.attention_arch == AttentionArch.DSA)
             or qwen4_exp_has_side_state
+            or lite_has_host_oe
         )
 
         return ModelExecutorConfig(
@@ -532,6 +536,19 @@ class ModelExecutor:
 
         self._active_multimodal_context = None
         self._active_positions_override = None
+
+        initialize_external_inputs = getattr(
+            self.model_runner.model, "initialize_external_inputs", None
+        )
+        if initialize_external_inputs is not None:
+            initialize_external_inputs(
+                token_to_kv_pool=token_to_kv_pool,
+                max_request_slots=config.max_req_pool_size,
+                max_graph_tokens=max(
+                    1, config.max_cudagraph_capture_size * spec_num_tokens
+                ),
+                device=self.device,
+            )
 
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
@@ -1519,6 +1536,20 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
+                    prepare_external_inputs = getattr(
+                        self.model_runner.model, "prepare_external_inputs", None
+                    )
+                    if prepare_external_inputs is not None:
+                        use_graph = self.forward_step.can_run(bs, ctx)
+                        prepare_external_inputs(
+                            forward_op,
+                            graph_tokens=(
+                                self.forward_step.padded_bs(bs, ctx)
+                                * (self.config.spec_num_tokens or 1)
+                                if use_graph
+                                else None
+                            ),
+                        )
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,

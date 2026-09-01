@@ -61,6 +61,7 @@ class LiteWeightSpec:
     parallel: _Parallel | None = None
     shard_axis: int | None = None
     expert_id: int | None = None
+    component_id: int | None = None
 
 
 class LiteCheckpointLayout:
@@ -149,7 +150,18 @@ class LiteCheckpointLayout:
                 if family == "embedders"
                 else (config.hidden_size, config.oe_hidden_size)
             )
-            return LiteWeightSpec(name, name, shape, torch.bfloat16, "host-oe")
+            return LiteWeightSpec(
+                name,
+                (
+                    name
+                    if family == "embedders"
+                    else "model.ngram_embeddings.projection"
+                ),
+                shape,
+                torch.bfloat16,
+                "host-oe" if family == "embedders" else "oe-projection",
+                component_id=table_id,
+            )
 
         layer_match = _LAYER_RE.fullmatch(name)
         if layer_match is None:
@@ -1133,20 +1145,452 @@ class LiteDecoderLayer(nn.Module):
 class LiteNgramParameters(nn.Module):
     def __init__(self, config: LiteConfig) -> None:
         super().__init__()
+        self.config = config
+        self._special_token_ids = config.special_token_ids
         self.embedders = nn.ModuleList()
         for _ in range(config.oe_component_count):
             table = nn.Module()
             table.register_parameter(
                 "weight",
-                nn.UninitializedParameter(
-                    requires_grad=False, device="cpu", dtype=torch.bfloat16
+                nn.Parameter(
+                    torch.empty(0, device="cpu", dtype=torch.bfloat16),
+                    requires_grad=False,
                 ),
             )
             self.embedders.append(table)
-        self.post_projs = nn.ModuleList(
-            _Weight((config.hidden_size, config.oe_hidden_size), torch.bfloat16)
-            for _ in range(config.oe_component_count)
+        self.projection = nn.Parameter(
+            torch.empty(
+                config.oe_component_count,
+                config.oe_hidden_size,
+                config.hidden_size,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
         )
+        self.register_buffer(
+            "ignore_tokens",
+            torch.tensor(config.special_token_ids, dtype=torch.int64),
+            persistent=False,
+        )
+        self._runtime: LiteOEStatePreparer | None = None
+
+    def _host_special_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+        ignore = tokens.new_tensor(self._special_token_ids)
+        return (tokens.unsqueeze(-1) == ignore).any(dim=-1)
+
+    def ngram_ids(
+        self,
+        input_ids: torch.Tensor,
+        initial_context: torch.Tensor,
+        lengths: Iterable[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return local table IDs, special mask, and each request's raw tail."""
+        if input_ids.device.type != "cpu" or initial_context.device.type != "cpu":
+            raise ValueError("Lite OE host IDs and context must be CPU tensors.")
+        if input_ids.ndim != 1 or input_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Lite OE input_ids must be a flat CPU integer tensor.")
+        if (
+            initial_context.ndim != 2
+            or initial_context.shape[1] != self.config.emb_neighbor_num - 1
+            or initial_context.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("Lite OE initial_context must have shape [batch, 3].")
+
+        lengths_tensor = torch.as_tensor(tuple(lengths), dtype=torch.int64)
+        if (
+            lengths_tensor.ndim != 1
+            or lengths_tensor.shape[0] != initial_context.shape[0]
+            or bool((lengths_tensor < 0).any())
+            or int(lengths_tensor.sum()) != input_ids.numel()
+        ):
+            raise ValueError("Lite OE ragged lengths must match the flat input.")
+        tokens = input_ids.to(torch.int64)
+        context = initial_context.to(torch.int64)
+        if bool((tokens < 0).any()) or bool((tokens >= self.config.vocab_size).any()):
+            raise ValueError(
+                f"Lite OE input IDs must be inside [0,{self.config.vocab_size})."
+            )
+        if tokens.numel() == 0:
+            return (
+                torch.empty((0, self.config.oe_component_count), dtype=torch.int64),
+                torch.empty(0, dtype=torch.bool),
+                context.clone(),
+            )
+
+        starts = torch.cumsum(lengths_tensor, dim=0) - lengths_tensor
+        request_ids = torch.repeat_interleave(
+            torch.arange(len(lengths_tensor)), lengths_tensor
+        )
+        columns = torch.arange(tokens.numel()) - starts[request_ids]
+        relative = torch.arange(-3, 1)
+        virtual = columns.unsqueeze(1) + relative.unsqueeze(0)
+        from_context = virtual < 0
+        context_values = context[request_ids].gather(1, (virtual + 3).clamp(0, 2))
+        token_indices = (starts[request_ids].unsqueeze(1) + virtual).clamp(
+            0, tokens.numel() - 1
+        )
+        windows = torch.where(from_context, context_values, tokens[token_indices])
+        special = self._host_special_mask(windows)
+        clean = windows.masked_fill(special, 0)
+
+        shifted = {
+            distance: clean[:, 3 - distance]
+            * (clean[:, 3 - distance :].ne(0).all(dim=1))
+            for distance in range(1, self.config.emb_neighbor_num)
+        }
+        table_ids = []
+        current = clean[:, -1]
+        for order in range(2, self.config.emb_neighbor_num + 1):
+            for split_id in range(self.config.emb_split_num):
+                table_id = (order - 2) * self.config.emb_split_num + split_id
+                rows = self.config.oe_table_rows(table_id)
+                local_ids = current.clone()
+                for distance in range(1, order):
+                    local_ids.add_(
+                        shifted[distance] * pow(self.config.vocab_size, distance, rows)
+                    )
+                table_ids.append(local_ids.remainder(rows))
+
+        tail_virtual = lengths_tensor.unsqueeze(1) + torch.arange(-3, 0)
+        tail_from_context = tail_virtual < 0
+        tail_context = context.gather(1, (tail_virtual + 3).clamp(0, 2))
+        tail_token_indices = (starts.unsqueeze(1) + tail_virtual).clamp(
+            0, tokens.numel() - 1
+        )
+        final_context = torch.where(
+            tail_from_context, tail_context, tokens[tail_token_indices]
+        )
+        return torch.stack(table_ids, dim=1), special[:, -1], final_context
+
+    def lookup_host(self, local_ids: torch.Tensor) -> torch.Tensor:
+        if (
+            local_ids.device.type != "cpu"
+            or local_ids.dtype != torch.int64
+            or local_ids.ndim != 2
+            or local_ids.shape[1] != self.config.oe_component_count
+        ):
+            raise ValueError("Lite OE lookup IDs must be CPU int64 [tokens, 12].")
+        if local_ids.shape[0] == 0:
+            return torch.empty(
+                (0, self.config.oe_component_count, self.config.oe_hidden_size),
+                dtype=torch.bfloat16,
+            )
+        outputs = []
+        for table_id, table in enumerate(self.embedders):
+            expected = (self.config.oe_table_rows(table_id), self.config.oe_hidden_size)
+            if tuple(table.weight.shape) != expected:
+                raise RuntimeError(
+                    f"Lite OE table {table_id} is not loaded: "
+                    f"got {tuple(table.weight.shape)}, expected {expected}."
+                )
+            ids = local_ids[:, table_id]
+            if bool((ids < 0).any()) or bool((ids >= expected[0]).any()):
+                raise ValueError(f"Lite OE table {table_id} received an invalid ID.")
+            outputs.append(F.embedding(ids, table.weight))
+        return torch.stack(outputs, dim=1)
+
+    def project_and_merge(
+        self,
+        word_hidden_states: torch.Tensor,
+        raw_oe: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = word_hidden_states.shape[0]
+        expected_raw = (
+            tokens,
+            self.config.oe_component_count,
+            self.config.oe_hidden_size,
+        )
+        if (
+            word_hidden_states.ndim != 2
+            or word_hidden_states.shape[1] != self.config.hidden_size
+            or tuple(raw_oe.shape) != expected_raw
+            or input_ids.ndim != 1
+            or input_ids.shape[0] != tokens
+        ):
+            raise ValueError("Lite OE projection inputs have incompatible shapes.")
+        if tokens == 0:
+            return word_hidden_states
+        projected = raw_oe.reshape(tokens, self.config.hidden_size) @ (
+            self.projection.reshape(self.config.hidden_size, self.config.hidden_size)
+        )
+        merged = (word_hidden_states + projected) / math.sqrt(
+            self.config.oe_component_count + 1
+        )
+        special = (input_ids.unsqueeze(-1) == self.ignore_tokens).any(dim=-1)
+        return torch.where(special.unsqueeze(-1), word_hidden_states, merged)
+
+    def initialize_runtime(
+        self,
+        *,
+        context_pages: torch.Tensor,
+        checkpoint_granularity: int,
+        max_request_slots: int,
+        max_graph_tokens: int,
+        device: str,
+    ) -> None:
+        self._runtime = LiteOEStatePreparer(
+            self,
+            context_pages=context_pages,
+            checkpoint_granularity=checkpoint_granularity,
+            max_request_slots=max_request_slots,
+            max_graph_tokens=max_graph_tokens,
+            device=device,
+        )
+
+    def prepare_forward_op(
+        self, forward_op: Any, *, graph_tokens: int | None
+    ) -> torch.Tensor:
+        if self._runtime is None:
+            raise RuntimeError("Lite OE runtime is not initialized.")
+        return self._runtime.prepare_forward_op(forward_op, graph_tokens=graph_tokens)
+
+    def prepared_raw_oe(self, num_tokens: int) -> torch.Tensor:
+        if self._runtime is None:
+            raise RuntimeError("Lite OE runtime is not initialized.")
+        return self._runtime.prepared_raw_oe(num_tokens)
+
+
+class LiteOEStatePreparer:
+    """Slot-safe host OE lookup and fixed-address Decode staging."""
+
+    def __init__(
+        self,
+        ngram: LiteNgramParameters,
+        *,
+        context_pages: torch.Tensor,
+        checkpoint_granularity: int,
+        max_request_slots: int,
+        max_graph_tokens: int,
+        device: str,
+    ) -> None:
+        if (
+            context_pages.ndim != 2
+            or context_pages.shape[1] != ngram.config.emb_neighbor_num - 1
+            or context_pages.dtype != torch.int32
+        ):
+            raise ValueError("Lite OE context pages must be int32 [pages, 3].")
+        if (
+            checkpoint_granularity <= 0
+            or max_request_slots <= 0
+            or max_graph_tokens <= 0
+        ):
+            raise ValueError("Lite OE runtime sizes must be positive.")
+        self.ngram = ngram
+        self.context_pages = context_pages
+        self.checkpoint_granularity = checkpoint_granularity
+        self.max_request_slots = max_request_slots
+        self.max_graph_tokens = max_graph_tokens
+        self._owners: list[str | None] = [None] * max_request_slots
+        self._lengths = [0] * max_request_slots
+        self._contexts = torch.full(
+            (max_request_slots, ngram.config.emb_neighbor_num - 1),
+            ngram.config.eos_token_id,
+            dtype=torch.int64,
+        )
+        self.staging = torch.zeros(
+            (
+                max_graph_tokens,
+                ngram.config.oe_component_count,
+                ngram.config.oe_hidden_size,
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self._prepared = self.staging
+        self.restore_count = 0
+
+    @staticmethod
+    def _page_id(table: Any, row: int, slot: int) -> int:
+        if slot < 0 or getattr(table, "ndim", None) != 2:
+            raise ValueError("Lite OE block table must be two-dimensional.")
+        if row >= table.shape[0] or slot >= table.shape[1]:
+            raise ValueError("Lite OE block table does not cover the state slot.")
+        page_id = int(table[row, slot])
+        if page_id <= 0:
+            raise ValueError("Lite OE active state must not use page 0 or padding.")
+        return page_id
+
+    def _initial_context(
+        self,
+        *,
+        request_id: str,
+        request_pool_index: int,
+        before_length: int,
+        table: Any,
+        row: int,
+    ) -> torch.Tensor:
+        if not 0 <= request_pool_index < self.max_request_slots:
+            raise ValueError("Lite OE request-pool index is out of range.")
+        if before_length < 0:
+            raise ValueError("Lite OE prefix length must be non-negative.")
+        if (
+            self._owners[request_pool_index] == request_id
+            and self._lengths[request_pool_index] == before_length
+        ):
+            return self._contexts[request_pool_index]
+        if before_length == 0:
+            return torch.full(
+                (self.ngram.config.emb_neighbor_num - 1,),
+                self.ngram.config.eos_token_id,
+                dtype=torch.int64,
+            )
+        page_id = self._page_id(
+            table,
+            row,
+            (before_length - 1) // self.checkpoint_granularity,
+        )
+        if page_id >= self.context_pages.shape[0]:
+            raise ValueError("Lite OE input state page is out of range.")
+        self.restore_count += 1
+        return self.context_pages[page_id].to(device="cpu", dtype=torch.int64)
+
+    def prepare(
+        self,
+        *,
+        request_ids: Iterable[str],
+        request_pool_indices: Iterable[int],
+        input_ids: torch.Tensor,
+        lengths: Iterable[int],
+        before_lengths: Iterable[int],
+        block_table: Any,
+        graph_tokens: int | None = None,
+    ) -> torch.Tensor:
+        request_ids = tuple(request_ids)
+        request_pool_indices = tuple(request_pool_indices)
+        lengths = tuple(lengths)
+        before_lengths = tuple(before_lengths)
+        batch = len(request_ids)
+        if not (
+            len(request_pool_indices)
+            == len(lengths)
+            == len(before_lengths)
+            == batch
+            == block_table.shape[0]
+        ):
+            raise ValueError("Lite OE request metadata lengths do not match.")
+        if input_ids.device.type != "cpu":
+            raise ValueError("Lite OE input IDs must remain on CPU for host lookup.")
+        if sum(lengths) != input_ids.numel() or any(length < 0 for length in lengths):
+            raise ValueError("Lite OE ragged lengths do not match input IDs.")
+
+        contexts = torch.stack(
+            [
+                self._initial_context(
+                    request_id=request_ids[row],
+                    request_pool_index=request_pool_indices[row],
+                    before_length=before_lengths[row],
+                    table=block_table,
+                    row=row,
+                )
+                for row in range(batch)
+            ]
+        )
+        ids, _, final_contexts = self.ngram.ngram_ids(input_ids, contexts, lengths)
+
+        output_pages: list[int | None] = []
+        written_pages: dict[int, tuple[str, int]] = {}
+        for row, length in enumerate(lengths):
+            request_pool_index = request_pool_indices[row]
+            request_id = request_ids[row]
+            after_length = before_lengths[row] + length
+            page_id = (
+                self._page_id(
+                    block_table,
+                    row,
+                    (after_length - 1) // self.checkpoint_granularity,
+                )
+                if length
+                else None
+            )
+            if page_id is not None:
+                owner = (request_id, request_pool_index)
+                if page_id in written_pages and written_pages[page_id] != owner:
+                    raise ValueError("Lite OE output state page has multiple owners.")
+                if page_id >= self.context_pages.shape[0]:
+                    raise ValueError("Lite OE output state page is out of range.")
+                written_pages[page_id] = owner
+            output_pages.append(page_id)
+
+        for row, page_id in enumerate(output_pages):
+            request_pool_index = request_pool_indices[row]
+            request_id = request_ids[row]
+            after_length = before_lengths[row] + lengths[row]
+            if page_id is not None:
+                self.context_pages[page_id].copy_(
+                    final_contexts[row].to(
+                        device=self.context_pages.device,
+                        dtype=torch.int32,
+                    ),
+                    non_blocking=True,
+                )
+            self._owners[request_pool_index] = request_id
+            self._lengths[request_pool_index] = after_length
+            self._contexts[request_pool_index].copy_(final_contexts[row])
+
+        raw_oe = self.ngram.lookup_host(ids)
+        if graph_tokens is None:
+            self._prepared = raw_oe.to(self.staging.device, non_blocking=True)
+            return self._prepared
+        if not input_ids.numel() <= graph_tokens <= self.max_graph_tokens:
+            raise ValueError("Lite OE graph token count is outside the staging range.")
+        self.staging[input_ids.numel() :].zero_()
+        if input_ids.numel():
+            self.staging[: input_ids.numel()].copy_(raw_oe, non_blocking=True)
+        self._prepared = self.staging[:graph_tokens]
+        return self._prepared
+
+    def prepare_forward_op(
+        self, forward_op: Any, *, graph_tokens: int | None
+    ) -> torch.Tensor:
+        request_ids = tuple(forward_op.request_ids)
+        request_pool_indices = tuple(forward_op.request_pool_indices)
+        lengths = tuple(forward_op.input_lengths)
+        num_extends = forward_op.num_extends()
+        decode_ids = tuple(forward_op.decode_input_ids)
+        if len(decode_ids) != len(request_ids) - num_extends:
+            raise ValueError("Lite OE decode IDs do not match the decode rows.")
+        if any(not 0 <= slot < self.max_request_slots for slot in request_pool_indices):
+            raise ValueError("Lite OE request-pool index is out of range.")
+        if any(token < 0 for token in decode_ids):
+            raise RuntimeError(
+                "Lite OE needs CPU decode token IDs; device-only future_input_map "
+                "cannot drive host-resident lookup."
+            )
+        if any(length != 1 for length in lengths[num_extends:]):
+            raise RuntimeError("Lite OE speculative Decode is not supported yet.")
+        tokens = torch.tensor(
+            (*forward_op.input_ids, *decode_ids), dtype=torch.int64, device="cpu"
+        )
+        before_lengths = tuple(forward_op.extend_prefix_lens) + tuple(
+            (
+                self._lengths[slot]
+                if self._owners[slot] == request_id
+                else forward_op.prefill_lengths[row]
+            )
+            for row, (request_id, slot) in enumerate(
+                zip(
+                    request_ids[num_extends:],
+                    request_pool_indices[num_extends:],
+                    strict=True,
+                ),
+                start=num_extends,
+            )
+        )
+        return self.prepare(
+            request_ids=request_ids,
+            request_pool_indices=request_pool_indices,
+            input_ids=tokens,
+            lengths=lengths,
+            before_lengths=before_lengths,
+            block_table=forward_op.block_tables_arrays()["lite_oe"],
+            graph_tokens=graph_tokens,
+        )
+
+    def prepared_raw_oe(self, num_tokens: int) -> torch.Tensor:
+        if not 0 <= num_tokens <= self._prepared.shape[0]:
+            raise ValueError("Lite OE prepared tensor does not cover model input.")
+        return self._prepared[:num_tokens]
 
 
 class LiteModel(nn.Module):
@@ -1222,6 +1666,29 @@ class FLASHLocalForCausalLM(nn.Module):
     def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
         raise NotImplementedError("Lite numerical forward is connected in phases 3-7.")
 
+    def initialize_external_inputs(
+        self,
+        *,
+        token_to_kv_pool: Any,
+        max_request_slots: int,
+        max_graph_tokens: int,
+        device: str,
+    ) -> None:
+        self.model.ngram_embeddings.initialize_runtime(
+            context_pages=token_to_kv_pool.arena.field("layer.0.lite.oe.context"),
+            checkpoint_granularity=token_to_kv_pool.arena.plan.prefix_granularity,
+            max_request_slots=max_request_slots,
+            max_graph_tokens=max_graph_tokens,
+            device=device,
+        )
+
+    def prepare_external_inputs(
+        self, forward_op: Any, *, graph_tokens: int | None
+    ) -> torch.Tensor:
+        return self.model.ngram_embeddings.prepare_forward_op(
+            forward_op, graph_tokens=graph_tokens
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         expected_sources = set(self.layout.iter_source_names())
         params = dict(self.named_parameters())
@@ -1259,6 +1726,28 @@ class FLASHLocalForCausalLM(nn.Module):
                 if moe_loader.matches(name):
                     loaded_targets.add(moe_loader.load(name, loaded_weight))
                 continue
+            if spec.category == "oe-projection":
+                param = params.get(spec.target_name)
+                if param is None or spec.component_id is None:
+                    raise ValueError(
+                        f"Missing Lite target parameter {spec.target_name!r}."
+                    )
+                expected = (
+                    self.config.oe_component_count,
+                    self.config.oe_hidden_size,
+                    self.config.hidden_size,
+                )
+                if tuple(param.shape) != expected:
+                    raise ValueError(
+                        f"Lite target {spec.target_name!r} has shape "
+                        f"{tuple(param.shape)}; expected {expected}."
+                    )
+                if not param.is_meta:
+                    param[spec.component_id].copy_(
+                        loaded_weight.t().to(device=param.device)
+                    )
+                loaded_targets.add(spec.target_name)
+                continue
             if spec.target_name in loaded_targets:
                 raise ValueError(
                     f"Duplicate Lite target parameter {spec.target_name!r}."
@@ -1267,8 +1756,17 @@ class FLASHLocalForCausalLM(nn.Module):
             if param is None:
                 raise ValueError(f"Missing Lite target parameter {spec.target_name!r}.")
             local_weight = self._local_weight(spec, loaded_weight)
-            if isinstance(param, nn.UninitializedParameter):
-                param.materialize(local_weight.shape, device="cpu", dtype=spec.dtype)
+            if spec.category == "host-oe":
+                if local_weight.device.type != "cpu" or param.device.type != "cpu":
+                    raise ValueError("Lite OE embedding tables must remain on CPU.")
+                param.data = local_weight
+                if (
+                    param.untyped_storage().data_ptr()
+                    != local_weight.untyped_storage().data_ptr()
+                ):
+                    raise RuntimeError("Lite OE host storage adoption did not alias.")
+                loaded_targets.add(spec.target_name)
+                continue
             if (
                 tuple(param.shape) != tuple(local_weight.shape)
                 or param.dtype != spec.dtype
