@@ -110,10 +110,9 @@ def _resolve_registered_config(
 
     architectures = raw_config.get("architectures")
     if isinstance(architectures, list) and architectures:
-        if (
-            architectures[0] == "FLASHLocalForCausalLM"
-            and LiteConfig.matches_checkpoint(raw_config)
-        ):
+        if architectures[
+            0
+        ] == "FLASHLocalForCausalLM" and LiteConfig.matches_checkpoint(raw_config):
             return LiteConfig
         return _ARCHITECTURE_CONFIG_REGISTRY.get(architectures[0])
     return None

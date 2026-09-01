@@ -23,12 +23,15 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
 from tokenspeed_kernel_npu._triton import tl, triton
 from tokenspeed_kernel_npu.public_kda_ops import is_available, load_public_kda_ops
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
 
 _PREFILL_CHUNK_SIZE = 64
 _PREFILL_MIN_PUBLIC_TOKENS = 32
@@ -670,6 +673,8 @@ def public_kda_paged_prefill(
     require_public: bool = False,
 ) -> KdaPrefillResult:
     """Run Lite featurewise-beta Prefill through the public split KDA ops."""
+    from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+
     required = ("kda_gate_cumsum", "chunk_kda_fwd")
     missing = [name for name in required if not is_available(name)]
     unsupported = _public_prefill_unsupported(

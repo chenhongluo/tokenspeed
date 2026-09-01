@@ -454,7 +454,10 @@ def test_kda_split_verify_registration_traits() -> None:
 @pytest.mark.parametrize(
     "kernel_name,extra_traits",
     [
-        ("triton_nvidia_kda_paged_decode", {"indexed_state": True}),
+        (
+            "triton_nvidia_kda_paged_decode",
+            {"beta_mode": "scalar", "indexed_state": True},
+        ),
         ("triton_nvidia_kda_replay_commit", {"flat_state": True}),
         (
             "triton_nvidia_kda_batched_replay_commit",

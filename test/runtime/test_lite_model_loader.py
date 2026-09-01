@@ -165,9 +165,7 @@ def test_lite_config_exposes_linear_tp_cache_geometry():
         env_mod.global_server_args_dict,
         {"mapping": mapping(8)},
     ):
-        conv, recurrent, conv_dtype, state_dtype, layer_ids = (
-            config.mamba2_cache_params
-        )
+        conv, recurrent, conv_dtype, state_dtype, layer_ids = config.mamba2_cache_params
 
     assert conv == (12, 3)
     assert recurrent == (1, 4, 4)
