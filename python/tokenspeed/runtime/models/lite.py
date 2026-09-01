@@ -32,7 +32,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.configs.lite_config import (
+    LiteConfig,
+    is_lite_replicated_mla_mapping,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -1427,11 +1430,19 @@ class LiteNgramParameters(nn.Module):
         )
 
     def prepare_forward_op(
-        self, forward_op: Any, *, graph_tokens: int | None
+        self,
+        forward_op: Any,
+        *,
+        resolved_input_ids: torch.Tensor,
+        graph_tokens: int | None,
     ) -> torch.Tensor:
         if self._runtime is None:
             raise RuntimeError("Lite OE runtime is not initialized.")
-        return self._runtime.prepare_forward_op(forward_op, graph_tokens=graph_tokens)
+        return self._runtime.prepare_forward_op(
+            forward_op,
+            resolved_input_ids=resolved_input_ids,
+            graph_tokens=graph_tokens,
+        )
 
     def prepared_raw_oe(self, num_tokens: int) -> torch.Tensor:
         if self._runtime is None:
@@ -1629,7 +1640,11 @@ class LiteOEStatePreparer:
         return self._prepared
 
     def prepare_forward_op(
-        self, forward_op: Any, *, graph_tokens: int | None
+        self,
+        forward_op: Any,
+        *,
+        resolved_input_ids: torch.Tensor,
+        graph_tokens: int | None,
     ) -> torch.Tensor:
         request_ids = tuple(forward_op.request_ids)
         request_pool_indices = tuple(forward_op.request_pool_indices)
@@ -1640,16 +1655,11 @@ class LiteOEStatePreparer:
             raise ValueError("Lite OE decode IDs do not match the decode rows.")
         if any(not 0 <= slot < self.max_request_slots for slot in request_pool_indices):
             raise ValueError("Lite OE request-pool index is out of range.")
-        if any(token < 0 for token in decode_ids):
-            raise RuntimeError(
-                "Lite OE needs CPU decode token IDs; device-only future_input_map "
-                "cannot drive host-resident lookup."
-            )
+        if resolved_input_ids.ndim != 1 or resolved_input_ids.numel() != sum(lengths):
+            raise ValueError("Lite OE resolved input IDs do not match ragged lengths.")
         if any(length != 1 for length in lengths[num_extends:]):
             raise RuntimeError("Lite OE speculative Decode is not supported yet.")
-        tokens = torch.tensor(
-            (*forward_op.input_ids, *decode_ids), dtype=torch.int64, device="cpu"
-        )
+        tokens = resolved_input_ids.to(device="cpu", dtype=torch.int64)
         before_lengths = tuple(forward_op.extend_prefix_lens) + tuple(
             (
                 self._lengths[slot]
@@ -1700,9 +1710,10 @@ class LiteModel(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, None]:
         hidden_states = self.embed_tokens(input_ids)
+        raw_oe = self.ngram_embeddings.prepared_raw_oe(input_ids.numel())
         hidden_states = self.ngram_embeddings.project_and_merge(
             hidden_states,
-            self.ngram_embeddings.prepared_raw_oe(input_ids.numel()),
+            raw_oe,
             input_ids,
         )
         for layer in self.layers:
@@ -1749,29 +1760,36 @@ class FLASHLocalForCausalLM(nn.Module):
             )
         expected = 1 if mapping.world_size == 1 else 8
         if mapping.world_size == 8:
-            if (mapping.attn.cp_size, mapping.attn.dp_size) == (8, 1):
+            if is_lite_replicated_mla_mapping(mapping):
+                dense_tp = 8
+                attention_group = 8
+            elif (mapping.attn.cp_size, mapping.attn.dp_size) == (8, 1):
                 dense_tp = 1
+                attention_group = 1
             elif (mapping.attn.cp_size, mapping.attn.dp_size) == (1, 8):
                 dense_tp = 8
+                attention_group = 1
             else:
                 raise ValueError(
-                    "Lite MLA requires CP8 or attention-DP8 within each role."
+                    "Lite MLA requires CP8, attention-DP8, or the replicated "
+                    "MLA TP8 topology within each role."
                 )
         else:
             dense_tp = 1
+            attention_group = 1
         actual = {
             "PP": mapping.pp_size,
             "dense TP": mapping.dense.tp_size,
             "KDA TP": mapping.linear_attn.tp_size,
             "MoE EP": mapping.moe.ep_size,
-            "MLA weight TP": mapping.attn.tp_size,
+            "MLA execution group": mapping.attn.tp_size,
         }
         required = {
             "PP": 1,
             "dense TP": dense_tp,
             "KDA TP": expected,
             "MoE EP": expected,
-            "MLA weight TP": 1,
+            "MLA execution group": attention_group,
         }
         mismatches = [
             f"{name}={actual[name]} (expected {value})"
@@ -1824,10 +1842,16 @@ class FLASHLocalForCausalLM(nn.Module):
         )
 
     def prepare_external_inputs(
-        self, forward_op: Any, *, graph_tokens: int | None
+        self,
+        forward_op: Any,
+        *,
+        resolved_input_ids: torch.Tensor,
+        graph_tokens: int | None,
     ) -> torch.Tensor:
         return self.model.ngram_embeddings.prepare_forward_op(
-            forward_op, graph_tokens=graph_tokens
+            forward_op,
+            resolved_input_ids=resolved_input_ids,
+            graph_tokens=graph_tokens,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

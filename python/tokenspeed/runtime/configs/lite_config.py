@@ -85,6 +85,28 @@ _REQUIRED_CHECKPOINT_FIELDS = frozenset(
 )
 
 
+def is_lite_replicated_mla_mapping(mapping: Any) -> bool:
+    """Whether an eight-rank Lite world replicates MLA for bounded serving."""
+    return (
+        mapping.world_size == 8
+        and mapping.pp_size == 1
+        and (
+            mapping.attn.tp_size,
+            mapping.attn.cp_size,
+            mapping.attn.dp_size,
+        )
+        == (8, 1, 1)
+        and mapping.dense.tp_size == 8
+        and mapping.linear_attn.tp_size == 8
+        and (mapping.moe.tp_size, mapping.moe.ep_size) == (1, 8)
+    )
+
+
+def lite_mla_component_tp_size(mapping: Any) -> int:
+    """Return the MLA head-sharding width for a Lite execution mapping."""
+    return 1 if is_lite_replicated_mla_mapping(mapping) else mapping.attn.tp_size
+
+
 class LiteConfig(PretrainedConfig):
     """Native config for ``FLASHLocalForCausalLM`` checkpoints.
 

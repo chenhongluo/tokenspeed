@@ -28,6 +28,7 @@ fi
 def test_worker_launchers_use_bounded_cleanup():
     ci_dir = Path(__file__).parent
     for name in (
+        "serve_lite_npu_pd_8p8d.sh",
         "serve_qwen35_122b_nvfp4_epd_1e1p2d.sh",
         "serve_qwen35_397b_nvfp4_pd_1p1d.sh",
     ):

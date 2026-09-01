@@ -326,13 +326,14 @@ def _create_attn_backend_with_name(
 def _resolve_kda_backend(kda_backend: str) -> str:
     """Resolve the KDA prefill backend policy.
 
-    On AMD, the backend policy is ignored and compatible kernels are selected
-    using registry priority. On NVIDIA, ``auto`` picks the fastest available
-    kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the portable
-    FLA scan. Explicit NVIDIA choices are validated against availability and
-    fail fast with an install hint. Decode is unaffected.
+    On AMD and Ascend, the backend policy is ignored and compatible kernels are
+    selected using registry priority. On NVIDIA, ``auto`` picks the fastest
+    available kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the
+    portable FLA scan. Explicit NVIDIA choices are validated against
+    availability and fail fast with an install hint. Decode is unaffected.
     """
-    if current_platform().is_amd:
+    platform = current_platform()
+    if platform.is_amd or platform.is_npu:
         # Named backend policies are NVIDIA-specific; let the registry decide.
         return "auto"
 

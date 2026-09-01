@@ -254,11 +254,19 @@ def test_lite_oe_state_crosses_checkpoint_boundary_without_restore() -> None:
     assert preparer.restore_count == 0
 
 
-def test_lite_oe_rejects_device_only_decode_token() -> None:
+def test_lite_oe_uses_resolved_device_owned_decode_token() -> None:
     config = LiteConfig.from_dict(lite_config_dict())
+    layer = LiteNgramParameters(config)
+    for table_id, table in enumerate(layer.embedders):
+        table.weight.data = torch.zeros(
+            (config.oe_table_rows(table_id), config.oe_hidden_size),
+            dtype=torch.bfloat16,
+        )
+    pages = torch.zeros((2, 3), dtype=torch.int32)
+    pages[1] = torch.tensor([2, 5, 6], dtype=torch.int32)
     preparer = LiteOEStatePreparer(
-        LiteNgramParameters(config),
-        context_pages=torch.zeros((2, 3), dtype=torch.int32),
+        layer,
+        context_pages=pages,
         checkpoint_granularity=128,
         max_request_slots=1,
         max_graph_tokens=1,
@@ -271,13 +279,53 @@ def test_lite_oe_rejects_device_only_decode_token() -> None:
         input_ids=[],
         decode_input_ids=[-1],
         extend_prefix_lens=[],
-        prefill_lengths=[1],
+        prefill_lengths=[3],
         num_extends=lambda: 0,
         block_tables_arrays=lambda: {"lite_oe": torch.tensor([[1]])},
     )
 
-    with pytest.raises(RuntimeError, match="CPU decode token IDs"):
-        preparer.prepare_forward_op(forward_op, graph_tokens=1)
+    raw = preparer.prepare_forward_op(
+        forward_op,
+        resolved_input_ids=torch.tensor([7], dtype=torch.int32),
+        graph_tokens=1,
+    )
+
+    assert raw.shape == (1, config.oe_component_count, config.oe_hidden_size)
+    assert pages[1].tolist() == [5, 6, 7]
+
+
+def test_lite_oe_rejects_resolved_token_count_before_publication() -> None:
+    config = LiteConfig.from_dict(lite_config_dict())
+    pages = torch.zeros((2, 3), dtype=torch.int32)
+    preparer = LiteOEStatePreparer(
+        LiteNgramParameters(config),
+        context_pages=pages,
+        checkpoint_granularity=128,
+        max_request_slots=1,
+        max_graph_tokens=1,
+        device="cpu",
+    )
+    forward_op = SimpleNamespace(
+        request_ids=["r0"],
+        request_pool_indices=[0],
+        input_lengths=[1],
+        input_ids=[],
+        decode_input_ids=[-1],
+        extend_prefix_lens=[],
+        prefill_lengths=[3],
+        num_extends=lambda: 0,
+        block_tables_arrays=lambda: {"lite_oe": torch.tensor([[1]])},
+    )
+
+    with pytest.raises(ValueError, match="resolved input IDs"):
+        preparer.prepare_forward_op(
+            forward_op,
+            resolved_input_ids=torch.empty(0, dtype=torch.int32),
+            graph_tokens=1,
+        )
+
+    assert not torch.count_nonzero(pages)
+    assert preparer.restore_count == 0
 
 
 def test_lite_oe_rejects_invalid_slots_and_pages_before_publication() -> None:

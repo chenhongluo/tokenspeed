@@ -288,24 +288,26 @@ def test_ascend_lite_mla_absorbed_extend_crosses_page_boundary():
 
 
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
-def test_ascend_lite_mla_decode_value_gate_and_merge():
+@pytest.mark.parametrize("lengths", [(73,), (73, 91)])
+def test_ascend_lite_mla_decode_value_gate_and_merge(lengths):
+    from tokenspeed_kernel.ops.attention import mla_decode_with_kvcache
     from tokenspeed_kernel_npu.ops.mla import (
         attn_merge_state,
-        mla_decode_with_kvcache,
         mla_project_value,
     )
 
     torch.manual_seed(5503)
-    q = torch.randn(2, 1, 32, 576, dtype=torch.bfloat16, device="npu")
-    cache = torch.randn(4, 128, 1, 576, dtype=torch.bfloat16, device="npu")
-    table = torch.tensor([[1, 0], [2, 0]], dtype=torch.int32, device="npu")
-    lengths = torch.tensor([3, 4], dtype=torch.int64, device="npu")
+    batch = len(lengths)
+    q = torch.randn(batch, 1, 32, 576, dtype=torch.bfloat16, device="npu")
+    cache = torch.randn(6, 64, 1, 576, dtype=torch.bfloat16, device="npu")
+    table = torch.tensor([[1, 2], [3, 4]][:batch], dtype=torch.int32, device="npu")
+    cache_seqlens = torch.tensor(lengths, dtype=torch.int64, device="npu")
     latent, lse = mla_decode_with_kvcache(
         q,
         cache,
         table,
-        lengths,
-        256,
+        cache_seqlens,
+        max(lengths),
         128,
         512,
         64,
@@ -313,10 +315,11 @@ def test_ascend_lite_mla_decode_value_gate_and_merge():
         0.0,
         True,
         None,
+        solution="torch_npu",
     )
     expected_rows = []
-    for row, length in enumerate((3, 4)):
-        key = cache[row + 1, :length, 0]
+    for row, length in enumerate(lengths):
+        key = cache[table[row].long()].reshape(-1, 576)[:length]
         logits = q[row, 0].float() @ key.float().transpose(0, 1) * 192**-0.5
         expected_rows.append(
             (torch.softmax(logits, dim=-1) @ key[:, :512].float()).to(q.dtype)
@@ -325,7 +328,7 @@ def test_ascend_lite_mla_decode_value_gate_and_merge():
     torch.testing.assert_close(latent, expected_latent, rtol=0.02, atol=0.02)
 
     weight = torch.randn(32, 512, 128, dtype=torch.bfloat16, device="npu")
-    gate = torch.randn(2, 4096, dtype=torch.bfloat16, device="npu")
+    gate = torch.randn(batch, 4096, dtype=torch.bfloat16, device="npu")
     projected = torch.empty_like(gate)
     mla_project_value(latent[:, 0], weight, gate, projected)
     expected = torch.bmm(latent[:, 0].transpose(0, 1), weight).transpose(0, 1)

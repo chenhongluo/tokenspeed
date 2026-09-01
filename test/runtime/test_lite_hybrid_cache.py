@@ -201,6 +201,54 @@ def test_lite_is_registered_as_the_existing_hybrid_mla_kda_family() -> None:
     assert _LINEAR_ATTN_CLS[_ARCHITECTURE] is LinearAttnConfig
 
 
+def test_replicated_mla_service_keeps_full_component_geometry() -> None:
+    try:
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    except ModuleNotFoundError as exc:
+        if exc.name == "compressed_tensors":
+            pytest.skip("full attention config dependencies are not installed")
+        raise
+
+    text_config = LiteConfig()
+    text_config.architectures = [_ARCHITECTURE]
+    mapping = Mapping(
+        rank=0,
+        world_size=8,
+        attn_tp_size=8,
+        linear_attn_tp_size=8,
+        dense_tp_size=8,
+        moe_tp_size=1,
+        moe_ep_size=8,
+    )
+    server_args = SimpleNamespace(
+        mapping=mapping,
+        attn_tp_size=8,
+        attention_backend="mla",
+        drafter_attention_backend=None,
+    )
+    model_config = SimpleNamespace(
+        hf_config=text_config,
+        num_attention_heads=text_config.num_attention_heads,
+        num_key_value_heads=text_config.num_key_value_heads,
+        head_dim=text_config.qk_nope_head_dim + text_config.qk_rope_head_dim,
+        kv_lora_rank=text_config.kv_lora_rank,
+        qk_nope_head_dim=text_config.qk_nope_head_dim,
+        qk_rope_head_dim=text_config.qk_rope_head_dim,
+        v_head_dim=text_config.v_head_dim,
+        scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
+    )
+
+    kwargs = MLAConfig._spec_kwargs(server_args, model_config, is_draft=False)
+
+    assert kwargs["attn_tp_size"] == 1
+    assert kwargs["num_attention_heads"] == text_config.num_attention_heads
+
+    text_config.architectures = ["OtherForCausalLM"]
+    kwargs = MLAConfig._spec_kwargs(server_args, model_config, is_draft=False)
+    assert kwargs["attn_tp_size"] == 8
+
+
 @pytest.mark.parametrize(
     (
         "tp_size",

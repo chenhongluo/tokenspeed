@@ -309,6 +309,20 @@ def _npu_available():
     return torch.npu.is_available()
 
 
+@pytest.mark.parametrize("requested", ["auto", "fla", "flashkda", "cutedsl_kda"])
+@pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
+def test_ascend_kda_backend_policy_stays_registry_driven(monkeypatch, requested):
+    from tokenspeed.runtime.layers.attention import registry
+
+    monkeypatch.setattr(
+        registry,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=False, is_npu=True),
+    )
+
+    assert registry._resolve_kda_backend(requested) == "auto"
+
+
 def _lite_output_epilogue_oracle(core, gate, weight, eps, heads, dim):
     shaped = core.reshape(-1, heads, dim).float()
     output = shaped * torch.rsqrt(shaped.square().mean(dim=-1, keepdim=True) + eps)

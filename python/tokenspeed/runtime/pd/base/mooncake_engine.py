@@ -23,6 +23,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _transfer_protocol() -> str:
+    from tokenspeed_kernel.platform import current_platform
+
+    return "ascend_direct" if current_platform().is_npu else "rdma"
+
+
 class MooncakeTransferEngine:
     def __init__(self, hostname: str, gpu_id: int, ib_device: str | None = None):
         try:
@@ -74,7 +80,7 @@ class MooncakeTransferEngine:
         ret_value = self.engine.initialize(
             hostname,
             "P2PHANDSHAKE",
-            "rdma",
+            _transfer_protocol(),
             device_name if device_name is not None else "",
         )
         if ret_value != 0:

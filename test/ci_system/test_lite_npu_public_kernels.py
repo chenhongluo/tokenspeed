@@ -65,7 +65,13 @@ def test_lite_npu_public_kernel_manifest():
     assert REQUIRED_CAPABILITIES <= set(capabilities)
 
     for kernel in kernels:
-        assert kernel["status"] in {"existing", "candidate", "adapt", "missing"}
+        assert kernel["status"] in {
+            "existing",
+            "candidate",
+            "adapt",
+            "missing",
+            "rejected",
+        }
         assert kernel["integration"] in {"reuse", "thin-adapter", "incremental", "new"}
         assert set(kernel["roles"]) <= {"prefill", "decode"}
         assert kernel["roles"]
@@ -95,3 +101,24 @@ def test_lite_npu_public_kernel_manifest():
     assert urlparse(baseline["source_url"]).hostname == "github.com"
     assert re.fullmatch(r"[0-9a-f]{40}", baseline["revision"])
     assert baseline["license"]
+
+
+def test_lite_decode_moe_collectives_use_official_non_v2_apis():
+    kernels = {
+        kernel["capability"]: kernel
+        for kernel in json.loads(MANIFEST.read_text())["kernels"]
+    }
+    expected = {
+        "grouped_moe_dispatch": "torch_npu.npu_moe_distribute_dispatch",
+        "grouped_moe_combine": "torch_npu.npu_moe_distribute_combine",
+    }
+    for capability, api in expected.items():
+        kernel = kernels[capability]
+        assert kernel["source_url"] == "https://github.com/Ascend/pytorch"
+        assert kernel["provider"] == "Huawei CANN/Torch-NPU"
+        assert kernel["api"] == api
+        assert kernel["status"] == "rejected"
+        assert kernel["roles"] == ["decode"]
+        assert kernel["excluded_apis"] == [f"{api}_v2"]
+        assert "v2" not in kernel["api"].lower()
+        assert "stage-8c-official-decode-dispatch-combine" in kernel["validation"]

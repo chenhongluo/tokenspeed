@@ -90,7 +90,8 @@ def lite_config_dict(**overrides):
 
 def mapping(world_size=1, rank=0, role="prefill"):
     size = world_size
-    dense_size = size if role == "decode" else 1
+    replicated = role == "replicated"
+    dense_size = size if role in {"decode", "replicated"} else 1
     world_group = tuple(range(world_size))
     return SimpleNamespace(
         world_size=world_size,
@@ -98,13 +99,17 @@ def mapping(world_size=1, rank=0, role="prefill"):
         pp_size=1,
         dense=SimpleNamespace(
             tp_size=dense_size,
-            tp_rank=rank if role == "decode" else 0,
-            tp_group=world_group if role == "decode" else (rank,),
+            tp_rank=rank if role in {"decode", "replicated"} else 0,
+            tp_group=(world_group if role in {"decode", "replicated"} else (rank,)),
         ),
         linear_attn=SimpleNamespace(tp_size=size, tp_rank=rank, tp_group=world_group),
-        moe=SimpleNamespace(ep_size=size, ep_rank=rank, ep_group=world_group),
+        moe=SimpleNamespace(
+            tp_size=1, ep_size=size, ep_rank=rank, ep_group=world_group
+        ),
         attn=SimpleNamespace(
-            tp_size=1,
+            tp_size=size if replicated else 1,
+            tp_rank=rank if replicated else 0,
+            tp_group=world_group if replicated else (rank,),
             cp_size=size if role == "prefill" else 1,
             dp_size=size if role == "decode" else 1,
             cp_rank=rank if role == "prefill" else 0,
@@ -250,6 +255,27 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
     assert model.model.ngram_embeddings.embedders[0].weight.numel() == 0
     assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
     assert model.model.ngram_embeddings.projection.shape == (12, 8, 96)
+
+
+def test_model_accepts_bounded_replicated_mla_topology():
+    from tokenspeed.runtime.configs.lite_config import lite_mla_component_tp_size
+
+    config = LiteConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(config, mapping(8, rank=3, role="replicated"))
+
+    assert model.mapping.attn.tp_size == 8
+    assert lite_mla_component_tp_size(model.mapping) == 1
+    assert model.model.layers[3].self_attn.q_b_proj.weight.shape == (48, 24)
+    assert model.model.layers[0].mlp.proj_input.weight.shape == (12, 96)
+    assert model.model.embed_tokens.weight.shape == (15, 96)
+
+
+def test_model_rejects_partial_replicated_mla_topology():
+    invalid = mapping(8, rank=3, role="replicated")
+    invalid.dense.tp_size = 1
+
+    with pytest.raises(ValueError, match="replicated MLA TP8"):
+        FLASHLocalForCausalLM(LiteConfig.from_dict(lite_config_dict()), invalid)
 
 
 def test_strict_loader_covers_rename_shards_experts_and_host_oe():

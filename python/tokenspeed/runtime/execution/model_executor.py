@@ -1543,6 +1543,9 @@ class ModelExecutor:
                         use_graph = self.forward_step.can_run(bs, ctx)
                         prepare_external_inputs(
                             forward_op,
+                            resolved_input_ids=self.input_buffers.input_ids_buf[
+                                :total_tokens
+                            ],
                             graph_tokens=(
                                 self.forward_step.padded_bs(bs, ctx)
                                 * (self.config.spec_num_tokens or 1)

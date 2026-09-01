@@ -155,6 +155,41 @@ class TestLinearAttnServerArgs(unittest.TestCase):
         self.assertEqual(mapping.dense.tp_size, 8)
         self.assertEqual(mapping.moe.ep_size, 8)
 
+    def test_bounded_service_uses_one_lockstep_tp8_world(self):
+        from tokenspeed.runtime.configs.lite_config import (
+            is_lite_replicated_mla_mapping,
+        )
+
+        mapping = self._resolve(
+            [
+                "--model",
+                "test/model",
+                "--world-size",
+                "8",
+                "--attn-tp-size",
+                "8",
+                "--linear-attn-tp-size",
+                "8",
+                "--dense-tp-size",
+                "8",
+                "--ep-size",
+                "8",
+            ]
+        )
+
+        mapping.rank = 0
+        self.assertTrue(is_lite_replicated_mla_mapping(mapping))
+        self.assertEqual(mapping.attn.tp_group, tuple(range(8)))
+        self.assertEqual(mapping.linear_attn.tp_group, tuple(range(8)))
+        self.assertEqual(mapping.dense.tp_group, tuple(range(8)))
+        self.assertEqual(mapping.moe.ep_group, tuple(range(8)))
+
+        from tokenspeed.runtime.pd.topology import PDParallelTopology
+
+        topology = PDParallelTopology.from_mapping(mapping)
+        topology.require_cache_pd_supported()
+        self.assertEqual((topology.tp_size, topology.cp_size), (8, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

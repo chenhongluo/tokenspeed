@@ -14,8 +14,10 @@
   不作为首轮服务和融合算子验收的前置条件；
 - 补齐参考实现中已经准入的全部优化，并新增 Lite KDA 前置 projection 合并、
   packed QKV causal convolution 和 featurewise-beta 融合；
-- 对 Grouped MoE 执行三组受控实验，分别隔离四组 executor 合并收益和 group-to-rank 物理放置收益，
-  目标候选为一个 flattened EP8 executor 加 group-major 的“两 rank 一组”布局；
+- 对 Grouped MoE 执行三组受控实验，分别隔离四组 executor 合并收益和 group-to-rank 物理放置收益；
+  实测胜者 A 保留四个独立 EP8 local-expert leaf，B/C 不进入 production；
+- Decode 在正确性基线闭环后单独准入华为公开的非 V2 Dispatch/Combine；V2 只保留为历史负对照，
+  非 V2 必须先证明目标 910B/CANN 的 EP8 eager 与 graph 能力；
 - TokenSpeed runtime 保持厂商无关：所有直接的 `torch_npu` 和第三方 kernel 调用都放在
   `tokenspeed-kernel` / `tokenspeed-kernel-npu` 边界后面；
 - 每个非平凡阶段都留下可运行的单元测试、算子上板测试、服务测试、精度检查、内存检查和性能检查。
@@ -77,6 +79,25 @@ EP8 后单 rank 口径：
 留出充足空间。该结论不包含 2M 长上下文或高并发容量；这两项仍需要最后 TODO 中的
 分布式 KV Cache。
 
+这里的“EP8 已足够”也经更保守的静态上界核对：若只把 routed expert 做 EP8，KDA、MLA、
+Grouped MoE 其余参数、OE projection、embedding/head/outer norm 均按完整复制计算，并相应展开
+post-load derived buffer，则每 rank 为：
+
+```text
+2,953,147,008  KDA（不做 TP）
++ 634,023,936  MLA
++ 12,683,575,296  routed experts（EP8）
++ 2,785,900,544  Grouped MoE 其余参数
++ 18,874,368  OE projection
++ 2,013,616,128  embedding、head 与 outer norm
++ 60,784,640  post-load derived
+= 21,149,921,920 bytes = 19.697400 GiB/rank
+```
+
+相对 910B 启动后的 60.649 GiB 可用 HBM，仍有约 40.952 GiB 静态余量。因此从**权重容量**看，
+只切 routed expert 的 EP8 就能放下；现有 KDA TP8 和 D 侧 dense TP8 继续复用是计算/通信实现选择，
+不是为了让权重勉强装入，也不要求先实现分布式 KV Cache。
+
 | 能力 | TokenSpeed 当前状态 | Lite 需要补齐 |
 | --- | --- | --- |
 | NPU device、HCCL、graph、MHA、Norm、Embedding | PR #1281 已支持 | 复用并扩展测试 |
@@ -136,14 +157,18 @@ EP8 后单 rank 口径：
 - 路由语义：每个 token 在四组内分别做 TopK，保证每组都有固定数量的候选 route；
 - 物理放置：把逻辑 expert 映射到 EP rank，决定上述组级约束能否转化为设备负载约束。
 
-最终候选使用一个 flattened EP8 executor，不给 routed expert 叠加 TP。保持 group-major global ID 时，
+阶段 6 的初始候选使用一个 flattened EP8 executor，不给 routed expert 叠加 TP。保持 group-major global ID 时，
 每 rank 持有 `1536/8=192` 个 real experts，每个 `384`-expert group 恰好映射到两个连续 rank：
 `g0 -> r0/r1`、`g1 -> r2/r3`、`g2 -> r4/r5`、`g3 -> r6/r7`。这不会改变每 rank 的 routed-expert
 静态权重规模。identity-zero expert 不进入 GMM，shared expert 继续独立计算。
 
-该布局是待上板验证的目标候选，不靠推导直接准入。阶段 6 必须用三组实验分别测量 executor 合并与
+该布局必须上板验证，不能靠推导直接准入。阶段 6 使用三组实验分别测量 executor 合并与
 物理放置，且记录 pair 级和 rank 级真实 route 数；每组固定 TopK 只能约束 rank pair 的总候选 route，
 zero-expert 命中和 pair 内 hot expert 仍可能造成实际 GMM 负载偏斜。
+
+阶段 6C 的实际上板结果选择 A：production 继续使用四个独立的 `E=384` EP8 leaf，每 rank
+每组 48 个 real expert；flattened B/C 被拒绝。因此后续 Decode 官方 Dispatch/Combine 也必须先按
+四组分别调用，不把通信算子准入与 flattened executor 重新绑定。
 
 通用 `MoELayer` 当前不支持同一层同时使用 TP 和 EP。目标方案中 routed expert 只使用 EP，
 不需要为此新增 mixed-TP/EP 抽象。
@@ -169,13 +194,16 @@ Lite OE 与 Qwen4-Exp PLE 的数学不同，只复用存储、加载和历史管
 
 | 角色 | MLA | KDA | MoE | Dense/shared 权重 |
 | --- | --- | --- | --- | --- |
-| Prefill | 权重每 rank 复制；eager 使用有限的本地/replicated history | linear-attention TP8 | EP8；阶段 6 选择 flattened placement | TP1 |
+| Prefill | 权重每 rank 复制；eager 使用有限的本地/replicated history | linear-attention TP8 | EP8；阶段 6 胜者 A 为四个独立 leaf | TP1 |
 | Decode | 权重每 rank 复制；eager 使用有限的本地/replicated history | linear-attention TP8 | EP8；与 P 使用同一 expert placement | TP8 |
 
 首轮只使用上表中的权重/计算切分：EP8 负责将 1536 个 routed expert 均分为
 192 个/rank，KDA 使用已有 linear-attention TP8，P/D 继续使用已验证的 dense/shared 映射。
 MLA 的有限上下文页和 KDA request state 先使用本地、有界的 correctness 布局，不在首轮
 实现跨 rank KV page ownership、partial output/LSE merge 或 P/D cache fragment 转换。
+
+这里唯一新增的权重容量前置条件是 EP8。已有 KDA TP8、D dense TP8 不需要撤掉，但它们不应被
+误解为分布式 KV Cache 工作；首轮服务不得为了 CP/SP/KVP、分布式 page owner 或 2M 容量延后。
 
 `Mapping` 虽已能表达 attention TP/CP/DP、linear-attention TP 和 MoE EP，但这不等于 CachePD
 已经支持 CP/KVP。相关工作不删除，统一移到文末“最后 TODO：分布式 KV Cache”，
@@ -203,7 +231,8 @@ MLA 的有限上下文页和 KDA request state 先使用本地、有界的 corre
 | Featurewise beta | 标准 KDA 前的 fused pointwise prepare | Decode 融入 recurrent kernel；Prefill 保留一个 prepare launch |
 | MLA | Torch/reference projection 和 attention | Ascend latent Prefill/Decode、LSE、value projection、output gate |
 | MoE routing | Torch softmax/top-k/remap | 四组独立 Ascend fused top-k + global ID 映射 |
-| MoE expert core | 四个独立 EP8 executor 的 reference baseline | 一个 flattened EP8 executor，复用 NPU GMM/collective |
+| MoE expert core | 四个独立 EP8 executor 的 reference baseline | 胜者 A：四个独立 Ascend GMM/SwiGLU/GMM leaf |
+| MoE Decode 通信 | local expert partial + EP8 AllReduce | 华为非 V2 Dispatch/Combine；仅在 EP8 eager/graph 上板通过后替换 |
 | OE | Torch id、lookup、aggregate | block projection + host staged lookup |
 | Norm/residual | 现有非融合路径 | 复用 PR #1281 fused-add-RMSNorm |
 
@@ -400,6 +429,22 @@ B 相对 A 证明四次 dispatch/GMM/finalize 合并为一次且无性能或内�
 准入门槛：16 rank 全部完成目标 shard 加载，P/D 角色内 eager 输出与冻结 reference 一致；每 rank
 权重和 collective 符合 8P8D 声明，静态权重通过实际内存账本。此阶段不宣称 HTTP 服务已端到端可用。
 
+### 阶段 8C：Decode 官方 Dispatch/Combine 准入
+
+本阶段只处理 Decode Grouped MoE 的通信优化，详细契约见
+`lite-npu-phase-08c-decode-official-dispatch-combine.md`。
+
+- production 候选只使用华为公开的非 V2
+  `npu_moe_distribute_dispatch/combine`；
+- 四个 `E=384,H=768,K=12` group 分别调用，identity/shared 保持算子外语义；
+- 首先在独立 NPU8 board 验证 EP8、local expert 48、BF16、BS1/2 eager/graph 和专用通信域；
+- 官方 A2 文档未声明 EP8，若目标环境拒绝则立即保留当前 local leaf + AllReduce baseline；
+- 只有 board 通过后才经 `tokenspeed-kernel-npu` solution 接入，runtime 不直接依赖 `torch_npu`；
+- V2 不是 fallback，也不为迁就算子改变固定的 8P8D 拓扑。
+
+准入门槛：相对当前 baseline，group/MoE/layer output 无精度回退，Decode graph BS1/2 与 overlap
+通过，TPOT/HBM 不回退；随后完成 8P8D 服务和 GSM8K 前 100 条累计验收。
+
 ### 阶段 9：8P8D 有限上下文 Eager 完整服务
 
 交付：
@@ -445,7 +490,8 @@ B 相对 A 证明四次 dispatch/GMM/finalize 合并为一次且无性能或内�
 | P/D fused MoE top-k | 阶段 6 |
 | Decode-only Weight-NZ | 阶段 11 |
 | Packed conv、recurrent KDA、chunk KDA | 阶段 4 |
-| Grouped MoE flattened executor 与 group-to-rank placement | 阶段 6 |
+| Grouped MoE A/B/C placement（胜者 A） | 阶段 6 |
+| Decode 官方非 V2 Dispatch/Combine | 阶段 8C |
 | OE block projection | 阶段 7 |
 | In-place MLA output gate | 阶段 5 |
 | KDA direct-to-live PD state | 最后 TODO |
@@ -527,7 +573,8 @@ head-sharded row 和 replicated low-rank row 保持原有 shard 语义。
 
 `model/load -> 本地 cache metadata -> KDA/MLA/MoE/OE 单卡子模块 eager
 -> EP8 为核心的 8P8D 权重/角色内切分 -> 有限上下文 8P8D 全模型 eager 服务
--> graph/overlap -> fusion -> 首轮最终验收 -> 分布式 KV Cache TODO`
+-> Decode 官方通信算子门禁 -> graph/overlap -> fusion -> 首轮最终验收
+-> 分布式 KV Cache TODO`
 
 在 eager state 未对齐前不开始 graph 调试。CP8/KVP8、跨 rank page ownership 和 PD fragment transfer
 不再阻塞 Eager、graph 或融合算子验收；它们只在首轮闭环后进入最后 TODO。
@@ -541,6 +588,7 @@ Projection packing 和 conv packing 放在功能 kernel 之后，确保问题能
 | Ascend MLA 无法返回可用 LSE | 最后 TODO 的两路 partial attention board | 不阻塞本地 MLA；做 KVP 前补 registered MLA solution |
 | CachePD 的 CP 限制不仅是 rank planner | 最后 TODO 的 8P8D synthetic transfer contract | 扩展通用 topology/fragment 层，不新增模型侧 transfer |
 | EP8 grouped collective 不支持目标 shape | router + identity expert distributed leaf | 保留 fixed-shape native HCCL fallback，记录 fused path 不支持 |
+| 官方非 V2 Dispatch/Combine 的 A2 公开域不含 EP8 | 阶段 8C NPU8 direct board | 保留 local leaf + AllReduce；不改 8P8D、不回退 V2 |
 | group-major 两卡一组只改善 pair 级、却放大 pair 内 hot-expert 偏斜 | 阶段 6 的 A/B/C route 与 GMM 计数 | C 未优于 B 时保留 flattened-interleaved，不引入未验证的 EPLB |
 | MLA HW prolog 不支持目标 hidden size | 真实 shape direct board | 保持关闭 |
 | Host OE staging 成为 Prefill 瓶颈 | row/block hit rate 和 transfer profile | 只有测到瓶颈后才增加 block batching/prefetch |

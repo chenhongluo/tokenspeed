@@ -79,6 +79,19 @@ class MLAConfig(BaseAttnConfig):
                 ),
             )
         hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        architectures = tuple(
+            getattr(text_config, "architectures", None)
+            or getattr(hf_config, "architectures", None)
+            or ()
+        )
+        attn_tp_size = server_args.attn_tp_size or server_args.mapping.attn.tp_size
+        if "LiteForCausalLM" in architectures:
+            from tokenspeed.runtime.configs.lite_config import (
+                lite_mla_component_tp_size,
+            )
+
+            attn_tp_size = lite_mla_component_tp_size(server_args.mapping)
         layer_types = tuple(
             getattr(hf_config, "cache_layer_types", None)
             or getattr(hf_config, "layer_types", None)
@@ -98,7 +111,7 @@ class MLAConfig(BaseAttnConfig):
             num_attention_heads=model_config.num_attention_heads,
             num_kv_heads=model_config.num_key_value_heads,
             head_dim=model_config.head_dim,
-            attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+            attn_tp_size=attn_tp_size,
             dtype=model_config.dtype,
             kv_cache_dtype=resolve_mla_kv_cache_dtype(
                 server_args, model_config, is_draft
