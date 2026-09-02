@@ -41,6 +41,7 @@ from tokenspeed.runtime.models.lite import FLASHLocalForCausalLM
 def test_role_mapping_and_exact_static_parameter_bytes(role) -> None:
     kwargs = role_mapping_kwargs(role)
     assert kwargs["linear_attn_tp_size"] == 8
+    assert kwargs["mla_weight_tp_size"] == 1
     assert kwargs["moe_ep_size"] == 8
     assert (kwargs["attn_cp_size"], kwargs["attn_dp_size"]) == (
         (8, 1) if role == "prefill" else (1, 8)

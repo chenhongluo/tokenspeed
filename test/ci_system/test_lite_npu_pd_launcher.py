@@ -116,6 +116,7 @@ def test_check_prints_the_bounded_8p8d_commands_without_side_effects(tmp_path):
             "--world-size 8",
             "--attn-tp-size 8",
             "--linear-attn-tp-size 8",
+            "--mla-weight-tp-size 1",
             "--dense-tp-size 8",
             "--ep-size 8",
             "--max-model-len 4096",

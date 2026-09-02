@@ -195,6 +195,7 @@ COMMON_ARGS=(
   --world-size 8
   --attn-tp-size 8
   --linear-attn-tp-size 8
+  --mla-weight-tp-size 1
   --dense-tp-size 8
   --ep-size 8
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"

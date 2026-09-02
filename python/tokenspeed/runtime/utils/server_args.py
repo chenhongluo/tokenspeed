@@ -325,6 +325,7 @@ class ServerArgs:
     world_size: int | None = None
     attn_tp_size: int | None = None
     linear_attn_tp_size: int | None = None
+    mla_weight_tp_size: int | None = None
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
@@ -667,6 +668,11 @@ class ServerArgs:
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
             linear_attn_tp_size=self.linear_attn_tp_size,
+            mla_weight_tp_size=(
+                self.mla_weight_tp_size
+                if self.mla_weight_tp_size is not None
+                else (self.attn_tp_size or attn_tp_size)
+            ),
             pp_size=pp_size,
             pp_layer_partition=self.pp_layer_partition,
             nprocs_per_node=nprocs_per_node,
@@ -2042,6 +2048,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.linear_attn_tp_size,
             help="Specify TP size for linear-attention layers. Defaults to attention TP.",
+        )
+        parser.add_argument(
+            "--mla-weight-tp-size",
+            type=int,
+            default=ServerArgs.mla_weight_tp_size,
+            help="Specify TP size for MLA weights. Defaults to attention TP.",
         )
         parser.add_argument(
             "--moe-tp-size",

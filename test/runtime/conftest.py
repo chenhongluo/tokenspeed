@@ -81,6 +81,9 @@ def kimi_recipe(
             chunked_prefill_size=max_scheduled_tokens,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            mapping=SimpleNamespace(
+                linear_attn=SimpleNamespace(tp_size=tp_size),
+            ),
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config)

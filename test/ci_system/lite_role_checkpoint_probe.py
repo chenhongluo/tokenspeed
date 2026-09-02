@@ -69,6 +69,7 @@ def role_mapping_kwargs(role: str) -> dict[str, int]:
             "moe_tp_size": 1,
             "moe_ep_size": 8,
             "linear_attn_tp_size": 8,
+            "mla_weight_tp_size": 1,
         }
     if role == "decode":
         return {
@@ -79,6 +80,7 @@ def role_mapping_kwargs(role: str) -> dict[str, int]:
             "moe_tp_size": 1,
             "moe_ep_size": 8,
             "linear_attn_tp_size": 8,
+            "mla_weight_tp_size": 1,
         }
     raise ValueError(f"Unknown Lite role {role!r}.")
 
@@ -277,6 +279,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         mapping.attn.tp_group,
         mapping.attn.dp_group,
         mapping.linear_attn.tp_group,
+        mapping.mla_weight.tp_group,
         mapping.dense.tp_group,
         mapping.moe.tp_ep_group,
     ):

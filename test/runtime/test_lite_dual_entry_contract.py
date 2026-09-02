@@ -20,9 +20,10 @@
 
 """Behavior guards for the temporary Flash-Lite dual model entries."""
 
+from test.runtime.test_lite_model_loader import lite_config_dict
+
 import pytest
 
-from test.runtime.test_lite_model_loader import lite_config_dict
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.configs.lite_config import LiteConfig
 from tokenspeed.runtime.models.flash_kda import _canonical_flash_kda_weight_name

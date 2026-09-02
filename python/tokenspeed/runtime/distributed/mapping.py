@@ -312,7 +312,7 @@ class VisionTowerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
-class LinearAttnLayerMapping(MappingBase):
+class LinearAttnLayerMapping(AttentionLayerMapping):
     """Parallel mapping for head-sharded linear-attention layers."""
 
     def __init__(
@@ -321,30 +321,13 @@ class LinearAttnLayerMapping(MappingBase):
         world_size: int = 1,
         tp_size: int | None = None,
     ):
-        super().__init__(rank, world_size)
-        self.tp_size, self.dp_size = _resolve_parallelism_sizes(
-            self.world_size, tp_size, None
+        super().__init__(
+            rank=rank,
+            world_size=world_size,
+            tp_size=tp_size,
+            cp_size=1,
+            dp_size=None,
         )
-
-    @cached_property
-    def has_tp(self) -> bool:
-        return self.tp_size > 1
-
-    @cached_property
-    def tp_rank(self) -> int:
-        return _make_parallelism_rank(self.rank, self.tp_size, stride=1)
-
-    @cached_property
-    def tp_group(self) -> Group:
-        return _make_parallelism_group(self.rank, self.tp_size, stride=1)
-
-    @cached_property
-    def dp_rank(self) -> int:
-        return _make_parallelism_rank(self.rank, self.dp_size, stride=self.tp_size)
-
-    @cached_property
-    def dp_group(self) -> Group:
-        return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
 class Mapping(MappingBase):
@@ -365,6 +348,7 @@ class Mapping(MappingBase):
         vision_tp_size: int | None = None,
         vision_dp_size: int | None = None,
         linear_attn_tp_size: int | None = None,
+        mla_weight_tp_size: int | None = None,
         pp_size: int = 1,
         pp_layer_partition: tuple[int, ...] | None = None,
         nprocs_per_node: int | None = None,
@@ -429,6 +413,16 @@ class Mapping(MappingBase):
                 else self.attn.tp_size
             ),
         )
+        self.mla_weight = DenseLayerMapping(
+            rank=rank,
+            world_size=stage_world_size,
+            tp_size=(
+                mla_weight_tp_size
+                if mla_weight_tp_size is not None
+                else self.attn.tp_size
+            ),
+            dp_size=None,
+        )
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
         )
@@ -443,6 +437,7 @@ class Mapping(MappingBase):
         self.moe.rank = rank
         self.vision.rank = rank
         self.linear_attn.rank = rank
+        self.mla_weight.rank = rank
 
     @cached_property
     def has_pp(self) -> bool:
@@ -515,6 +510,8 @@ class Mapping(MappingBase):
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Pipeline: pp={self.pp_size}",
             f"  Attention: tp={self.attn.tp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
+            f"    MLA weights: tp={self.mla_weight.tp_size}  dp={self.mla_weight.dp_size}",
+            f"    Linear attn: tp={self.linear_attn.tp_size}  dp={self.linear_attn.dp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",

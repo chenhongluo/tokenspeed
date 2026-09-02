@@ -201,6 +201,7 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
         world_size=8,
         attn_tp_size=8,
         linear_attn_tp_size=8,
+        mla_weight_tp_size=1,
         dense_tp_size=8,
         moe_tp_size=1,
         moe_ep_size=8,
@@ -243,7 +244,7 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
 
     text_config.architectures = ["OtherForCausalLM"]
     config = MLAConfig.generate(server_args, model_config, is_draft=False)
-    assert config.attn_tp_size == 8
+    assert config.attn_tp_size == 1
 
 
 @pytest.mark.parametrize(
