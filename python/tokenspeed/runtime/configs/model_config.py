@@ -24,7 +24,7 @@ import copy
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
 
@@ -108,6 +108,44 @@ class AttentionArch(IntEnum):
     MHA = auto()
     DSA = auto()
     MSA = auto()
+
+
+def resolve_oe_runtime_plan(
+    *,
+    use_over_embedding: bool,
+    requested_placement: str,
+    device: str,
+    capabilities: Mapping[str, Mapping[str, str]],
+) -> tuple[str | None, str | None]:
+    """Resolve one class-declared OE table/state implementation pair."""
+    if requested_placement not in {"auto", "host", "device"}:
+        raise ValueError(
+            "oe_table_placement must be one of auto, host, or device; "
+            f"got {requested_placement!r}"
+        )
+    if not use_over_embedding:
+        if requested_placement != "auto":
+            raise ValueError("--oe-table-placement is only valid for an OE checkpoint")
+        return None, None
+
+    device_capabilities = capabilities.get(device, {})
+    if requested_placement == "auto":
+        placement = next(
+            (
+                candidate
+                for candidate in ("device", "host")
+                if candidate in device_capabilities
+            ),
+            None,
+        )
+    else:
+        placement = requested_placement
+    if placement is None or placement not in device_capabilities:
+        raise ValueError(
+            f"OE table placement {requested_placement!r} is not supported by "
+            f"the selected model on {device!r}"
+        )
+    return placement, device_capabilities[placement]
 
 
 @dataclass(frozen=True)
@@ -403,6 +441,14 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.mapping = server_args.mapping
+        self.device = getattr(server_args, "device", "cuda")
+        self._oe_table_placement_request = (
+            "auto"
+            if is_draft_worker
+            else getattr(server_args, "oe_table_placement", "auto")
+        )
+        self.oe_table_placement: str | None = None
+        self.oe_state_provider: str | None = None
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)

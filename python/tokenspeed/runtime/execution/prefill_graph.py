@@ -247,7 +247,7 @@ class PrefillGraph:
             or self._embed_tokens is None
             # The graph embedding seam only accepts input_ids. Models whose
             # embeddings depend on request context must keep prefill eager.
-            or bool(getattr(model, "requires_request_token_history", False))
+            or bool(getattr(config, "requires_request_token_history", False))
             or model_runner is None
             or not model_runner.is_generation
             # DP replay decisions must come from replicated state, and a

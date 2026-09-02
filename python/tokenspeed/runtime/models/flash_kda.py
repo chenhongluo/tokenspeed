@@ -63,6 +63,7 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.over_embedding import (
+    HostLongCatOverEmbedding,
     LongCatOverEmbedding,
     resolve_longcat_oe_hyperparameters,
 )
@@ -1266,6 +1267,7 @@ class FLASHLocalModel(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        oe_table_placement: str | None = "device",
     ) -> None:
         super().__init__()
         self.config = config
@@ -1273,7 +1275,12 @@ class FLASHLocalModel(nn.Module):
         self.padding_id = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = self._build_embed_tokens(config, quant_config)
+        self.ngram_embeddings: HostLongCatOverEmbedding | None = None
+        self.embed_tokens = self._build_embed_tokens(
+            config,
+            quant_config,
+            oe_table_placement,
+        )
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         def get_layer(idx: int, prefix: str):
@@ -1296,9 +1303,8 @@ class FLASHLocalModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: set[int] = set()
 
-    def _build_embed_tokens(self, config, quant_config):
-        """Create the embedding layer: plain VocabParallelEmbedding, or the
-        fused over-embedding (OE) layer when the checkpoint carries OE tables.
+    def _build_embed_tokens(self, config, quant_config, oe_table_placement):
+        """Create the plain, Device-OE, or Host-OE embedding components.
 
         OE is enabled when ``config.use_over_embedding`` is True (i.e. the
         checkpoint's ``ngram_vocab_size_ratio`` / legacy ``oe_vocab_size_ratio``
@@ -1312,6 +1318,20 @@ class FLASHLocalModel(nn.Module):
                 tp_rank=self.mapping.attn.tp_rank,
                 tp_size=self.mapping.attn.tp_size,
                 tp_group=self.mapping.attn.tp_group,
+            )
+
+        if oe_table_placement == "host":
+            self.ngram_embeddings = HostLongCatOverEmbedding(config)
+            return VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                tp_rank=self.mapping.dense.tp_rank,
+                tp_size=self.mapping.dense.tp_size,
+                tp_group=self.mapping.dense.tp_group,
+            )
+        if oe_table_placement != "device":
+            raise ValueError(
+                "OE checkpoints require a resolved host or device table placement."
             )
 
         # OE hyperparameters: neighbor_num is the maximum n-gram order, while
@@ -1350,6 +1370,12 @@ class FLASHLocalModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids, ctx)
         else:
             hidden_states = self.embed_tokens(input_ids)
+            if self.ngram_embeddings is not None:
+                hidden_states = self.ngram_embeddings.project_and_merge(
+                    hidden_states,
+                    self.ngram_embeddings.prepared_raw_oe(input_ids.numel()),
+                    input_ids,
+                )
 
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
@@ -1392,6 +1418,11 @@ class FLASHLocalForCausalLM(BaseCausalLM):
     """
 
     model_cls = FLASHLocalModel
+    supports_oe_table_placement = True
+    oe_runtime_capabilities = {
+        "cuda": {"device": "runtime-full-history"},
+        "npu": {"host": "cache-checkpointed-tail"},
+    }
 
     def __init__(
         self,
@@ -1400,16 +1431,16 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         model: FLASHLocalModel | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        oe_table_placement: str | None = "device",
     ) -> None:
         self._model_override = model
+        self.oe_table_placement = oe_table_placement
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
         )
-        embed = self.model.embed_tokens
-        self.requires_request_token_history = isinstance(embed, LongCatOverEmbedding)
 
     def resolve_model(
         self,
@@ -1425,6 +1456,42 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             mapping=mapping,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
+            oe_table_placement=self.oe_table_placement,
+        )
+
+    def initialize_external_inputs(
+        self,
+        *,
+        token_to_kv_pool,
+        max_request_slots: int,
+        max_graph_tokens: int,
+        device: str,
+    ) -> None:
+        host_oe = getattr(self.model, "ngram_embeddings", None)
+        if host_oe is None:
+            return
+        host_oe.initialize_runtime(
+            context_pages=token_to_kv_pool.arena.field("layer.0.lite.oe.context"),
+            checkpoint_granularity=token_to_kv_pool.arena.plan.prefix_granularity,
+            max_request_slots=max_request_slots,
+            max_graph_tokens=max_graph_tokens,
+            device=device,
+        )
+
+    def prepare_external_inputs(
+        self,
+        forward_op,
+        *,
+        resolved_input_ids: torch.Tensor,
+        graph_tokens: int | None,
+    ) -> torch.Tensor | None:
+        host_oe = getattr(self.model, "ngram_embeddings", None)
+        if host_oe is None:
+            return None
+        return host_oe.prepare_forward_op(
+            forward_op,
+            resolved_input_ids=resolved_input_ids,
+            graph_tokens=graph_tokens,
         )
 
     def post_init(self) -> None:
@@ -1562,6 +1629,15 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             #   * ``model.ngram_embeddings.post_projs.{N}.weight``    -> oe_projection
             #     (longcat-flash-lite open naming — the canonical Flash-KDA ckpt)
             embed = getattr(self.model, "embed_tokens", None)
+            host_oe = getattr(self.model, "ngram_embeddings", None)
+            if isinstance(host_oe, HostLongCatOverEmbedding) and (
+                ".oe_embed_tokens" in name
+                or ".oe_embed_proj" in name
+                or ".ngram_embeddings" in name
+            ):
+                if not host_oe.load_weight(name, loaded_weight):
+                    raise ValueError(f"Unexpected Host OE weight {name!r}.")
+                continue
             if isinstance(embed, LongCatOverEmbedding) and (
                 ".embed_tokens" in name
                 or ".oe_embed_tokens" in name
@@ -1692,6 +1768,9 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         embed = getattr(self.model, "embed_tokens", None)
         if isinstance(embed, LongCatOverEmbedding):
             embed.validate_loaded_weights()
+        host_oe = getattr(self.model, "ngram_embeddings", None)
+        if isinstance(host_oe, HostLongCatOverEmbedding):
+            host_oe.validate_loaded_weights()
 
         for layer in self.model.layers:
             self_attn = layer.self_attn

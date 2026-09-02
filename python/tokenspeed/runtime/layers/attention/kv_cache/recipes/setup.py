@@ -183,10 +183,10 @@ def prepare_cache_setup(
     recipe = _RECIPES.get(family)
     if recipe is None:
         raise ValueError(f"unsupported cache model family: {family}")
-    hf_config = model_config.hf_config
-    text_config = getattr(hf_config, "text_config", hf_config)
-    if family == "kimi_k3" and "LiteForCausalLM" in (
-        getattr(text_config, "architectures", None) or ()
+    if (
+        family == "kimi_k3"
+        and getattr(model_config, "oe_state_provider", None)
+        == "cache-checkpointed-tail"
     ):
         recipe = LiteRecipe
     return recipe(

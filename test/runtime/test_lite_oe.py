@@ -33,11 +33,60 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.layers.over_embedding import (
+    CheckpointedTailOEStatePreparer,
+    HostLongCatOverEmbedding,
+)
 from tokenspeed.runtime.models.lite import (
     FLASHLocalForCausalLM,
     LiteNgramParameters,
     LiteOEStatePreparer,
 )
+
+
+def test_temporary_lite_oe_names_alias_the_shared_layer() -> None:
+    assert LiteNgramParameters is HostLongCatOverEmbedding
+    assert LiteOEStatePreparer is CheckpointedTailOEStatePreparer
+
+
+def test_shared_flash_loader_delegates_host_oe_weights(monkeypatch) -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import flash_kda
+
+    monkeypatch.setattr(
+        flash_kda,
+        "flash_local_prefers_packed_projections",
+        lambda: True,
+    )
+    monkeypatch.setattr(flash_kda, "flash_local_prefers_packed_moe", lambda: True)
+    model = flash_kda.FLASHLocalForCausalLM(
+        FLASHLocalConfig.from_dict(lite_config_dict()),
+        Mapping(rank=0, world_size=1),
+        oe_table_placement="host",
+    )
+    host_oe = model.model.ngram_embeddings
+    assert isinstance(host_oe, HostLongCatOverEmbedding)
+    monkeypatch.setattr(model, "post_load_weights", lambda: None)
+    table = torch.zeros(
+        (host_oe.config.oe_table_rows(0), host_oe.config.oe_hidden_size),
+        dtype=torch.bfloat16,
+    )
+    projection = torch.zeros(
+        (host_oe.config.hidden_size, host_oe.config.oe_hidden_size),
+        dtype=torch.bfloat16,
+    )
+
+    model.load_weights(
+        [
+            ("model.ngram_embeddings.embedders.0.weight", table),
+            ("model.ngram_embeddings.post_projs.0.weight", projection),
+        ]
+    )
+
+    assert host_oe.embedders[0].weight.data_ptr() == table.data_ptr()
+    assert host_oe._table_loaded[0]
+    assert host_oe._projection_loaded[0]
 
 
 def _brute_ids(config, flat_tokens, initial_context, lengths):

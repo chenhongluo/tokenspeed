@@ -288,6 +288,7 @@ class ServerArgs:
     # Runtime options
     disable_pdl: bool = False
     npu_enable_weight_nz: bool = False
+    oe_table_placement: str = "auto"
     enable_prefix_caching: bool = True
     disable_kvstore: bool = False
     enforce_eager: bool = False
@@ -1842,6 +1843,13 @@ class ServerArgs:
             "--npu-enable-weight-nz",
             action="store_true",
             help="Prepare selected Lite Decode weights in Ascend FRACTAL_NZ format.",
+        )
+        parser.add_argument(
+            "--oe-table-placement",
+            choices=["auto", "host", "device"],
+            default=ServerArgs.oe_table_placement,
+            help="Choose where over-embedding tables reside. Explicit choices "
+            "fail when the selected model/backend has no matching implementation.",
         )
         prefix_cache_group = parser.add_mutually_exclusive_group()
         prefix_cache_group.add_argument(

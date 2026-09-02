@@ -101,7 +101,10 @@ def _lite_recipe(
                 linear_attn=SimpleNamespace(tp_size=tp_size),
             ),
         ),
-        model_config=SimpleNamespace(hf_config=text_config),
+        model_config=SimpleNamespace(
+            hf_config=text_config,
+            oe_state_provider="cache-checkpointed-tail",
+        ),
         attn_config=attn_config,
         draft_model_config=None,
         draft_attn_config=None,
@@ -471,6 +474,33 @@ def test_lite_setup_dispatches_to_the_oe_recipe() -> None:
         raise
 
     recipe = _lite_recipe(8)
+    setup = prepare_cache_setup(
+        family="kimi_k3",
+        server_args=recipe.server_args,
+        model_config=recipe.model_config,
+        attn_config=recipe.attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=recipe.cache_budget_bytes,
+        decode_input_tokens=recipe.decode_input_tokens,
+        overlap_schedule_depth=recipe.overlap_schedule_depth,
+    )
+
+    assert setup.spec.memory_plan.field("layer.0.lite.oe.context").shape == (3,)
+
+
+def test_lite_setup_dispatches_by_provider_not_architecture() -> None:
+    try:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+            prepare_cache_setup,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "compressed_tensors":
+            pytest.skip("full attention config dependencies are not installed")
+        raise
+
+    recipe = _lite_recipe(8)
+    recipe.model_config.hf_config.architectures = ["FLASHLocalForCausalLM"]
     setup = prepare_cache_setup(
         family="kimi_k3",
         server_args=recipe.server_args,

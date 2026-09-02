@@ -539,6 +539,34 @@ class FLASHLocalConfig(PretrainedConfig):
         ]
 
     @property
+    def oe_component_count(self) -> int:
+        if self.emb_neighbor_num is None or self.emb_split_num is None:
+            raise ValueError("OE requires emb_neighbor_num and emb_split_num.")
+        return (self.emb_neighbor_num - 1) * self.emb_split_num
+
+    @property
+    def oe_hidden_size(self) -> int:
+        count = self.oe_component_count
+        if self.hidden_size % count:
+            raise ValueError("hidden_size must be divisible by the OE component count.")
+        return self.hidden_size // count
+
+    @property
+    def oe_table_base_rows(self) -> int:
+        if self.ngram_vocab_size_ratio is None:
+            raise ValueError("OE requires ngram_vocab_size_ratio.")
+        return int(self.vocab_size * self.ngram_vocab_size_ratio)
+
+    def oe_table_rows(self, table_id: int) -> int:
+        if not 0 <= table_id < self.oe_component_count:
+            raise IndexError(f"OE table index {table_id} is outside the model.")
+        return self.oe_table_base_rows + 2 * table_id + 1
+
+    @property
+    def special_token_ids(self) -> tuple[int, ...]:
+        return tuple(self.oe_ignore_tokens)
+
+    @property
     def mamba2_cache_params(self):
         """KDA per-request state spec consumed by the hybrid KV-cache allocator.
 
