@@ -250,6 +250,25 @@ def test_flash_kda_identity_zero_expert_is_partitioned_across_moe_ranks() -> Non
     assert topk_output.topk_weights.tolist() == [[0.0, 0.25], [0.75, 0.0]]
 
 
+def test_flash_local_decoder_selects_packed_moe_by_capability(monkeypatch) -> None:
+    from test.runtime.test_lite_model_loader import lite_config_dict
+
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import flash_kda
+    from tokenspeed.runtime.models.flash_local_moe import PackedFLASHLocalMoE
+
+    monkeypatch.setattr(flash_kda, "flash_local_prefers_packed_moe", lambda: True)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    mapping = Mapping(rank=0, world_size=1)
+
+    with torch.device("meta"):
+        layer = flash_kda.FLASHLocalDecoderLayer(config, 0, mapping)
+
+    assert isinstance(layer.moe, PackedFLASHLocalMoE)
+    assert layer.moe.local_expert_ids == tuple(range(32))
+
+
 def test_flash_kda_maps_fgbkda_projection_weights_to_checkpoint_structure() -> None:
     from tokenspeed.runtime.models.flash_kda import (
         _canonical_flash_kda_weight_name,

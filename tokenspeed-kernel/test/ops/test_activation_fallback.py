@@ -20,7 +20,6 @@
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.activation import sigmoid_mul
 
 

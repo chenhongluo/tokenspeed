@@ -806,12 +806,12 @@ def _production_layer(
     checkpoint: _Checkpoint | None,
 ):
     from tokenspeed.runtime.configs.lite_config import LiteConfig
-    from tokenspeed.runtime.models.lite import LiteGroupedMoEParameters
+    from tokenspeed.runtime.models.flash_local_moe import PackedFLASHLocalMoE
 
     config = LiteConfig()
     mapping = _production_mapping(role, rank)
     with torch.device("meta"):
-        layer = LiteGroupedMoEParameters(config, mapping)
+        layer = PackedFLASHLocalMoE(config, mapping)
     layer.to_empty(device=device)
 
     torch.manual_seed(6901)
@@ -994,13 +994,19 @@ def _production_decode_oracle(
 
 
 def _production_graph_replay(layer, hidden: torch.Tensor) -> tuple[float, float]:
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        global_num_tokens=[hidden.shape[0]] * EP_SIZE,
+    )
     buffer = hidden.clone()
     for _ in range(4):
-        layer(buffer)
+        layer(buffer, ctx=ctx)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
-        output = layer(buffer)
+        output = layer(buffer, ctx=ctx)
     torch.npu.synchronize()
     graph.replay()
     torch.npu.synchronize()
@@ -1009,7 +1015,7 @@ def _production_graph_replay(layer, hidden: torch.Tensor) -> tuple[float, float]
     graph.replay()
     torch.npu.synchronize()
     actual = output.clone()
-    expected = layer(buffer)
+    expected = layer(buffer, ctx=ctx)
     torch.npu.synchronize()
     assert not torch.equal(first, actual)
     rel, max_abs, _ = _comparison(actual, expected)
@@ -1030,6 +1036,7 @@ def test_lite_grouped_moe_production_ep8_board():
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
     )
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     if int(os.environ.get("WORLD_SIZE", "1")) != EP_SIZE:
         pytest.fail("Lite production EP8 board requires WORLD_SIZE=8")
@@ -1082,7 +1089,13 @@ def test_lite_grouped_moe_production_ep8_board():
                 expected, fused_expected, stage = _production_prefill_oracle(
                     layer, hidden, split, contexts, rank
                 )
-                actual = layer(hidden, global_sp_num_tokens=list(split))
+                actual = layer(
+                    hidden,
+                    ctx=SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        global_num_tokens=list(split),
+                    ),
+                )
                 wrapper_rel, wrapper_max_abs, _ = _comparison(actual, fused_expected)
                 rel, max_abs, _ = _comparison(actual, expected)
                 assert wrapper_rel <= 1e-2, (
@@ -1113,7 +1126,13 @@ def test_lite_grouped_moe_production_ep8_board():
                 expected, fused_expected, stage = _production_decode_oracle(
                     layer, hidden, contexts, rank
                 )
-                actual = layer(hidden)
+                actual = layer(
+                    hidden,
+                    ctx=SimpleNamespace(
+                        forward_mode=ForwardMode.DECODE,
+                        global_num_tokens=[batch] * EP_SIZE,
+                    ),
+                )
                 wrapper_rel, wrapper_max_abs, _ = _comparison(actual, fused_expected)
                 rel, max_abs, _ = _comparison(actual, expected)
                 graph_rel, graph_max_abs = _production_graph_replay(layer, hidden)

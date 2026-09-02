@@ -38,11 +38,17 @@ from tokenspeed.runtime.configs.lite_config import (
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.layers.moe.types import MoELayerSpec
-from tokenspeed.runtime.layers.moe.weights.unquant import create_dense_weight_pair
 from tokenspeed.runtime.models.flash_local_attention import (
     PackedFLASHLocalKDA,
     SeparateProjectionKimiLinearMLAAttention,
+)
+from tokenspeed.runtime.models.flash_local_moe import (
+    PackedFLASHLocalMoE,
+)
+from tokenspeed.runtime.models.flash_local_moe import PackedRMSNorm as _Norm
+from tokenspeed.runtime.models.flash_local_moe import PackedWeight as _Weight
+from tokenspeed.runtime.models.flash_local_moe import (
+    grouped_moe_local_expert_ids,
 )
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
@@ -359,48 +365,6 @@ class LiteCheckpointLayout:
         return LiteWeightSpec(name, name, shape, torch.bfloat16, "replicated")
 
 
-class _Weight(nn.Module):
-    def __init__(
-        self,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        weight_nz: Literal["standard", "transposed"] | None = None,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
-        self.weight_nz = weight_nz
-        self._weight_nz_prepared = False
-        self._weight_nz_transposed = False
-
-    def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
-        if (
-            self.weight_nz is None
-            or self._weight_nz_prepared
-            or self.weight.device.type != "npu"
-        ):
-            return
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        if (
-            not global_server_args_dict.get("npu_enable_weight_nz", False)
-            or global_server_args_dict.get("disaggregation_mode") != "decode"
-        ):
-            return
-        import tokenspeed_kernel
-
-        transposed = self.weight_nz == "transposed"
-        self.weight.data = tokenspeed_kernel.prepare_weight_nz(
-            self.weight.data, transpose=transposed
-        )
-        self._weight_nz_transposed = transposed
-        self._weight_nz_prepared = True
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._weight_nz_transposed:
-            return torch.matmul(hidden_states, self.weight)
-        return F.linear(hidden_states, self.weight)
-
-
 def _all_reduce(tensor: torch.Tensor, group: tuple[int, ...]) -> torch.Tensor:
     from tokenspeed.runtime.distributed.comm_ops import all_reduce
 
@@ -411,45 +375,6 @@ def _logits_metadata(ctx: Any) -> Any:
     from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 
     return LogitsMetadata.from_forward_context(ctx)
-
-
-class _Norm(_Weight):
-    def __init__(self, size: int, eps: float = 1e-6) -> None:
-        super().__init__((size,), torch.bfloat16)
-        self.variance_epsilon = eps
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            if residual is not None:
-                return hidden_states, residual
-            return hidden_states
-        if hidden_states.device.type in ("cuda", "npu"):
-            from tokenspeed_kernel.ops.layernorm import rmsnorm
-
-            return rmsnorm(
-                hidden_states,
-                self.weight.data,
-                self.variance_epsilon,
-                residual=residual,
-            )
-        normalized = hidden_states.float()
-        if residual is not None:
-            normalized = normalized + residual.float()
-            residual.copy_(normalized.to(residual.dtype))
-        output = (
-            normalized
-            * torch.rsqrt(
-                normalized.square().mean(dim=-1, keepdim=True) + self.variance_epsilon
-            )
-            * self.weight.float()
-        ).to(hidden_states.dtype)
-        if residual is not None:
-            return output, residual
-        return output
 
 
 class _VocabEmbedding(_Weight):
@@ -474,405 +399,6 @@ class _VocabEmbedding(_Weight):
         return _all_reduce(output, self.tp_group)
 
 
-class _Router(nn.Module):
-    def __init__(self, hidden_size: int, experts: int) -> None:
-        super().__init__()
-        self.classifier = _Weight((experts, hidden_size), torch.float32)
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty(experts, dtype=torch.float32), requires_grad=False
-        )
-
-
-class _ExpertGroup(nn.Module):
-    def __init__(self, hidden_size: int, experts: int) -> None:
-        super().__init__()
-        self.router = _Router(hidden_size, experts)
-
-
-class _SharedExpert(nn.Module):
-    def __init__(self, config: LiteConfig, dense_tp_size: int) -> None:
-        super().__init__()
-        local_ffn = config.ffn_hidden_size // dense_tp_size
-        self.gate_proj = _Weight((local_ffn, config.hidden_size), torch.bfloat16)
-        self.up_proj = _Weight((local_ffn, config.hidden_size), torch.bfloat16)
-        self.down_proj = _Weight(
-            (config.hidden_size, local_ffn), torch.bfloat16, weight_nz="standard"
-        )
-
-
-class _PackedExperts(nn.Module):
-    def __init__(self, config: LiteConfig, mapping: Any) -> None:
-        super().__init__()
-        group_hidden = config.hidden_size // config.moe_group_size
-        spec = MoELayerSpec(
-            top_k=config.moe_topk,
-            num_experts=config.num_experts,
-            num_local_experts=config.num_experts // mapping.moe.ep_size,
-            hidden_size=group_hidden,
-            intermediate_size=config.expert_ffn_hidden_size,
-            activation="silu",
-            tp_rank=0,
-            tp_size=1,
-            ep_rank=mapping.moe.ep_rank,
-            ep_size=mapping.moe.ep_size,
-        )
-        self.num_experts = spec.num_experts
-        self.num_local_experts = spec.num_local_experts
-        self.hidden_size = spec.hidden_size
-        self.intermediate_size = spec.intermediate_size
-        self.ep_rank = spec.ep_rank
-        self.ep_size = spec.ep_size
-        create_dense_weight_pair(spec, self, params_dtype=torch.bfloat16)
-
-
-class _LocalExpertView:
-    def __init__(
-        self, experts: _PackedExperts, start: int, stop: int, num_experts: int
-    ) -> None:
-        self.num_experts = num_experts
-        self.num_local_experts = stop - start
-        self.hidden_size = experts.hidden_size
-        self.intermediate_size = experts.intermediate_size
-        self.ep_rank = experts.ep_rank
-        self.ep_size = experts.ep_size
-        self.w13_weight = experts.w13_weight[start:stop]
-        self.w2_weight = experts.w2_weight[start:stop]
-        self._ascend_bf16_moe_weights_processed = True
-
-
-class LiteGroupedMoEParameters(nn.Module):
-    def __init__(self, config: LiteConfig, mapping: Any) -> None:
-        super().__init__()
-        dense_tp = mapping.dense.tp_size
-        group_hidden = config.hidden_size // config.moe_group_size
-        self.config = config
-        self.mapping = mapping
-        self.group_hidden = group_hidden
-        experts_per_router = config.n_routed_experts + config.zero_expert_num
-        self.expert_groups = nn.ModuleList(
-            _ExpertGroup(group_hidden, experts_per_router)
-            for _ in range(config.moe_group_size)
-        )
-        self.experts = _PackedExperts(config, mapping)
-        self.norm = _Norm(config.hidden_size)
-        self.proj_input = _Weight(
-            (config.hidden_size // dense_tp, config.hidden_size), torch.bfloat16
-        )
-        self.proj_output = _Weight(
-            (config.hidden_size, config.hidden_size // dense_tp),
-            torch.bfloat16,
-            weight_nz="standard",
-        )
-        self.shared_experts = _SharedExpert(config, dense_tp)
-        self._moe_plan: dict[str, Any] | None = None
-        self._expert_views: tuple[_LocalExpertView, ...] = ()
-
-    def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
-        if self.experts.w13_weight.device.type != "npu" or self._expert_views:
-            return
-        import tokenspeed_kernel
-
-        self._moe_plan = tokenspeed_kernel.moe_plan(
-            "unquant",
-            input_dtype=torch.bfloat16,
-            activation="silu",
-            routing_mode="precomputed_topk",
-            ep_size=self.mapping.moe.ep_size,
-            ispp=self.config.expert_ffn_hidden_size,
-        )
-        tokenspeed_kernel.moe_process_weights(self._moe_plan, self.experts)
-        local_per_group = self.config.n_routed_experts // self.mapping.moe.ep_size
-        self._expert_views = tuple(
-            _LocalExpertView(
-                self.experts,
-                group_id * local_per_group,
-                (group_id + 1) * local_per_group,
-                self.config.n_routed_experts,
-            )
-            for group_id in range(self.config.moe_group_size)
-        )
-
-    def _route(
-        self, grouped: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        all_weights = []
-        all_ids = []
-        all_logits = []
-        for group_id, expert_group in enumerate(self.expert_groups):
-            router = expert_group.router
-            logits = F.linear(
-                grouped[:, group_id].float(), router.classifier.weight.float()
-            )
-            if logits.device.type == "npu":
-                import tokenspeed_kernel
-
-                weights, ids = tokenspeed_kernel.moe_softmax_bias_topk(
-                    logits,
-                    router.e_score_correction_bias,
-                    self.config.moe_topk,
-                    routed_scaling_factor=self.config.routed_scaling_factor,
-                )
-            else:
-                probabilities = torch.softmax(logits, dim=-1)
-                ids = torch.topk(
-                    probabilities + router.e_score_correction_bias,
-                    self.config.moe_topk,
-                    dim=-1,
-                    sorted=False,
-                ).indices
-                weights = probabilities.gather(1, ids)
-                weights = weights * self.config.routed_scaling_factor
-            all_weights.append(weights)
-            all_ids.append(ids.to(torch.int32))
-            all_logits.append(logits)
-        return (
-            torch.stack(all_weights),
-            torch.stack(all_ids),
-            torch.stack(all_logits),
-        )
-
-    def _reference_experts(
-        self,
-        grouped: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        group_outputs = []
-        num_real = self.config.n_routed_experts
-        intermediate = self.config.expert_ffn_hidden_size
-        for group_id in range(self.config.moe_group_size):
-            group_input = grouped[:, group_id]
-            group_ids = topk_ids[group_id]
-            group_weights = topk_weights[group_id]
-            group_output = torch.zeros_like(group_input)
-            identity_weight = torch.where(
-                group_ids >= num_real,
-                group_weights,
-                torch.zeros_like(group_weights),
-            ).sum(dim=-1, keepdim=True)
-            group_output.add_(group_input * identity_weight.to(group_input.dtype))
-            for expert_id_tensor in torch.unique(group_ids[group_ids < num_real]):
-                expert_id = int(expert_id_tensor)
-                token_ids, route_ids = torch.where(group_ids == expert_id)
-                flat_expert_id = group_id * num_real + expert_id
-                gate_up = F.linear(
-                    group_input[token_ids],
-                    self.experts.w13_weight[flat_expert_id],
-                )
-                gate, up = gate_up.split(intermediate, dim=-1)
-                expert_output = F.linear(
-                    F.silu(gate) * up,
-                    self.experts.w2_weight[flat_expert_id],
-                )
-                expert_output = expert_output * group_weights[token_ids, route_ids].to(
-                    expert_output.dtype
-                ).unsqueeze(-1)
-                group_output.index_add_(0, token_ids, expert_output)
-            group_outputs.append(group_output)
-        return torch.cat(group_outputs, dim=-1)
-
-    def _project_grouped(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        projected = F.linear(hidden_states, self.proj_input.weight)
-        projected_fp32 = projected.float()
-        projected = (
-            projected_fp32
-            * torch.rsqrt(
-                projected_fp32.square().mean(dim=-1, keepdim=True)
-                + self.config.rms_norm_eps
-            )
-            * self.norm.weight.float()
-        ).to(projected.dtype)
-        return (projected * self.config.grouped_moe_norm_scale).view(
-            hidden_states.shape[0], self.config.moe_group_size, self.group_hidden
-        )
-
-    def _identity_routes(
-        self,
-        grouped: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        weights = torch.where(
-            topk_ids >= self.config.n_routed_experts,
-            topk_weights,
-            torch.zeros_like(topk_weights),
-        ).sum(dim=-1)
-        return (
-            grouped * weights.permute(1, 0).unsqueeze(-1).to(grouped.dtype)
-        ).flatten(1)
-
-    def _local_experts(
-        self,
-        grouped: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        if grouped.device.type == "npu":
-            if self._moe_plan is None or not self._expert_views:
-                raise RuntimeError(
-                    "Lite Ascend Grouped MoE weights were not processed after loading."
-                )
-            import tokenspeed_kernel
-
-            outputs = [
-                tokenspeed_kernel.moe_apply(
-                    self._moe_plan,
-                    grouped[:, group_id],
-                    self._expert_views[group_id],
-                    topk_weights[group_id],
-                    topk_weights=topk_weights[group_id],
-                    topk_ids=topk_ids[group_id],
-                )
-                for group_id in range(self.config.moe_group_size)
-            ]
-            return torch.cat(outputs, dim=-1)
-
-        outputs = []
-        local_per_group = self.config.n_routed_experts // self.mapping.moe.ep_size
-        expert_start = self.mapping.moe.ep_rank * local_per_group
-        intermediate = self.config.expert_ffn_hidden_size
-        for group_id in range(self.config.moe_group_size):
-            group_input = grouped[:, group_id]
-            group_output = torch.zeros_like(group_input)
-            group_ids = topk_ids[group_id]
-            group_weights = topk_weights[group_id]
-            for expert_id_tensor in torch.unique(
-                group_ids[
-                    (group_ids >= expert_start)
-                    & (group_ids < expert_start + local_per_group)
-                ]
-            ):
-                expert_id = int(expert_id_tensor)
-                token_ids, route_ids = torch.where(group_ids == expert_id)
-                local_id = group_id * local_per_group + expert_id - expert_start
-                gate_up = F.linear(
-                    group_input[token_ids], self.experts.w13_weight[local_id]
-                )
-                gate, up = gate_up.split(intermediate, dim=-1)
-                expert_output = F.linear(
-                    F.silu(gate) * up, self.experts.w2_weight[local_id]
-                )
-                group_output.index_add_(
-                    0,
-                    token_ids,
-                    expert_output
-                    * group_weights[token_ids, route_ids]
-                    .to(expert_output.dtype)
-                    .unsqueeze(-1),
-                )
-            outputs.append(group_output)
-        return torch.cat(outputs, dim=-1)
-
-    def _shared(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        shared_gate = F.linear(hidden_states, self.shared_experts.gate_proj.weight)
-        shared_up = F.linear(hidden_states, self.shared_experts.up_proj.weight)
-        return F.linear(
-            F.silu(shared_gate) * shared_up,
-            self.shared_experts.down_proj.weight,
-        )
-
-    def _prefill(
-        self, hidden_states: torch.Tensor, global_sp_num_tokens: list[int] | None
-    ) -> torch.Tensor:
-        if (
-            global_sp_num_tokens is None
-            or len(global_sp_num_tokens) != self.mapping.moe.ep_size
-            or any(tokens < 0 for tokens in global_sp_num_tokens)
-            or global_sp_num_tokens[self.mapping.attn.cp_rank] != hidden_states.shape[0]
-            or tuple(self.mapping.attn.cp_group) != tuple(self.mapping.moe.ep_group)
-        ):
-            raise ValueError(
-                "Lite Prefill Grouped MoE requires rank-ordered global_sp_num_tokens."
-            )
-        from tokenspeed.runtime.distributed.comm_ops import (
-            token_all_gather,
-            token_reduce_scatter,
-        )
-
-        grouped = self._project_grouped(hidden_states)
-        topk_weights, topk_ids, _ = self._route(grouped)
-        identity = self._identity_routes(grouped, topk_weights, topk_ids)
-        group = self.mapping.moe.ep_group
-        total_tokens = sum(global_sp_num_tokens)
-        grouped = token_all_gather(
-            grouped.flatten(1).contiguous(), group, global_sp_num_tokens
-        ).view(total_tokens, self.config.moe_group_size, self.group_hidden)
-        topk_weights = token_all_gather(
-            topk_weights.permute(1, 0, 2).flatten(1).contiguous(),
-            group,
-            global_sp_num_tokens,
-        ).view(total_tokens, self.config.moe_group_size, self.config.moe_topk)
-        topk_weights = topk_weights.permute(1, 0, 2)
-        topk_ids = token_all_gather(
-            topk_ids.permute(1, 0, 2).flatten(1).contiguous(),
-            group,
-            global_sp_num_tokens,
-        ).view(total_tokens, self.config.moe_group_size, self.config.moe_topk)
-        topk_ids = topk_ids.permute(1, 0, 2)
-        routed = token_reduce_scatter(
-            self._local_experts(grouped, topk_weights, topk_ids),
-            group,
-            global_sp_num_tokens,
-        )
-        return F.linear(routed + identity, self.proj_output.weight) + self._shared(
-            hidden_states
-        )
-
-    def _decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
-
-        dense_group = self.mapping.dense.tp_group
-        projected = all_gather(
-            F.linear(hidden_states, self.proj_input.weight), dense_group, dim=-1
-        )
-        projected_fp32 = projected.float()
-        projected = (
-            projected_fp32
-            * torch.rsqrt(
-                projected_fp32.square().mean(dim=-1, keepdim=True)
-                + self.config.rms_norm_eps
-            )
-            * self.norm.weight.float()
-        ).to(projected.dtype)
-        grouped = (projected * self.config.grouped_moe_norm_scale).view(
-            hidden_states.shape[0], self.config.moe_group_size, self.group_hidden
-        )
-        topk_weights, topk_ids, _ = self._route(grouped)
-        routed = all_reduce(
-            self._local_experts(grouped, topk_weights, topk_ids),
-            self.mapping.moe.ep_group,
-        )
-        routed = routed + self._identity_routes(grouped, topk_weights, topk_ids)
-        local_hidden = self.config.hidden_size // self.mapping.dense.tp_size
-        routed = routed.narrow(
-            -1, self.mapping.dense.tp_rank * local_hidden, local_hidden
-        )
-        return all_reduce(
-            F.linear(routed, self.proj_output.weight) + self._shared(hidden_states),
-            dense_group,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        global_sp_num_tokens: list[int] | None = None,
-    ) -> torch.Tensor:
-        if self.mapping.world_size == 8:
-            if self.mapping.attn.cp_size == 8:
-                return self._prefill(hidden_states, global_sp_num_tokens)
-            return self._decode(hidden_states)
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-
-        grouped = self._project_grouped(hidden_states)
-        topk_weights, topk_ids, _ = self._route(grouped)
-        routed = F.linear(
-            self._reference_experts(grouped, topk_weights, topk_ids),
-            self.proj_output.weight,
-        )
-        return routed + self._shared(hidden_states)
-
-
 class LiteDecoderLayer(nn.Module):
     def __init__(self, config: LiteConfig, mapping: Any, layer_id: int) -> None:
         super().__init__()
@@ -890,7 +416,7 @@ class LiteDecoderLayer(nn.Module):
             )
         )
         self.post_attention_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = LiteGroupedMoEParameters(config, mapping)
+        self.mlp = PackedFLASHLocalMoE(config, mapping)
 
     def forward(
         self,
@@ -915,14 +441,7 @@ class LiteDecoderLayer(nn.Module):
                 hidden_states, self.mapping.linear_attn.tp_group
             )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        global_sp_num_tokens = (
-            ctx.global_num_tokens
-            if self.mapping.world_size == 8 and self.mapping.attn.cp_size == 8
-            else None
-        )
-        hidden_states = self.mlp(
-            hidden_states, global_sp_num_tokens=global_sp_num_tokens
-        )
+        hidden_states = self.mlp(hidden_states, ctx=ctx)
         return residual + hidden_states
 
 
@@ -1681,12 +1200,11 @@ class LiteForCausalLM(nn.Module):
         return loaded_targets
 
     def _local_expert_ids(self) -> tuple[int, ...]:
-        local_per_group = self.config.n_routed_experts // self.mapping.moe.ep_size
-        start = self.mapping.moe.ep_rank * local_per_group
-        return tuple(
-            group_id * self.config.n_routed_experts + start + local_id
-            for group_id in range(self.config.moe_group_size)
-            for local_id in range(local_per_group)
+        return grouped_moe_local_expert_ids(
+            num_groups=self.config.moe_group_size,
+            num_experts_per_group=self.config.n_routed_experts,
+            ep_rank=self.mapping.moe.ep_rank,
+            ep_size=self.mapping.moe.ep_size,
         )
 
     def _local_weight(

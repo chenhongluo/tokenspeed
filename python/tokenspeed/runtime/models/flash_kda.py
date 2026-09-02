@@ -87,6 +87,13 @@ from tokenspeed.runtime.models.flash_local_attention import (
     SeparateProjectionKimiLinearMLAAttention,
     flash_local_prefers_packed_projections,
 )
+from tokenspeed.runtime.models.flash_local_moe import (
+    PackedFLASHLocalMoE,
+    flash_local_prefers_packed_moe,
+)
+from tokenspeed.runtime.models.flash_local_moe import (
+    grouped_moe_topk as _grouped_moe_topk_local,
+)
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
 )
@@ -244,21 +251,15 @@ def _parse_flash_kda_router_name(name: str) -> tuple[int, str] | None:
 
 
 def _load_flash_kda_router_correction_bias(
-    moe: "FLASHLocalMoE",
+    moe: "FLASHLocalMoE | PackedFLASHLocalMoE",
     loaded_weight: torch.Tensor,
 ) -> None:
     """Load a full-width or shared per-group router correction bias."""
 
-    bias = moe.router.e_score_correction_bias
     groups = moe.moe_group_size
     logits_per_group = moe.n_routed_experts + moe.zero_expert_num
     full_shape = (groups * logits_per_group,)
     loaded_shape = tuple(loaded_weight.shape)
-    if tuple(bias.shape) != full_shape:
-        raise ValueError(
-            "Flash-KDA router correction bias target has shape "
-            f"{tuple(bias.shape)}, expected {full_shape}."
-        )
     if loaded_shape == (logits_per_group,):
         loaded_weight = loaded_weight.repeat(groups)
     elif loaded_shape != full_shape:
@@ -266,6 +267,20 @@ def _load_flash_kda_router_correction_bias(
             "Flash-KDA router correction bias checkpoint tensor has shape "
             f"{loaded_shape}, expected {(logits_per_group,)} (shared per group) "
             f"or {full_shape} (full width)."
+        )
+    if isinstance(moe, PackedFLASHLocalMoE):
+        for group_id, group_weight in enumerate(
+            loaded_weight.view(groups, logits_per_group)
+        ):
+            moe.load_group_router_weight(
+                group_id, "e_score_correction_bias", group_weight
+            )
+        return
+    bias = moe.router.e_score_correction_bias
+    if tuple(bias.shape) != full_shape:
+        raise ValueError(
+            "Flash-KDA router correction bias target has shape "
+            f"{tuple(bias.shape)}, expected {full_shape}."
         )
     with torch.no_grad():
         bias.copy_(loaded_weight)
@@ -397,16 +412,13 @@ def _group_moe_topk(
 
     num_experts_per_group = router_logits.shape[-1]
     num_real_experts_per_group = num_experts_per_group - zero_expert_num
-    scores = router_logits.float().view(moe_group_size, -1, num_experts_per_group)
-    scores = scores.softmax(dim=-1)
-    biased_scores = scores + correction_bias.view(
-        moe_group_size, 1, num_experts_per_group
+    weights, local_ids = _grouped_moe_topk_local(
+        router_logits.float().view(moe_group_size, -1, num_experts_per_group),
+        correction_bias,
+        top_k=top_k,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
     )
-    local_ids = biased_scores.topk(top_k, dim=-1, sorted=False).indices
-    weights = scores.gather(-1, local_ids)
-    if renormalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    weights = weights * routed_scaling_factor
 
     group_offsets = torch.arange(
         moe_group_size, device=router_logits.device, dtype=local_ids.dtype
@@ -551,6 +563,28 @@ class FLASHLocalMoE(nn.Module):
             if name not in ["correction_bias"] and "shared_experts" not in name
         ]
 
+    def load_group_router_weight(
+        self, group_id: int, field: str, loaded_weight: torch.Tensor
+    ) -> None:
+        if not 0 <= group_id < self.moe_group_size:
+            raise ValueError(f"Invalid FLASHLocal router group {group_id}.")
+        if field == "classifier.weight":
+            start = group_id * self.hidden_size_per_group
+            target = self.router.classifier.weight[
+                :, start : start + self.hidden_size_per_group
+            ]
+        elif field == "e_score_correction_bias":
+            width = self.n_routed_experts + self.zero_expert_num
+            start = group_id * width
+            target = self.router.e_score_correction_bias[start : start + width]
+        else:
+            raise ValueError(f"Invalid FLASHLocal router tensor {field!r}.")
+        if tuple(target.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"Invalid FLASHLocal router tensor {field!r} for group {group_id}."
+            )
+        target.data.copy_(loaded_weight.to(device=target.device))
+
     def _apply_zero_experts(self, hidden_states: torch.Tensor, topk_output):
         """Extract the zero-expert contribution from the per-group top-k.
 
@@ -589,6 +623,7 @@ class FLASHLocalMoE(nn.Module):
         hidden_states: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
+        ctx: ForwardContext | None = None,
     ) -> torch.Tensor:
         """Multi-Group-Head MoE forward.
 
@@ -604,6 +639,7 @@ class FLASHLocalMoE(nn.Module):
             routed = group_moe_proj_output(routed, proj_output, G)  # [T, H]
             return routed + shared_out + zero_out
         """
+        del ctx
         real_num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -1096,17 +1132,21 @@ class FLASHLocalDecoderLayer(nn.Module):
                 "Flash-KDA requires EveryLayer-MoE (first_k_dense_replace=0); "
                 f"got layer {layer_id} not flagged as MoE."
             )
-        self.moe = FLASHLocalMoE(
-            config=config,
-            mapping=mapping,
-            quant_config=_get_flash_kda_moe_quant_config(
-                config,
-                quant_config,
-                add_prefix("moe", prefix),
-            ),
-            layer_index=layer_id,
-            prefix=add_prefix("moe", prefix),
-            alt_stream=alt_stream,
+        self.moe = (
+            PackedFLASHLocalMoE(config, mapping)
+            if flash_local_prefers_packed_moe()
+            else FLASHLocalMoE(
+                config=config,
+                mapping=mapping,
+                quant_config=_get_flash_kda_moe_quant_config(
+                    config,
+                    quant_config,
+                    add_prefix("moe", prefix),
+                ),
+                layer_index=layer_id,
+                prefix=add_prefix("moe", prefix),
+                alt_stream=alt_stream,
+            )
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1160,6 +1200,7 @@ class FLASHLocalDecoderLayer(nn.Module):
             hidden_states,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            ctx=ctx,
         )
 
     def forward(
@@ -1391,7 +1432,7 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             lambda: {
                 layer_id: layer.moe.get_moe_routed_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.moe, FLASHLocalMoE)
+                if isinstance(layer.moe, (FLASHLocalMoE, PackedFLASHLocalMoE))
             }
         )
 
@@ -1435,6 +1476,14 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = config.q_lora_rank is not None
 
         params_dict = dict(self.named_parameters())
+        packed_moe = next(
+            (
+                layer.moe
+                for layer in self.model.layers
+                if isinstance(getattr(layer, "moe", None), PackedFLASHLocalMoE)
+            ),
+            None,
+        )
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -1445,6 +1494,9 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             num_experts=config.n_routed_experts * config.moe_group_size,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
+            local_expert_ids=(
+                packed_moe.local_expert_ids if packed_moe is not None else None
+            ),
         )
 
         for name, loaded_weight in weights:
@@ -1470,22 +1522,8 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                 moe = getattr(layer, "moe", None)
                 if moe is None:
                     continue
-                hidden_size_per_group = moe.hidden_size_per_group
-                if field == "classifier.weight":
-                    start = group_id * hidden_size_per_group
-                    end = start + hidden_size_per_group
-                    with torch.no_grad():
-                        moe.router.classifier.weight[:, start:end].copy_(loaded_weight)
-                    continue
-                if field == "e_score_correction_bias":
-                    n_logits_per_group = moe.n_routed_experts + moe.zero_expert_num
-                    start = group_id * n_logits_per_group
-                    end = start + n_logits_per_group
-                    with torch.no_grad():
-                        moe.router.e_score_correction_bias[start:end].copy_(
-                            loaded_weight
-                        )
-                    continue
+                moe.load_group_router_weight(group_id, field, loaded_weight)
+                continue
 
             router_match = _parse_flash_kda_router_name(name)
             if router_match is not None:
@@ -1544,6 +1582,12 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             # KDA conv weights are plain params named ``<qkv>_conv1d_weight``.
             if "_conv1d.weight" in name:
                 name = name.replace("_conv1d.weight", "_conv1d_weight")
+
+            if ".shared_experts." in name and name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1671,6 +1715,8 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                 self_attn.process_weights_after_loading()
             elif isinstance(self_attn, SeperateFLASHLocal):
                 self_attn.fuse_conv_weights()
+            if isinstance(layer.moe, PackedFLASHLocalMoE):
+                layer.moe.process_weights_after_loading()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         tp_size = self.mapping.attn.tp_size

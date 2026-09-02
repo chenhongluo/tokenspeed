@@ -35,17 +35,18 @@ from tokenspeed.runtime.models.lite import (
 
 
 class _Mode:
-    def __init__(self, idle: bool = False) -> None:
+    def __init__(self, idle: bool = False, extend: bool = False) -> None:
         self.idle = idle
+        self.extend = extend
 
     def is_idle(self) -> bool:
         return self.idle
 
     def is_decode(self) -> bool:
-        return not self.idle
+        return not self.idle and not self.extend
 
     def is_extend_or_mixed(self) -> bool:
-        return False
+        return self.extend
 
 
 class _Capture:
@@ -83,20 +84,20 @@ class _MLP(nn.Module):
     def __init__(self, offset: float) -> None:
         super().__init__()
         self.offset = offset
-        self.global_sp_num_tokens = None
+        self.ctx = None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        global_sp_num_tokens: list[int] | None = None,
+        ctx=None,
     ) -> torch.Tensor:
-        self.global_sp_num_tokens = global_sp_num_tokens
+        self.ctx = ctx
         return hidden_states + self.offset
 
 
-def _ctx(*, idle: bool = False, global_num_tokens=None):
+def _ctx(*, idle: bool = False, extend: bool = False, global_num_tokens=None):
     return SimpleNamespace(
-        forward_mode=_Mode(idle),
+        forward_mode=_Mode(idle, extend),
         global_num_tokens=global_num_tokens,
         capture_hidden_mode=_Capture(),
         gather_ids=None,
@@ -126,7 +127,7 @@ def test_decoder_matches_double_residual_oracle() -> None:
     assert torch.equal(actual, 12 * hidden + 2)
     assert layer.input_layernorm.residual_calls == 0
     assert layer.post_attention_layernorm.residual_calls == 1
-    assert layer.mlp.global_sp_num_tokens is None
+    assert layer.mlp.ctx.forward_mode.is_decode()
 
 
 def test_lite_norm_preserves_fused_residual_semantics_on_cpu() -> None:
@@ -161,12 +162,15 @@ def test_kda_reduces_once_and_prefill_passes_token_split(monkeypatch) -> None:
     split = [2, 0, 3, 2, 1, 0, 4, 1]
 
     actual = layer(
-        torch.arange(2), hidden, _ctx(global_num_tokens=split), torch.arange(2)
+        torch.arange(2),
+        hidden,
+        _ctx(extend=True, global_num_tokens=split),
+        torch.arange(2),
     )
 
     assert len(calls) == 1
     assert calls[0][1] == tuple(range(8))
-    assert layer.mlp.global_sp_num_tokens is split
+    assert layer.mlp.ctx.global_num_tokens is split
     assert torch.equal(actual, torch.full_like(hidden, 54))
 
 
@@ -186,11 +190,12 @@ def test_mla_skips_kda_reduce(monkeypatch, role, expected_split) -> None:
     layer(
         torch.arange(1),
         torch.ones(1, 4),
-        _ctx(global_num_tokens=split),
+        _ctx(extend=role == "prefill", global_num_tokens=split),
         torch.arange(1),
     )
 
-    assert (layer.mlp.global_sp_num_tokens is split) is expected_split
+    assert layer.mlp.ctx.global_num_tokens is split
+    assert layer.mlp.ctx.forward_mode.is_decode() is (not expected_split)
 
 
 def test_idle_layer_is_an_exact_noop() -> None:

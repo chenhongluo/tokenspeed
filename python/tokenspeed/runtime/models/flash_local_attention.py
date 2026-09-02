@@ -26,11 +26,11 @@ import math
 from typing import Any, Literal
 
 import torch
+from tokenspeed_kernel.ops.attention import mla_normalize_project_query
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn import functional as F
 
-from tokenspeed_kernel.ops.attention import mla_normalize_project_query
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
@@ -230,9 +230,9 @@ class PackedFLASHLocalKDA(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty(local_projection, dtype=torch.float32), requires_grad=False
         )
-        self.o_norm = RMSNorm(
-            config.linear_head_dim, eps=config.rms_norm_eps
-        ).to(dtype=torch.bfloat16)
+        self.o_norm = RMSNorm(config.linear_head_dim, eps=config.rms_norm_eps).to(
+            dtype=torch.bfloat16
+        )
         self.o_proj = WeightNZReplicatedLinear(
             local_projection,
             config.hidden_size,
@@ -319,16 +319,11 @@ class PackedFLASHLocalKDA(nn.Module):
         else:
             core_fp32 = core_output.float()
             normalized = core_fp32 * torch.rsqrt(
-                core_fp32.square().mean(dim=-1, keepdim=True)
-                + self.config.rms_norm_eps
+                core_fp32.square().mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
             )
-            normalized = (normalized * self.o_norm.weight.float()).to(
-                core_output.dtype
-            )
+            normalized = (normalized * self.o_norm.weight.float()).to(core_output.dtype)
             output_gate = output_gate.reshape_as(normalized)
-            gated = normalized * torch.sigmoid(output_gate.float()).to(
-                normalized.dtype
-            )
+            gated = normalized * torch.sigmoid(output_gate.float()).to(normalized.dtype)
             gated = gated.flatten(1)
         return self.o_proj(gated)[0]
 
@@ -363,15 +358,13 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         )
         del self.fused_qkv_a_proj_with_mqa
         qk_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.q_a_layernorm = RMSNorm(
-            config.q_lora_rank, eps=config.rms_norm_eps
-        ).to(dtype=torch.bfloat16)
-        self.kv_a_layernorm = RMSNorm(
-            config.kv_lora_rank, eps=config.rms_norm_eps
-        ).to(dtype=torch.bfloat16)
-        self.fused_qk_layernorm = FusedRMSNorm(
-            self.q_a_layernorm, self.kv_a_layernorm
+        self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps).to(
+            dtype=torch.bfloat16
         )
+        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps).to(
+            dtype=torch.bfloat16
+        )
+        self.fused_qk_layernorm = FusedRMSNorm(self.q_a_layernorm, self.kv_a_layernorm)
         self.q_a_proj = WeightNZReplicatedLinear(
             config.hidden_size,
             config.q_lora_rank,
@@ -399,8 +392,7 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         )
         self.kv_b_proj = ReplicatedLinear(
             config.kv_lora_rank,
-            config.num_attention_heads
-            * (config.qk_nope_head_dim + config.v_head_dim),
+            config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
             bias=False,
             params_dtype=torch.bfloat16,
             prefix=add_prefix("kv_b_proj", prefix),
