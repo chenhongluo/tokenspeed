@@ -248,7 +248,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         model_runner = SimpleNamespace(
             model=SimpleNamespace(
                 model=inner_model,
-                requires_request_prefix_tokens=True,
+                requires_request_token_history=True,
             ),
             is_generation=True,
             is_multimodal=False,

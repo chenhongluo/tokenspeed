@@ -82,6 +82,11 @@ class InputBuffers:
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
+            self.request_token_history_input_lengths_buf = torch.ones(
+                (max_bs,), dtype=torch.int32
+            )
+            self.input_start_offsets_buf = torch.zeros(max_bs + 1, dtype=torch.int32)
+            self.active_request_mask_buf = torch.zeros(max_bs, dtype=torch.bool)
             # Zero (not arange) so padded positions read a consistent, in-range
             # value; the tail is re-zeroed every iteration by fill_input_buffers.
             self.positions_buf = torch.zeros(max_num_tokens, dtype=torch.int64)
@@ -107,6 +112,36 @@ class InputBuffers:
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
+
+    def prepare_request_token_history_inputs(
+        self,
+        *,
+        batch_size: int,
+        num_extends: int,
+        decode_width: int,
+    ) -> None:
+        """Publish the packed batch layout read by request-token history.
+
+        Args:
+            batch_size: Number of rows represented by the layout, including
+                graph-padding rows.
+            num_extends: Leading rows whose widths come from input lengths.
+            decode_width: Fixed packed width of each remaining decode row.
+        """
+        if not 0 <= num_extends <= batch_size <= self.max_bs:
+            raise ValueError(
+                "request-token history batch sizes must satisfy "
+                f"0 <= num_extends <= batch_size <= {self.max_bs}"
+            )
+        if decode_width <= 0:
+            raise ValueError("request-token history decode width must be positive")
+        lengths = self.request_token_history_input_lengths_buf[:batch_size]
+        lengths.copy_(self.input_lengths_buf[:batch_size])
+        lengths[num_extends:].fill_(decode_width)
+        offsets = self.input_start_offsets_buf[: batch_size + 1]
+        offsets[0].zero_()
+        torch.cumsum(lengths, dim=0, out=offsets[1:])
+        self.active_request_mask_buf[:batch_size].fill_(True)
 
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
@@ -219,6 +254,12 @@ class InputBuffers:
             input_lengths_cpu,
             non_blocking=True,
         )
+        if runtime_states.has_request_token_history:
+            self.prepare_request_token_history_inputs(
+                batch_size=batch_size,
+                num_extends=num_extends,
+                decode_width=runtime_states.future_input_map.shape[1],
+            )
 
         self.all_extends_mid_chunk = (
             num_extends > 0

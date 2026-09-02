@@ -32,13 +32,16 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.request_token_history import (
+        RequestTokenHistoryView,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 @dataclass
 class ForwardContext:
-    """Do not contain Tensor"""
+    """Per-forward metadata and non-owning views of graph-stable tensors."""
 
     # --- attention infrastructure ---
     attn_backend: AttentionBackend
@@ -81,6 +84,9 @@ class ForwardContext:
     # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
     dsa_swa_slot_mapping: torch.Tensor | None = None
     dsa_compressor_slot_cache: Any | None = None
+
+    # Non-owning, graph-stable view assembled from RuntimeStates and InputBuffers.
+    request_token_history: RequestTokenHistoryView | None = None
 
 
 @contextmanager

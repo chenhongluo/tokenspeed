@@ -126,7 +126,7 @@ def _branch_index(weight_name: str, *, projection: bool) -> int | None:
 class LongCatOverEmbedding(nn.Module):
     """Word embedding plus TP-local OE branches and one final TP reduction."""
 
-    requires_request_prefix_tokens = True
+    requires_request_token_history = True
 
     def __init__(
         self,
@@ -202,224 +202,11 @@ class LongCatOverEmbedding(nn.Module):
         )
         self._table_loaded = [False] * len(self.spec.fragments)
         self._projection_loaded = [False] * len(self.spec.fragments)
-        self._padding_req_pool_index = -1
-        self.register_buffer(
-            "_req_pool_indices", torch.empty(0, dtype=torch.int64), persistent=False
-        )
-        self.register_buffer(
-            "_input_lengths", torch.empty(0, dtype=torch.int32), persistent=False
-        )
-        self.register_buffer(
-            "history_token_ids", torch.empty(0, dtype=torch.int32), persistent=False
-        )
-        self.register_buffer(
-            "committed_lengths", torch.empty(0, dtype=torch.int32), persistent=False
-        )
-        self.register_buffer(
-            "staged_prefix_ids", torch.empty(0, dtype=torch.int32), persistent=False
-        )
-        self.register_buffer(
-            "pending_prefix_lengths",
-            torch.empty(0, dtype=torch.int32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pending_prefix_counts",
-            torch.empty(0, dtype=torch.int32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_input_start_offsets",
-            torch.empty(0, dtype=torch.int32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_active_request_mask",
-            torch.empty(0, dtype=torch.bool),
-            persistent=False,
-        )
         self.register_buffer(
             "_ignored_token_ids",
             torch.tensor(self.spec.ignored_token_ids, dtype=torch.int32),
             persistent=False,
         )
-        self.register_buffer(
-            "_effective_input_lengths",
-            torch.empty(0, dtype=torch.int32),
-            persistent=False,
-        )
-
-    @property
-    def request_prefix_lookback(self) -> int:
-        """Return the number of prefix tokens required by the first lookup."""
-        return self.spec.history_lookback
-
-    def bind_runtime_inputs(
-        self,
-        *,
-        req_pool_indices: torch.Tensor,
-        input_lengths: torch.Tensor,
-        max_request_slots: int,
-        history_capacity: int,
-        padding_req_pool_index: int,
-    ) -> None:
-        """Bind graph-stable batch inputs and allocate OE-owned history.
-
-        Args:
-            req_pool_indices: Per-request slots with a dedicated padding value.
-            input_lengths: Per-request packed token counts.
-            max_request_slots: Exclusive upper bound for real request slots.
-            history_capacity: Maximum absolute token position stored per request.
-            padding_req_pool_index: Slot used by graph-padding rows.
-        """
-        if req_pool_indices.device != input_lengths.device:
-            raise ValueError("OE runtime inputs must be on the same device")
-        if padding_req_pool_index != max_request_slots:
-            raise ValueError(
-                "OE padding slot must immediately follow the real request slots"
-            )
-        if history_capacity <= 0:
-            raise ValueError("OE history_capacity must be positive")
-
-        device = req_pool_indices.device
-        slot_count = max_request_slots + 1
-        max_batch_size = req_pool_indices.numel()
-        self._padding_req_pool_index = padding_req_pool_index
-        self._req_pool_indices = req_pool_indices
-        self._input_lengths = input_lengths
-        self.history_token_ids = torch.zeros(
-            (slot_count, history_capacity), dtype=torch.int32, device=device
-        )
-        self.committed_lengths = torch.zeros(
-            slot_count, dtype=torch.int32, device=device
-        )
-        self.staged_prefix_ids = torch.zeros(
-            (slot_count, self.spec.history_lookback),
-            dtype=torch.int32,
-            device=device,
-        )
-        self.pending_prefix_lengths = torch.full(
-            (slot_count,), -1, dtype=torch.int32, device=device
-        )
-        self.pending_prefix_counts = torch.zeros(
-            slot_count, dtype=torch.int32, device=device
-        )
-        self._input_start_offsets = torch.zeros(
-            max_batch_size + 1, dtype=torch.int32, device=device
-        )
-        self._active_request_mask = torch.zeros(
-            max_batch_size, dtype=torch.bool, device=device
-        )
-        self._effective_input_lengths = torch.zeros(
-            max_batch_size, dtype=torch.int32, device=device
-        )
-
-    def stage_prefixes(
-        self,
-        *,
-        req_pool_indices,
-        prefix_lengths,
-        request_token_ids,
-    ) -> None:
-        """Stage the bounded prefix tails consumed by the next forward.
-
-        ``request_token_ids`` contains at most ``request_prefix_lookback``
-        tokens ending at each corresponding prefix boundary. This method only
-        fills forward inputs; authoritative history is changed in ``forward``.
-        """
-        if not (len(req_pool_indices) == len(prefix_lengths) == len(request_token_ids)):
-            raise ValueError("OE prefix staging inputs must have matching lengths")
-        if self.pending_prefix_lengths.numel() == 0:
-            raise RuntimeError("OE runtime inputs must be bound before staging")
-
-        lookback = self.spec.history_lookback
-        capacity = self.history_token_ids.shape[1]
-        for row, prefix_length, token_ids in zip(
-            req_pool_indices, prefix_lengths, request_token_ids
-        ):
-            row = int(row)
-            prefix_length = int(prefix_length)
-            tail = tuple(int(token_id) for token_id in token_ids)
-            if not 0 <= row < self._padding_req_pool_index:
-                raise ValueError(f"OE request slot {row} is out of range")
-            if not 0 <= prefix_length <= capacity:
-                raise ValueError(
-                    f"OE prefix length {prefix_length} exceeds capacity {capacity}"
-                )
-            if len(tail) > lookback or len(tail) > prefix_length:
-                raise ValueError(
-                    f"OE prefix tail has {len(tail)} tokens for boundary "
-                    f"{prefix_length} and lookback {lookback}"
-                )
-            if tail:
-                self.staged_prefix_ids[row, : len(tail)].copy_(
-                    torch.as_tensor(
-                        tail,
-                        dtype=torch.int32,
-                        device=self.staged_prefix_ids.device,
-                    )
-                )
-            self.pending_prefix_counts[row] = len(tail)
-            self.pending_prefix_lengths[row] = prefix_length
-
-    def _prepare_history(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        batch_size: int,
-        num_extends: int,
-        decode_width: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.history_token_ids.numel() == 0:
-            raise RuntimeError("OE runtime inputs must be bound before forward")
-        if batch_size <= 0:
-            raise ValueError("OE forward requires a non-empty request batch")
-        if not 0 <= num_extends <= batch_size:
-            raise ValueError(
-                f"OE num_extends must be in [0, {batch_size}], got {num_extends}"
-            )
-        if decode_width <= 0:
-            raise ValueError(f"OE decode width must be positive, got {decode_width}")
-
-        rows = self._req_pool_indices[:batch_size]
-        active = self._active_request_mask[:batch_size]
-        torch.ne(rows, self._padding_req_pool_index, out=active)
-        lengths = self._effective_input_lengths[:batch_size]
-        lengths.copy_(self._input_lengths[:batch_size])
-        # Decode lengths track committed tokens, while target verification packs
-        # a fixed-width candidate block for every row, including graph padding.
-        lengths[num_extends:].fill_(decode_width)
-        offsets = self._input_start_offsets[: batch_size + 1]
-        offsets[0].zero_()
-        torch.cumsum(lengths, dim=0, out=offsets[1:])
-
-        pending_lengths = self.pending_prefix_lengths.index_select(0, rows)
-        pending_counts = self.pending_prefix_counts.index_select(0, rows)
-        staged = self.staged_prefix_ids.index_select(0, rows)
-        capacity = self.history_token_ids.shape[1]
-        for column in range(self.spec.history_lookback):
-            history_positions = pending_lengths - pending_counts + column
-            valid = (
-                active
-                & (pending_lengths >= 0)
-                & (pending_counts > column)
-                & (history_positions >= 0)
-            )
-            history_positions.clamp_(0, capacity - 1)
-            previous = self.history_token_ids[rows, history_positions]
-            self.history_token_ids[rows, history_positions] = torch.where(
-                valid, staged[:, column], previous
-            )
-
-        first_token_offsets = offsets[:-1].clamp_max(input_ids.numel() - 1).long()
-        first_positions = positions.index_select(0, first_token_offsets).to(torch.int32)
-        previous_lengths = self.committed_lengths.index_select(0, rows)
-        self.committed_lengths[rows] = torch.where(
-            active, first_positions, previous_lengths
-        )
-        self.pending_prefix_lengths.index_fill_(0, rows, -1)
-        self.pending_prefix_counts.index_fill_(0, rows, 0)
-        return offsets, rows, active
 
     def load_weight(self, weight_name: str, loaded_weight: torch.Tensor) -> bool:
         """Load one word, OE table, or projection checkpoint tensor.
@@ -516,33 +303,26 @@ class LongCatOverEmbedding(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         ctx,
     ) -> torch.Tensor:
         if input_ids.numel() == 0:
             return self.word_embedding(input_ids)
-        decode_width = max(
-            int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1),
-            1,
-        )
-        offsets, req_pool_indices, active_request_mask = self._prepare_history(
-            input_ids,
-            positions,
-            int(ctx.bs),
-            int(ctx.num_extends),
-            decode_width,
-        )
+        view = ctx.request_token_history
+        if view is None:
+            raise RuntimeError("LongCat OE forward requires request token history")
         word_partial = self.word_embedding(input_ids, reduce_results=False)
         bypass_mask = None
         if self.spec.segment_ignored_tokens and self.spec.ignored_token_ids:
-            bypass_mask = torch.isin(input_ids, self._ignored_token_ids)
+            bypass_mask = (input_ids.unsqueeze(-1) == self._ignored_token_ids).any(
+                dim=-1
+            )
         activation = append_packed_lookup_(
             input_ids,
-            offsets,
-            req_pool_indices,
-            active_request_mask,
-            self.history_token_ids,
-            self.committed_lengths,
+            view.input_start_offsets,
+            view.req_pool_indices,
+            view.active_request_mask,
+            view.history_token_ids,
+            view.committed_lengths,
             tuple(self.oe_tables),
             spec=self.spec,
             enable_pdl=True,

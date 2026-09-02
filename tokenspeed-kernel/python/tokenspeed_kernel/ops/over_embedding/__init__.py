@@ -71,8 +71,9 @@ def append_packed_lookup_(
         active_request_mask: Contiguous bool tensor ``[Q]``. Inactive graph-padding
             requests skip the table append and produce zero activation.
         history_token_ids: Contiguous int32 tensor
-            ``[slot_count, max_context_len]``. Its last row is reserved for
-            graph padding.
+            ``[slot_count, max_context_len]``. For each active row, ``[0:L)``
+            contains the full committed token prefix. Its last row is reserved
+            for graph padding.
         committed_lengths: Contiguous int32 publication pointers
             ``[slot_count]``. This kernel never modifies them.
         oe_tables: Compact BF16 OE fragment tables in ``spec.fragments`` order.

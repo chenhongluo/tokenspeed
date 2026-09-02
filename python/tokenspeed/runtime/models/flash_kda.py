@@ -1286,7 +1286,7 @@ class FLASHLocalModel(nn.Module):
         if input_embeds is not None:
             hidden_states = input_embeds
         elif isinstance(self.embed_tokens, LongCatOverEmbedding):
-            hidden_states = self.embed_tokens(input_ids, positions, ctx)
+            hidden_states = self.embed_tokens(input_ids, ctx)
         else:
             hidden_states = self.embed_tokens(input_ids)
 
@@ -1348,42 +1348,7 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             prefix=prefix,
         )
         embed = self.model.embed_tokens
-        self.requires_request_prefix_tokens = isinstance(embed, LongCatOverEmbedding)
-        self.request_prefix_lookback = (
-            embed.request_prefix_lookback if self.requires_request_prefix_tokens else 0
-        )
-
-    def bind_model_runtime_inputs(
-        self,
-        *,
-        input_buffers,
-        max_request_slots: int,
-        history_capacity: int,
-    ) -> None:
-        """Bind the shared OE layer to graph-stable executor inputs."""
-        if not self.requires_request_prefix_tokens:
-            return
-        self.model.embed_tokens.bind_runtime_inputs(
-            req_pool_indices=input_buffers.state_write_req_pool_indices_buf,
-            input_lengths=input_buffers.input_lengths_buf,
-            max_request_slots=max_request_slots,
-            history_capacity=history_capacity,
-            padding_req_pool_index=max_request_slots,
-        )
-
-    def stage_request_prefixes(
-        self,
-        *,
-        req_pool_indices,
-        prefix_lengths,
-        request_token_ids,
-    ) -> None:
-        """Stage bounded OE prefix inputs for the next model forward."""
-        self.model.embed_tokens.stage_prefixes(
-            req_pool_indices=req_pool_indices,
-            prefix_lengths=prefix_lengths,
-            request_token_ids=request_token_ids,
-        )
+        self.requires_request_token_history = isinstance(embed, LongCatOverEmbedding)
 
     def resolve_model(
         self,

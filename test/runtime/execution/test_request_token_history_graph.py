@@ -20,41 +20,25 @@
 
 from types import SimpleNamespace
 
-from tokenspeed.runtime.engine.request_prefix_inputs import RequestPrefixInputBuilder
+import torch
+
+from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 
 
-class _ForwardOp(SimpleNamespace):
-    def num_extends(self) -> int:
-        return len(self.extend_prefix_lens)
-
-
-def test_request_prefix_inputs_follow_boundaries_and_slot_ownership():
-    builder = RequestPrefixInputBuilder(lookback=3)
-    states = {
-        "request-a": SimpleNamespace(
-            prompt_input_ids=[10, 11, 12, 13],
-            output_ids=[20, 21],
-        ),
-        "request-b": SimpleNamespace(prompt_input_ids=[30, 31], output_ids=[]),
-    }
-
-    extend = _ForwardOp(
-        request_ids=["request-a"],
-        request_pool_indices=[1],
-        extend_prefix_lens=[5],
+def test_decode_graph_history_layout_masks_padding_rows() -> None:
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.runtime_states = SimpleNamespace(has_request_token_history=True)
+    wrapper.input_buffers = SimpleNamespace(
+        input_start_offsets_buf=torch.empty(4, dtype=torch.int32),
+        active_request_mask_buf=torch.empty(3, dtype=torch.bool),
     )
-    assert builder.gather(extend, states) == ((1, 5, (12, 13, 20)),)
+    wrapper.max_tokens_per_req = 8
+    wrapper.device = "cpu"
 
-    decode = _ForwardOp(
-        request_ids=["request-a"],
-        request_pool_indices=[1],
-        extend_prefix_lens=[],
+    wrapper._prepare_request_token_history_graph_inputs(
+        active_bs=2,
+        padded_bs=3,
     )
-    assert builder.gather(decode, states) is None
 
-    reused_slot = _ForwardOp(
-        request_ids=["request-b"],
-        request_pool_indices=[1],
-        extend_prefix_lens=[],
-    )
-    assert builder.gather(reused_slot, states) == ((1, 1, (30,)),)
+    assert wrapper.input_buffers.input_start_offsets_buf.tolist() == [0, 8, 16, 24]
+    assert wrapper.input_buffers.active_request_mask_buf.tolist() == [True, True, False]

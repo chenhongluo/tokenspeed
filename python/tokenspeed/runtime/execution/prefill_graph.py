@@ -247,7 +247,7 @@ class PrefillGraph:
             or self._embed_tokens is None
             # The graph embedding seam only accepts input_ids. Models whose
             # embeddings depend on request context must keep prefill eager.
-            or bool(getattr(model, "requires_request_prefix_tokens", False))
+            or bool(getattr(model, "requires_request_token_history", False))
             or model_runner is None
             or not model_runner.is_generation
             # DP replay decisions must come from replicated state, and a
@@ -508,6 +508,12 @@ class PrefillGraph:
         )
         ib.req_pool_indices_buf[:bs].copy_(
             torch.arange(bs, dtype=ib.req_pool_indices_buf.dtype)
+        )
+        ib.input_lengths_buf[:bs].copy_(seq_lens_gpu)
+        ib.prepare_request_token_history_inputs(
+            batch_size=bs,
+            num_extends=bs,
+            decode_width=1,
         )
         ib.seq_lens_buf[:bs].copy_(seq_lens_gpu)
         ib.extend_seq_lens_buf[:bs].copy_(seq_lens_gpu)

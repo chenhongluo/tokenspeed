@@ -141,8 +141,8 @@ class DeviceSpecs:
         num_host_pages: The L2 host tier's page count (incl. the null page),
             sized here because it depends on the pools' transfer layout; 0
             without ``--enable-kvstore``. The scheduler is configured from it.
-        request_prefix_lookback: Number of model-owned prefix tokens staged at
-            request admission; zero when the model does not need them.
+        requires_request_token_history: Whether model execution maintains a
+            request-persistent token history.
     """
 
     cache_geometry: Any
@@ -156,7 +156,7 @@ class DeviceSpecs:
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
-    request_prefix_lookback: int = 0
+    requires_request_token_history: bool = False
 
 
 @dataclass(frozen=True)
@@ -402,7 +402,7 @@ class DeviceHandle:
                 grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,
                 capture_next_input_ids=capture_next_input_ids,
-                request_prefixes=planned.request_prefixes,
+                request_history_seeds=planned.request_history_seeds,
             )
 
         return PendingExecution(self._thread.submit(_forward))
@@ -711,6 +711,9 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
+    requires_request_token_history = bool(
+        getattr(target.model, "requires_request_token_history", False)
+    )
     executor = create_model_executor(
         server_args=server_args,
         config=ModelExecutorConfig.from_server_args(
@@ -721,6 +724,7 @@ def build_device_side(
             global_rank=global_rank,
             prefix_granularity=cache_geometry.prefix_granularity,
             overlap_schedule_depth=overlap_schedule_depth,
+            requires_request_token_history=requires_request_token_history,
         ),
         model_runner=target,
         draft_model_runner=draft,
@@ -789,9 +793,7 @@ def build_device_side(
         num_host_pages=(
             l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
         ),
-        request_prefix_lookback=int(
-            getattr(target.model, "request_prefix_lookback", 0)
-        ),
+        requires_request_token_history=requires_request_token_history,
     )
 
     def encoder_model_facts() -> EncoderModelFacts:

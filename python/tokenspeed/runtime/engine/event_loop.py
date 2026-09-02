@@ -43,7 +43,6 @@ from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
-from tokenspeed.runtime.engine.request_prefix_inputs import RequestPrefixInputBuilder
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
     make_config,
@@ -212,9 +211,7 @@ class EventLoop:
         self.max_total_num_tokens = geometry.token_capacity
         # Planning reads this every round; keep the value, not the handle.
         self._uses_eager_grammar = specs.uses_eager_grammar
-        self._request_prefix_inputs = RequestPrefixInputBuilder(
-            specs.request_prefix_lookback
-        )
+        self._requires_request_token_history = specs.requires_request_token_history
         cache_groups = specs.cache_groups
         # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
@@ -1003,8 +1000,8 @@ class EventLoop:
                         # KeyError on rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
-                        request_prefixes = self._request_prefix_inputs.gather(
-                            forward_op, self.output_processor.rid_to_state
+                        request_history_seeds = self._gather_request_history_seeds(
+                            forward_op
                         )
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
@@ -1026,7 +1023,7 @@ class EventLoop:
                                 if self.model_config.is_multimodal_active
                                 else None
                             ),
-                            request_prefixes=request_prefixes,
+                            request_history_seeds=request_history_seeds,
                         )
                         # EPD invariant: handshaked items were filled by the
                         # async admission drain before admission; none may
@@ -1096,6 +1093,33 @@ class EventLoop:
             self.output_processor.rid_to_state[rid].sampling_params
             for rid in forward_op.request_ids
         ]
+
+    def _gather_request_history_seeds(self, forward_op):
+        """Return full-prefix history seeds for the batch's extend requests."""
+        if not self._requires_request_token_history:
+            return None
+
+        states = self.output_processor.rid_to_state
+        seeds = []
+        for index, boundary in enumerate(forward_op.extend_prefix_lens):
+            boundary = int(boundary)
+            if boundary == 0:
+                continue
+            state = states[forward_op.request_ids[index]]
+            prompt = state.prompt_input_ids
+            if boundary <= len(prompt):
+                tokens = tuple(prompt[:boundary])
+            else:
+                output_end = boundary - len(prompt)
+                tokens = tuple(prompt + state.output_ids[:output_end])
+            seeds.append(
+                (
+                    int(forward_op.request_pool_indices[index]),
+                    boundary,
+                    tokens,
+                )
+            )
+        return tuple(seeds) or None
 
     def _gather_grammar_state(self, forward_op) -> GrammarStepInputs | None:
         """Build ``GrammarStepInputs`` for the current batch, or ``None``.

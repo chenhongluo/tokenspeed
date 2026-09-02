@@ -75,8 +75,9 @@ class PlannedForward:
         multimodal_context: Per-batch multimodal state, None for text-only.
             Its ``mm_inputs`` are shallow copies taken at gather time; the
             items inside are the other registered exception.
-        request_prefixes: Immutable ``(slot, boundary, token_tail)`` tuples for
-            a model-owned bounded-lookback input, or None.
+        request_history_seeds: Immutable ``(slot, boundary, token_ids)`` tuples
+            restoring the full committed prefix at cached-prefix boundaries,
+            or None.
     """
 
     forward_op: Any
@@ -84,7 +85,7 @@ class PlannedForward:
     dp_metadata: "DpForwardMetadata | None"
     grammar_inputs: Any
     multimodal_context: Any
-    request_prefixes: Any = None
+    request_history_seeds: Any = None
 
 
 @dataclass

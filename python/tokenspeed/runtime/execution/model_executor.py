@@ -171,6 +171,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    requires_request_token_history: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -219,6 +220,7 @@ class ModelExecutorConfig:
         global_rank: int,
         prefix_granularity: int,
         overlap_schedule_depth: int = 0,
+        requires_request_token_history: bool = False,
     ) -> ModelExecutorConfig:
         output_length = (
             server_args.speculative_num_draft_tokens
@@ -299,6 +301,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
+            requires_request_token_history=requires_request_token_history,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -433,20 +436,16 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
-        bind_model_runtime_inputs = getattr(
-            self.model_runner.model, "bind_model_runtime_inputs", None
-        )
-        if bind_model_runtime_inputs is not None:
-            bind_model_runtime_inputs(
-                input_buffers=self.input_buffers,
-                max_request_slots=config.max_req_pool_size,
-                history_capacity=config.physical_context_len,
-            )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
+            request_token_history_capacity=(
+                config.physical_context_len
+                if config.requires_request_token_history
+                else 0
+            ),
         )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
@@ -683,6 +682,7 @@ class ModelExecutor:
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            ctx.request_token_history = self._request_token_history_view(ctx.bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
                 if self.config.model_is_mrope
@@ -1099,6 +1099,15 @@ class ModelExecutor:
             device=self.device,
         )
 
+    def _request_token_history_view(self, bs: int):
+        if not self.runtime_states.has_request_token_history:
+            return None
+        return self.runtime_states.request_token_history_view(
+            req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+            input_start_offsets=self.input_buffers.input_start_offsets_buf[: bs + 1],
+            active_request_mask=self.input_buffers.active_request_mask_buf[:bs],
+        )
+
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
@@ -1323,7 +1332,7 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
-        request_prefixes=None,
+        request_history_seeds=None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1381,20 +1390,12 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 out_loc_table=page_table,
             )
-            if request_prefixes:
-                stage_request_prefixes = getattr(
-                    self.model_runner.model, "stage_request_prefixes", None
-                )
-                if stage_request_prefixes is None:
-                    raise RuntimeError(
-                        "request prefixes were provided to a model without "
-                        "prefix staging support"
-                    )
-                slots, prefix_lengths, token_tails = zip(*request_prefixes)
-                stage_request_prefixes(
+            if request_history_seeds:
+                slots, prefix_lengths, seed_token_ids = zip(*request_history_seeds)
+                self.runtime_states.seed_request_token_history(
                     req_pool_indices=slots,
                     prefix_lengths=prefix_lengths,
-                    request_token_ids=token_tails,
+                    request_token_ids=seed_token_ids,
                 )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
@@ -1479,6 +1480,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    request_token_history=self._request_token_history_view(bs),
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_metadata is None:

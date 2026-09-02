@@ -19,8 +19,11 @@
 # SOFTWARE.
 """Runtime state tensors shared by the model executor."""
 
+from __future__ import annotations
+
 import torch
 
+from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -35,12 +38,26 @@ class RuntimeStates:
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
+        request_token_history_capacity: int = 0,
     ):
+        if request_token_history_capacity < 0:
+            raise ValueError("request token history capacity must be non-negative")
+
         self.device = device
         self.vocab_size = vocab_size
+        self._request_pool_size = req_pool_size
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device
+        )
+        self.request_token_history_ids = (
+            torch.zeros(
+                (req_pool_size + 1, request_token_history_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
+            if request_token_history_capacity
+            else None
         )
         # Resolve input ids from here when overlap scheduling.
         self.future_input_map = torch.empty(
@@ -54,6 +71,29 @@ class RuntimeStates:
         )
         self.scaling_penalties = torch.ones(
             (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
+        )
+
+    @property
+    def has_request_token_history(self) -> bool:
+        """Whether this runtime owns request-persistent token histories."""
+        return self.request_token_history_ids is not None
+
+    def request_token_history_view(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        input_start_offsets: torch.Tensor,
+        active_request_mask: torch.Tensor,
+    ) -> RequestTokenHistoryView | None:
+        """Combine persistent history with the current packed-batch layout."""
+        if self.request_token_history_ids is None:
+            return None
+        return RequestTokenHistoryView(
+            history_token_ids=self.request_token_history_ids,
+            committed_lengths=self.valid_cache_lengths,
+            req_pool_indices=req_pool_indices,
+            input_start_offsets=input_start_offsets,
+            active_request_mask=active_request_mask,
         )
 
     def update_valid_cache_length(
@@ -70,6 +110,54 @@ class RuntimeStates:
         self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
         self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
         self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+
+    def seed_request_token_history(
+        self,
+        *,
+        req_pool_indices,
+        prefix_lengths,
+        request_token_ids,
+    ) -> None:
+        """Restore the history required at each request's prefix boundary.
+
+        Args:
+            req_pool_indices: Request-pool slots to restore.
+            prefix_lengths: Absolute prefix boundary for each request.
+            request_token_ids: Full token prefixes ending at the corresponding
+                prefix boundary.
+        """
+        history = self.request_token_history_ids
+        if history is None:
+            raise RuntimeError("request token history is not enabled")
+        if not (len(req_pool_indices) == len(prefix_lengths) == len(request_token_ids)):
+            raise ValueError(
+                "request token history seed inputs must have matching lengths"
+            )
+
+        capacity = history.shape[1]
+        for row, prefix_length, token_ids in zip(
+            req_pool_indices, prefix_lengths, request_token_ids
+        ):
+            row = int(row)
+            prefix_length = int(prefix_length)
+            seed_tokens = tuple(int(token_id) for token_id in token_ids)
+            if not 0 <= row < self._request_pool_size:
+                raise ValueError(f"request token history slot {row} is out of range")
+            if not 0 <= prefix_length <= capacity:
+                raise ValueError(
+                    f"request token history prefix length {prefix_length} "
+                    f"exceeds capacity {capacity}"
+                )
+            if len(seed_tokens) != prefix_length:
+                raise ValueError(
+                    "request token history seed has "
+                    f"{len(seed_tokens)} tokens but must cover prefix length "
+                    f"{prefix_length}"
+                )
+            if seed_tokens:
+                history[row, :prefix_length].copy_(
+                    torch.as_tensor(seed_tokens, dtype=torch.int32, device=self.device)
+                )
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]

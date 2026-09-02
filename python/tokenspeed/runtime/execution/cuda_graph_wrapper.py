@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
@@ -380,6 +381,41 @@ class CudaGraphWrapper:
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
+    def _request_token_history_view(self, bs: int) -> RequestTokenHistoryView | None:
+        if (
+            self.runtime_states is None
+            or not self.runtime_states.has_request_token_history
+        ):
+            return None
+        return self.runtime_states.request_token_history_view(
+            req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+            input_start_offsets=self.input_buffers.input_start_offsets_buf[: bs + 1],
+            active_request_mask=self.input_buffers.active_request_mask_buf[:bs],
+        )
+
+    def _prepare_request_token_history_graph_inputs(
+        self,
+        *,
+        active_bs: int,
+        padded_bs: int,
+    ) -> None:
+        if (
+            self.runtime_states is None
+            or not self.runtime_states.has_request_token_history
+        ):
+            return
+        width = self.max_tokens_per_req
+        torch.arange(
+            0,
+            padded_bs * width + 1,
+            width,
+            dtype=torch.int32,
+            device=self.device,
+            out=self.input_buffers.input_start_offsets_buf[: padded_bs + 1],
+        )
+        self.input_buffers.active_request_mask_buf[:active_bs].fill_(True)
+        self.input_buffers.active_request_mask_buf[active_bs:padded_bs].fill_(False)
+
     def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
         graph_cls = (
             self.device_module.NPUGraph
@@ -387,6 +423,8 @@ class CudaGraphWrapper:
             else self.device_module.CUDAGraph
         )
         graph = graph_cls()
+
+        self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -408,6 +446,7 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
+            request_token_history=self._request_token_history_view(bs),
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -552,6 +591,10 @@ class CudaGraphWrapper:
         _is_cuda_graph_phase = True
         try:
             for bs in batch_sizes:
+                self._prepare_request_token_history_graph_inputs(
+                    active_bs=0,
+                    padded_bs=bs,
+                )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -567,6 +610,7 @@ class CudaGraphWrapper:
                         if self.drafter is not None
                         else CaptureHiddenMode.NULL
                     ),
+                    request_token_history=self._request_token_history_view(bs),
                 )
                 if self.dp_size > 1:
                     ctx.global_num_tokens = [
@@ -1188,6 +1232,10 @@ class CudaGraphWrapper:
 
         if use_graph:
             self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
+            self._prepare_request_token_history_graph_inputs(
+                active_bs=bs,
+                padded_bs=padded_bs,
+            )
 
         # MLA/KDA backends build their eager metadata from the cache contract
         # and refresh their captured decode buffers from it during replay.

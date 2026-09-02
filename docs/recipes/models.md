@@ -38,6 +38,15 @@ For LongCat 2.0, `trtllm_mla` remains the dense MLA delegate inside the LSA
 backend; sparse selection is configured from the checkpoint and does not need
 a separate scheduler option.
 
+For the device-resident LongCat over-embedding path, request-token history is
+owned by `RuntimeStates` and keyed by request-pool slot. `InputBuffers` owns the
+packed batch layout, and `ForwardContext` carries a non-owning view combining
+the two for the OE layer. Extend requests copy their full committed prefix into
+that history at a cached-prefix boundary; subsequent input tokens are appended
+directly by the OE kernel. The `LiteForCausalLM` NPU path is separate: its
+host-resident OE tables and cache-backed context continue to use the Lite
+external-input preparation flow.
+
 ## Inkling
 
 Blog: https://lightseek.org/blog/tokenspeed-inkling.html
