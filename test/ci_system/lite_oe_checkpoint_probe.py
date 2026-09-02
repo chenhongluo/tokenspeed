@@ -40,11 +40,13 @@ from typing import Any
 import torch
 from safetensors.torch import load_file
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
-from tokenspeed.runtime.models.lite import (
-    LiteCheckpointLayout,
-    LiteNgramParameters,
-    LiteOEStatePreparer,
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+from tokenspeed.runtime.layers.over_embedding import (
+    CheckpointedTailOEStatePreparer,
+    HostLongCatOverEmbedding,
+)
+from tokenspeed.runtime.models.flash_local_checkpoint import (
+    FLASHLocalCheckpointLayout,
 )
 
 EXACT_OE_PAYLOAD_BYTES = 28_991_102_976
@@ -155,8 +157,8 @@ def _normalize_file_mappings(pointers: list[int]) -> None:
                 raise OSError(error, os.strerror(error))
 
 
-def _oe_names(config: LiteConfig) -> tuple[list[str], list[str]]:
-    layout = LiteCheckpointLayout(config)
+def _oe_names(config: FLASHLocalConfig) -> tuple[list[str], list[str]]:
+    layout = FLASHLocalCheckpointLayout(config)
     table_names = []
     projection_names = []
     for table_id in range(config.oe_component_count):
@@ -199,12 +201,12 @@ def load_oe_checkpoint(
     *,
     device: int | None,
     after_table_adoption: Callable[[], None] | None = None,
-) -> tuple[LiteNgramParameters, dict[str, Any], torch.Tensor]:
+) -> tuple[HostLongCatOverEmbedding, dict[str, Any], torch.Tensor]:
     """Load only Lite OE tensors and retain table safetensors mappings."""
-    config = LiteConfig.from_dict(_read_json(checkpoint / "config.json"))
+    config = FLASHLocalConfig.from_dict(_read_json(checkpoint / "config.json"))
     table_names, projection_names = _oe_names(config)
     selected, shard_count = _load_selected(checkpoint, table_names + projection_names)
-    layer = LiteNgramParameters(config)
+    layer = HostLongCatOverEmbedding(config)
     table_pointers = []
     payload_bytes = 0
     for table_id, name in enumerate(table_names):
@@ -257,7 +259,7 @@ def load_oe_checkpoint(
     )
 
 
-def _touch_tables(layer: LiteNgramParameters, touch_mib: int) -> float:
+def _touch_tables(layer: HostLongCatOverEmbedding, touch_mib: int) -> float:
     total_pages = max(1, touch_mib * 256)
     pages_per_table = max(1, total_pages // len(layer.embedders))
     checksum = 0.0
@@ -290,7 +292,7 @@ def _initialize_npu(device: int) -> dict[str, int]:
 
 
 def _numerical_probe(
-    layer: LiteNgramParameters, packed_cpu: torch.Tensor, device: int
+    layer: HostLongCatOverEmbedding, packed_cpu: torch.Tensor, device: int
 ) -> dict[str, Any]:
     config = layer.config
     cases = []
@@ -427,7 +429,7 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     if device is not None:
         bucket = 1 if args.role == "prefill" else 2
-        preparer = LiteOEStatePreparer(
+        preparer = CheckpointedTailOEStatePreparer(
             layer,
             context_pages=torch.zeros(
                 (3, 3), dtype=torch.int32, device=f"npu:{device}"

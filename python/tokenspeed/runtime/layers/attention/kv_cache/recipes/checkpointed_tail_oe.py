@@ -41,12 +41,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 
-LITE_OE_GROUP = "lite_oe"
-LITE_OE_FIELD = "layer.0.lite.oe.context"
+OE_TAIL_GROUP = "lite_oe"
+OE_TAIL_FIELD = "layer.0.lite.oe.context"
 
 
-class LiteRecipe(KimiK3Recipe):
-    """Add Lite OE state without publishing a second cache family."""
+class CheckpointedTailOERecipe(KimiK3Recipe):
+    """Add Checkpointed-tail OE state without publishing a second cache family."""
 
     @property
     @override
@@ -58,7 +58,7 @@ class LiteRecipe(KimiK3Recipe):
         return super().groups() + (
             (
                 CacheGroupSpec(
-                    group_id=LITE_OE_GROUP,
+                    group_id=OE_TAIL_GROUP,
                     retention="full_history",
                     family="state",
                     transfer_policy=(
@@ -68,7 +68,7 @@ class LiteRecipe(KimiK3Recipe):
                 ),
                 (
                     CacheFieldSpec(
-                        LITE_OE_FIELD,
+                        OE_TAIL_FIELD,
                         "slot.0",
                         (3,),
                         "int32",
@@ -89,10 +89,12 @@ class LiteRecipe(KimiK3Recipe):
             )
             * packing[FULL_ATTENTION]
         )
-        oe_bytes = sum(field.payload_bytes for field in fields[LITE_OE_GROUP])
+        oe_bytes = sum(field.payload_bytes for field in fields[OE_TAIL_GROUP])
         if plane_bytes % oe_bytes:
-            raise ValueError("Lite OE context must divide the existing slot.0 plane")
-        packing[LITE_OE_GROUP] = plane_bytes // oe_bytes
+            raise ValueError(
+                "Checkpointed-tail OE context must divide the existing slot.0 plane"
+            )
+        packing[OE_TAIL_GROUP] = plane_bytes // oe_bytes
         return packing
 
     @override

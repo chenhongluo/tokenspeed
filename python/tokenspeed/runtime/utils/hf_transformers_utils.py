@@ -52,7 +52,6 @@ from tokenspeed.runtime.configs import (
     KimiK3Config,
     KimiK3DSparkConfig,
     KimiK25Config,
-    LiteConfig,
     LongcatConfig,
     MiniMaxM2Config,
     MiniMaxM3Config,
@@ -92,7 +91,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     LongcatConfig.model_type: LongcatConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
-    LiteConfig.model_type: LiteConfig,
 }
 
 _ARCHITECTURE_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -110,10 +108,6 @@ def _resolve_registered_config(
 
     architectures = raw_config.get("architectures")
     if isinstance(architectures, list) and architectures:
-        if architectures[
-            0
-        ] == "FLASHLocalForCausalLM" and LiteConfig.matches_checkpoint(raw_config):
-            return LiteConfig
         return _ARCHITECTURE_CONFIG_REGISTRY.get(architectures[0])
     return None
 
@@ -225,9 +219,6 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     ``list[str]``; downstream code already handles the absence via
     ``resolve_architecture``.
     """
-    if isinstance(config, LiteConfig):
-        config.__dict__["architectures"] = [config.runtime_architecture]
-        return
     if getattr(config, "architectures", None):
         return
     raw_archs = raw_config.get("architectures")
@@ -559,7 +550,7 @@ _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
 )
 
 _MISTRAL_REGEX_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
-    {"FLASHLocalForCausalLM", "LiteForCausalLM", "LongcatCausalLM"}
+    {"FLASHLocalForCausalLM", "LongcatCausalLM"}
 )
 
 

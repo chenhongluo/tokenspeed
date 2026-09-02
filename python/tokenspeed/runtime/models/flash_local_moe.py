@@ -681,9 +681,15 @@ class PackedFLASHLocalMoE(nn.Module):
             return routed + self._shared(hidden_states)
 
         mode = ctx.forward_mode
-        if mode is not None and mode.is_extend_or_mixed():
+        if (
+            mode is not None
+            and mode.is_extend_or_mixed()
+            and self.mapping.attn.cp_size > 1
+        ):
             return self._prefill(hidden_states, ctx.global_num_tokens)
-        if mode is not None and (mode.is_decode() or mode.is_idle()):
+        if mode is not None and (
+            mode.is_decode() or mode.is_idle() or mode.is_extend_or_mixed()
+        ):
             return self._decode(hidden_states)
         raise ValueError("FLASHLocal Grouped MoE requires a valid ForwardContext mode.")
 

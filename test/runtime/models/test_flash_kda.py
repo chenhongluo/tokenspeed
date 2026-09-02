@@ -376,7 +376,9 @@ def test_flash_lite_oe_keeps_its_special_token_policy(
     with mock.patch(
         "tokenspeed.runtime.models.flash_kda.LongCatOverEmbedding"
     ) as over_embedding:
-        model._build_embed_tokens(config, quant_config=None)
+        model._build_embed_tokens(
+            config, quant_config=None, oe_table_placement="device"
+        )
 
     kwargs = over_embedding.call_args.kwargs
     assert kwargs["ignored_token_ids"] == ((2, 3) if exclude_special_tokens else ())

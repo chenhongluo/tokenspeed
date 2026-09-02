@@ -32,21 +32,12 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.layers.over_embedding import (
     CheckpointedTailOEStatePreparer,
     HostLongCatOverEmbedding,
 )
-from tokenspeed.runtime.models.lite import (
-    FLASHLocalForCausalLM,
-    LiteNgramParameters,
-    LiteOEStatePreparer,
-)
-
-
-def test_temporary_lite_oe_names_alias_the_shared_layer() -> None:
-    assert LiteNgramParameters is HostLongCatOverEmbedding
-    assert LiteOEStatePreparer is CheckpointedTailOEStatePreparer
+from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 
 
 def test_shared_flash_loader_delegates_host_oe_weights(monkeypatch) -> None:
@@ -60,8 +51,10 @@ def test_shared_flash_loader_delegates_host_oe_weights(monkeypatch) -> None:
         lambda: True,
     )
     monkeypatch.setattr(flash_kda, "flash_local_prefers_packed_moe", lambda: True)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    config.strict_checkpoint_layout = False
     model = flash_kda.FLASHLocalForCausalLM(
-        FLASHLocalConfig.from_dict(lite_config_dict()),
+        config,
         Mapping(rank=0, world_size=1),
         oe_table_placement="host",
     )
@@ -122,8 +115,8 @@ def _brute_ids(config, flat_tokens, initial_context, lengths):
 
 
 def test_lite_oe_ids_match_hand_computation_and_chunk_continuation() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     initial = torch.tensor([[2, 2, 5], [2, 2, 2], [7, 8, 9]])
     tokens = torch.tensor([6, 36, 10, 11, 12, 2, 13, 14], dtype=torch.int64)
     lengths = [3, 5, 0]
@@ -151,8 +144,8 @@ def test_lite_oe_ids_match_hand_computation_and_chunk_continuation() -> None:
 
 def test_lite_oe_lookup_projection_normalize_and_special() -> None:
     torch.manual_seed(19)
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     for table_id, table in enumerate(layer.embedders):
         rows = config.oe_table_rows(table_id)
         table.weight.data = (
@@ -193,8 +186,8 @@ def test_lite_oe_lookup_projection_normalize_and_special() -> None:
 
 
 def test_lite_oe_state_restore_slot_reuse_and_fixed_staging() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     for table_id, table in enumerate(layer.embedders):
         rows = config.oe_table_rows(table_id)
         table.weight.data = (
@@ -204,7 +197,7 @@ def test_lite_oe_state_restore_slot_reuse_and_fixed_staging() -> None:
             .to(torch.bfloat16)
         )
     pages = torch.zeros((8, 3), dtype=torch.int32)
-    preparer = LiteOEStatePreparer(
+    preparer = CheckpointedTailOEStatePreparer(
         layer,
         context_pages=pages,
         checkpoint_granularity=128,
@@ -258,15 +251,15 @@ def test_lite_oe_state_restore_slot_reuse_and_fixed_staging() -> None:
 
 
 def test_lite_oe_state_crosses_checkpoint_boundary_without_restore() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     for table_id, table in enumerate(layer.embedders):
         rows = config.oe_table_rows(table_id)
         table.weight.data = torch.zeros(
             (rows, config.oe_hidden_size), dtype=torch.bfloat16
         )
     pages = torch.zeros((4, 3), dtype=torch.int32)
-    preparer = LiteOEStatePreparer(
+    preparer = CheckpointedTailOEStatePreparer(
         layer,
         context_pages=pages,
         checkpoint_granularity=128,
@@ -304,8 +297,8 @@ def test_lite_oe_state_crosses_checkpoint_boundary_without_restore() -> None:
 
 
 def test_lite_oe_uses_resolved_device_owned_decode_token() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     for table_id, table in enumerate(layer.embedders):
         table.weight.data = torch.zeros(
             (config.oe_table_rows(table_id), config.oe_hidden_size),
@@ -313,7 +306,7 @@ def test_lite_oe_uses_resolved_device_owned_decode_token() -> None:
         )
     pages = torch.zeros((2, 3), dtype=torch.int32)
     pages[1] = torch.tensor([2, 5, 6], dtype=torch.int32)
-    preparer = LiteOEStatePreparer(
+    preparer = CheckpointedTailOEStatePreparer(
         layer,
         context_pages=pages,
         checkpoint_granularity=128,
@@ -344,10 +337,10 @@ def test_lite_oe_uses_resolved_device_owned_decode_token() -> None:
 
 
 def test_lite_oe_rejects_resolved_token_count_before_publication() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     pages = torch.zeros((2, 3), dtype=torch.int32)
-    preparer = LiteOEStatePreparer(
-        LiteNgramParameters(config),
+    preparer = CheckpointedTailOEStatePreparer(
+        HostLongCatOverEmbedding(config),
         context_pages=pages,
         checkpoint_granularity=128,
         max_request_slots=1,
@@ -378,10 +371,10 @@ def test_lite_oe_rejects_resolved_token_count_before_publication() -> None:
 
 
 def test_lite_oe_rejects_invalid_slots_and_pages_before_publication() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     pages = torch.zeros((2, 3), dtype=torch.int32)
-    preparer = LiteOEStatePreparer(
-        LiteNgramParameters(config),
+    preparer = CheckpointedTailOEStatePreparer(
+        HostLongCatOverEmbedding(config),
         context_pages=pages,
         checkpoint_granularity=128,
         max_request_slots=2,
@@ -432,8 +425,8 @@ def test_lite_oe_rejects_invalid_slots_and_pages_before_publication() -> None:
 def test_lite_oe_fixed_staging_replays_updated_values() -> None:
     torch.npu.set_device(0)
     torch.manual_seed(2027)
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     for table_id, table in enumerate(layer.embedders):
         table.weight.data = torch.randn(
             config.oe_table_rows(table_id),
@@ -442,7 +435,7 @@ def test_lite_oe_fixed_staging_replays_updated_values() -> None:
         )
     layer.projection.data = torch.randn_like(layer.projection, device="npu") * 0.02
     layer.ignore_tokens = layer.ignore_tokens.to("npu")
-    preparer = LiteOEStatePreparer(
+    preparer = CheckpointedTailOEStatePreparer(
         layer,
         context_pages=torch.zeros((4, 3), dtype=torch.int32, device="npu"),
         checkpoint_granularity=128,
@@ -498,8 +491,8 @@ def test_lite_oe_fixed_staging_replays_updated_values() -> None:
 
 
 def test_lite_oe_loader_adopts_safetensors_mapping(tmp_path) -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
-    model = FLASHLocalForCausalLM(config, mapping())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(config, mapping(), oe_table_placement="host")
     name = "model.ngram_embeddings.embedders.0.weight"
     source = torch.arange(13 * 8, dtype=torch.bfloat16).reshape(13, 8)
     checkpoint = tmp_path / "oe.safetensors"
@@ -509,7 +502,7 @@ def test_lite_oe_loader_adopts_safetensors_mapping(tmp_path) -> None:
     pointer = mapped.untyped_storage().data_ptr()
 
     def checkpoint_weights():
-        for source_name, tensor in weights(model.layout):
+        for source_name, tensor in weights(model.checkpoint_layout):
             yield source_name, mapped if source_name == name else tensor
 
     model.load_weights(checkpoint_weights())

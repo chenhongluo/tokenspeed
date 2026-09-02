@@ -35,6 +35,67 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 _ATTENTION_LAYER = "attention"
 _LINEAR_ATTENTION_LAYER = LINEAR_ATTENTION
 
+_STRICT_FLASH_LITE_MARKERS = frozenset(
+    {
+        "ngram_vocab_size_ratio",
+        "moe_group_size",
+        "zero_expert_num",
+        "kda_use_full_rank_gate",
+        "mla_use_output_gate",
+    }
+)
+_STRICT_FLASH_LITE_FIELDS = frozenset(
+    {
+        "architectures",
+        "attention_bias",
+        "attention_dropout",
+        "attention_method",
+        "bos_token_id",
+        "emb_neighbor_num",
+        "emb_split_num",
+        "eos_token_id",
+        "expert_ffn_hidden_size",
+        "fa_interval",
+        "ffn_hidden_size",
+        "grouped_moe_norm_scale",
+        "hidden_size",
+        "kda_nope",
+        "kda_use_full_rank_gate",
+        "kv_lora_rank",
+        "linear_conv_size",
+        "linear_head_dim",
+        "linear_hidden_size",
+        "linear_method",
+        "linear_num_heads",
+        "max_position_embeddings",
+        "mla_scale_kv_lora",
+        "mla_scale_q_lora",
+        "mla_use_output_gate",
+        "moe_group_size",
+        "moe_impl",
+        "moe_switch_token_num",
+        "moe_topk",
+        "n_routed_experts",
+        "ngram_exclude_sp_token",
+        "ngram_fix_normalize_factor",
+        "ngram_vocab_size_ratio",
+        "num_attention_heads",
+        "num_layers",
+        "q_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "rms_norm_eps",
+        "routed_scaling_factor",
+        "special_token_scope",
+        "use_cache",
+        "use_mla",
+        "v_head_dim",
+        "vocab_size",
+        "zero_expert_num",
+        "zero_expert_type",
+    }
+)
+
 
 def _resolve_hybrid_layer_pattern(
     num_hidden_layers: int,
@@ -231,6 +292,28 @@ class FLASHLocalConfig(PretrainedConfig):
 
     model_type = "flash_kda"
 
+    @classmethod
+    def from_dict(cls, config_dict: dict, **kwargs):
+        strict = _STRICT_FLASH_LITE_MARKERS.issubset(config_dict)
+        if strict:
+            missing = sorted(_STRICT_FLASH_LITE_FIELDS.difference(config_dict))
+            if missing:
+                raise ValueError(
+                    "Flash-Lite checkpoint config is missing required fields: "
+                    + ", ".join(missing)
+                )
+            if config_dict["architectures"] != ["FLASHLocalForCausalLM"]:
+                raise ValueError(
+                    "Flash-Lite architectures must be ['FLASHLocalForCausalLM']."
+                )
+
+        result = super().from_dict(config_dict, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        config.strict_checkpoint_layout = strict
+        if strict:
+            config._validate_strict_flash_lite()
+        return result
+
     def __init__(
         self,
         vocab_size: int = 163840,
@@ -244,6 +327,9 @@ class FLASHLocalConfig(PretrainedConfig):
         activation_situ_linear_beta: float | None = 25.0,
         rms_norm_eps: float = 1e-5,
         max_position_embeddings: int = 8192,
+        use_cache: bool = True,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
         tie_word_embeddings: bool = False,
         torch_dtype="bfloat16",
         params_dtype="bfloat16",
@@ -339,6 +425,9 @@ class FLASHLocalConfig(PretrainedConfig):
         self.activation_situ_linear_beta = activation_situ_linear_beta
         self.rms_norm_eps = rms_norm_eps
         self.max_position_embeddings = max_position_embeddings
+        self.use_cache = use_cache
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
 
         if "num_layers" in kwargs and "num_hidden_layers" not in kwargs:
             self.num_hidden_layers = kwargs["num_layers"]
@@ -496,6 +585,77 @@ class FLASHLocalConfig(PretrainedConfig):
             **kwargs,
         )
 
+    def _validate_strict_flash_lite(self) -> None:
+        positive = {
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "ffn_hidden_size": self.ffn_hidden_size,
+            "expert_ffn_hidden_size": self.expert_ffn_hidden_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "q_lora_rank": self.q_lora_rank,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+            "linear_head_dim": self.linear_head_dim,
+            "linear_num_heads": self.linear_num_heads,
+            "linear_conv_size": self.linear_conv_size,
+            "fa_interval": self.fa_interval,
+            "moe_group_size": self.moe_group_size,
+            "n_routed_experts": self.n_routed_experts,
+            "zero_expert_num": self.zero_expert_num,
+            "moe_topk": self.moe_topk,
+            "moe_switch_token_num": self.moe_switch_token_num,
+            "emb_neighbor_num": self.emb_neighbor_num,
+            "emb_split_num": self.emb_split_num,
+            "ngram_vocab_size_ratio": self.ngram_vocab_size_ratio,
+            "grouped_moe_norm_scale": self.grouped_moe_norm_scale,
+        }
+        invalid = [
+            name for name, value in positive.items() if value is None or value <= 0
+        ]
+        if invalid:
+            raise ValueError(
+                "Flash-Lite config fields must be positive: " + ", ".join(invalid)
+            )
+        if self.num_hidden_layers % self.fa_interval:
+            raise ValueError("num_layers must be divisible by fa_interval.")
+        if self.linear_hidden_size != self.hidden_size:
+            raise ValueError("linear_hidden_size must equal hidden_size.")
+        if self.linear_num_heads % 8:
+            raise ValueError("linear_num_heads must be divisible by KDA TP8.")
+        if (self.n_routed_experts * self.moe_group_size) % 8:
+            raise ValueError("Grouped MoE real experts must be divisible by EP8.")
+        if self.hidden_size % self.moe_group_size:
+            raise ValueError("hidden_size must be divisible by moe_group_size.")
+        if self.moe_topk > self.n_routed_experts + self.zero_expert_num:
+            raise ValueError("moe_topk exceeds the experts available in one group.")
+        if self.linear_method.upper() != "FGBKDA" or not self.kda_use_full_rank_gate:
+            raise ValueError("Flash-Lite requires FGBKDA with the full-rank gate.")
+        if not (self.kda_nope and self.mla_use_output_gate):
+            raise ValueError("Flash-Lite requires NoPE MLA with the output gate.")
+        if not self.use_mla or self.attention_method.upper() != "MLA":
+            raise ValueError("Flash-Lite requires the hybrid MLA attention path.")
+        if self.zero_expert_type != "identity":
+            raise ValueError("Flash-Lite zero experts must use identity semantics.")
+        if self.moe_impl != "mix" or not self.use_cache:
+            raise ValueError("Flash-Lite requires mix MoE and cache support.")
+        if self.attention_bias or self.attention_dropout != 0:
+            raise ValueError(
+                "Flash-Lite attention must be bias-free with zero dropout."
+            )
+        if not (
+            self.mla_scale_q_lora
+            and self.mla_scale_kv_lora
+            and self.ngram_exclude_sp_token
+            and self.ngram_fix_normalize_factor
+        ):
+            raise ValueError(
+                "Flash-Lite checkpoint scaling and OE switches must be enabled."
+            )
+        self.special_token_ids
+
     # ----- helpers -----
 
     def is_kda_layer(self, layer_idx: int) -> bool:
@@ -582,7 +742,7 @@ class FLASHLocalConfig(PretrainedConfig):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         mapping = global_server_args_dict["mapping"]
-        attn_tp_size = mapping.attn.tp_size
+        attn_tp_size = mapping.linear_attn.tp_size
 
         la = self.linear_attn_config
         num_heads = la["linear_num_heads"]

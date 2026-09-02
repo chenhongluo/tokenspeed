@@ -31,15 +31,16 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 from tokenspeed.runtime.models.flash_local_moe import (
     PackedFLASHLocalMoE,
     PackedWeight,
     grouped_moe_local_expert_ids,
     grouped_moe_topk,
 )
-from tokenspeed.runtime.models.lite import FLASHLocalForCausalLM
 
 
 def test_lite_packed_moe_import_does_not_require_accelerator() -> None:
@@ -69,7 +70,7 @@ def test_lite_packed_moe_import_does_not_require_accelerator() -> None:
 
 
 def test_lite_router_bias_only_changes_selection() -> None:
-    config = LiteConfig.from_dict(lite_config_dict(routed_scaling_factor=5.0))
+    config = FLASHLocalConfig.from_dict(lite_config_dict(routed_scaling_factor=5.0))
     layer = PackedFLASHLocalMoE(config, mapping())
     grouped = torch.randn(3, config.moe_group_size, 24, dtype=torch.bfloat16)
     for group_id, expert_group in enumerate(layer.expert_groups):
@@ -163,7 +164,7 @@ def test_shared_flash_local_loader_uses_packed_group_ownership(
         flash_kda, "flash_local_prefers_packed_projections", lambda: True
     )
     monkeypatch.setattr(flash_kda, "flash_local_prefers_packed_moe", lambda: True)
-    config = FLASHLocalConfig.from_dict(lite_config_dict(ngram_vocab_size_ratio=None))
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     parallel = Mapping(
         rank=1,
         world_size=8,
@@ -175,6 +176,8 @@ def test_shared_flash_local_loader_uses_packed_group_ownership(
         linear_attn_tp_size=8,
         mla_weight_tp_size=1,
     )
+    config.strict_checkpoint_layout = False
+    config.use_over_embedding = False
     model = flash_kda.FLASHLocalForCausalLM(config, parallel)
     prefix = "model.layers.0.mlp.experts.1"
 
@@ -256,7 +259,7 @@ def test_lite_grouped_moe_reference_real_identity_duplicate_and_shared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(7)
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     layer = PackedFLASHLocalMoE(config, mapping())
     for parameter in layer.parameters():
         parameter.data.uniform_(-0.08, 0.08)
@@ -281,7 +284,7 @@ def test_lite_grouped_moe_reference_real_identity_duplicate_and_shared(
 
 
 def test_lite_grouped_moe_empty_and_prefill_metadata_fail_closed() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     reference = PackedFLASHLocalMoE(config, mapping())
     empty = torch.empty(0, 96, dtype=torch.bfloat16)
     assert reference(empty).shape == empty.shape
@@ -293,6 +296,33 @@ def test_lite_grouped_moe_empty_and_prefill_metadata_fail_closed() -> None:
     )
     with pytest.raises(ValueError, match="global_num_tokens"):
         distributed(torch.zeros(1, 96, dtype=torch.bfloat16), ctx=ctx)
+
+
+def test_lite_grouped_moe_lockstep_extend_uses_feature_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = PackedFLASHLocalMoE(
+        FLASHLocalConfig.from_dict(lite_config_dict()),
+        mapping(8, role="replicated"),
+    )
+    hidden = torch.zeros(2, 96, dtype=torch.bfloat16)
+    expected = torch.ones_like(hidden)
+    monkeypatch.setattr(layer, "_decode", lambda _hidden: expected)
+    monkeypatch.setattr(
+        layer,
+        "_prefill",
+        lambda *_args: pytest.fail("lockstep Extend must not use CP collectives"),
+    )
+
+    actual = layer(
+        hidden,
+        ctx=SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            global_num_tokens=[2] * 8,
+        ),
+    )
+
+    assert actual is expected
 
 
 def _identity_route(layer: PackedFLASHLocalMoE, tokens: int):
@@ -316,8 +346,20 @@ def test_lite_grouped_moe_prefill_collectives_and_identity_math(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(11)
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = PackedFLASHLocalMoE(config, mapping(8, rank=0, role="prefill"))
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    parallel = Mapping(
+        rank=0,
+        world_size=8,
+        attn_tp_size=1,
+        attn_cp_size=8,
+        dense_tp_size=1,
+        dense_dp_size=8,
+        moe_tp_size=1,
+        moe_ep_size=8,
+        linear_attn_tp_size=8,
+        mla_weight_tp_size=1,
+    )
+    layer = PackedFLASHLocalMoE(config, parallel)
     for parameter in layer.parameters():
         parameter.data.uniform_(-0.05, 0.05)
     hidden = torch.randn(2, 96, dtype=torch.bfloat16)
@@ -361,7 +403,7 @@ def test_lite_grouped_moe_decode_feature_expert_and_dense_collectives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(13)
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     layer = PackedFLASHLocalMoE(config, mapping(8, rank=0, role="decode"))
     for parameter in layer.parameters():
         parameter.data.uniform_(-0.05, 0.05)
@@ -416,15 +458,32 @@ def test_lite_grouped_moe_decode_feature_expert_and_dense_collectives(
 
 @pytest.mark.parametrize("world_size", [1, 8])
 def test_lite_grouped_moe_meta_packed_shapes_and_loader(world_size: int) -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    parallel = Mapping(
+        rank=0,
+        world_size=world_size,
+        attn_tp_size=1,
+        attn_cp_size=world_size,
+        attn_dp_size=1,
+        dense_tp_size=1,
+        dense_dp_size=world_size,
+        moe_tp_size=1,
+        moe_ep_size=world_size,
+        moe_dp_size=1,
+        linear_attn_tp_size=world_size,
+        mla_weight_tp_size=1,
+    )
     with torch.device("meta"):
-        model = FLASHLocalForCausalLM(config, mapping(world_size, rank=0))
-    experts = model.model.layers[0].mlp.experts
+        model = FLASHLocalForCausalLM(
+            config,
+            parallel,
+            oe_table_placement="host",
+        )
+    experts = model.model.layers[0].moe.experts
     local_experts = 32 // world_size
     assert experts.w13_weight.shape == (local_experts, 32, 24)
     assert experts.w2_weight.shape == (local_experts, 24, 16)
     assert experts.w13_weight.is_meta and experts.w2_weight.is_meta
 
-    loaded = model.load_weights(weights(model.layout))
-    assert "model.layers.0.mlp.experts.w13_weight" in loaded
-    assert "model.layers.0.mlp.experts.w2_weight" in loaded
+    model.load_weights(weights(model.checkpoint_layout))
+    assert experts.w13_weight.is_meta and experts.w2_weight.is_meta

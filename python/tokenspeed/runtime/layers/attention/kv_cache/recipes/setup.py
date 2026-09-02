@@ -29,6 +29,9 @@ from typing import Literal
 
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.checkpointed_tail_oe import (
+    CheckpointedTailOERecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
 )
@@ -38,7 +41,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
     KimiK3Recipe,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.lite import LiteRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     OrdinaryRecipe,
 )
@@ -188,7 +190,7 @@ def prepare_cache_setup(
         and getattr(model_config, "oe_state_provider", None)
         == "cache-checkpointed-tail"
     ):
-        recipe = LiteRecipe
+        recipe = CheckpointedTailOERecipe
     return recipe(
         server_args=server_args,
         model_config=model_config,

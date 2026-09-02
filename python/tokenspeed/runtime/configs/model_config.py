@@ -72,7 +72,6 @@ _MLA_ARCHITECTURES = frozenset(
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
-        "LiteForCausalLM",
         # The K3 DSpark draft is MLA-native (DeepSeek-V3 layout, RoPE + YaRN),
         # so it must resolve to the MLA family rather than defaulting to MHA.
         "K3DSparkModel",

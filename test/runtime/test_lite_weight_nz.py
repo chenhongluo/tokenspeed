@@ -24,9 +24,10 @@ from unittest import mock
 import torch
 import torch.nn.functional as F
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 from tokenspeed.runtime.models.flash_local_attention import WeightNZReplicatedLinear
-from tokenspeed.runtime.models.lite import FLASHLocalForCausalLM, _Weight
+from tokenspeed.runtime.models.flash_local_moe import PackedWeight as _Weight
 
 
 def test_weight_nz_server_arg_defaults_off_and_propagates_decode_role():
@@ -59,8 +60,12 @@ def test_weight_nz_server_arg_defaults_off_and_propagates_decode_role():
 
 
 def test_lite_weight_nz_whitelist_is_exact():
-    config = LiteConfig.from_dict(lite_config_dict())
-    model = FLASHLocalForCausalLM(config, mapping(8, rank=0, role="decode"))
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config,
+        mapping(8, rank=0, role="decode"),
+        oe_table_placement="host",
+    )
     marked = {
         name: module.weight_nz
         for name, module in model.named_modules()
@@ -70,8 +75,8 @@ def test_lite_weight_nz_whitelist_is_exact():
     expected = {}
     for layer_id in range(4):
         prefix = f"model.layers.{layer_id}"
-        expected[f"{prefix}.mlp.proj_output"] = "standard"
-        expected[f"{prefix}.mlp.shared_experts.down_proj"] = "standard"
+        expected[f"{prefix}.moe.proj_output"] = "standard"
+        expected[f"{prefix}.moe.shared_experts.down_proj"] = "standard"
         if layer_id < 3:
             expected[f"{prefix}.self_attn.o_proj"] = "standard"
         else:
@@ -85,7 +90,7 @@ def test_lite_weight_nz_whitelist_is_exact():
             )
     assert marked == expected
 
-    target = LiteConfig()
+    target = FLASHLocalConfig()
     assert (
         len(target.linear_layer_ids)
         + 4 * len(target.full_attention_layer_ids)

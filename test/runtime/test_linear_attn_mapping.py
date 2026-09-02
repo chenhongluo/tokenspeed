@@ -204,10 +204,6 @@ class TestLinearAttnServerArgs(unittest.TestCase):
         self.assertEqual(mapping.moe.ep_size, 8)
 
     def test_bounded_service_uses_one_lockstep_tp8_world(self):
-        from tokenspeed.runtime.configs.lite_config import (
-            is_lite_replicated_mla_mapping,
-        )
-
         mapping = self._resolve(
             [
                 "--model",
@@ -226,7 +222,7 @@ class TestLinearAttnServerArgs(unittest.TestCase):
         )
 
         mapping.rank = 0
-        self.assertTrue(is_lite_replicated_mla_mapping(mapping))
+        self.assertEqual((mapping.attn.tp_size, mapping.attn.dp_size), (8, 1))
         self.assertEqual(mapping.attn.tp_group, tuple(range(8)))
         self.assertEqual(mapping.linear_attn.tp_group, tuple(range(8)))
         self.assertEqual(mapping.dense.tp_group, tuple(range(8)))

@@ -805,10 +805,10 @@ def _production_layer(
     contexts: list[tuple[dict, _Weights]],
     checkpoint: _Checkpoint | None,
 ):
-    from tokenspeed.runtime.configs.lite_config import LiteConfig
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
     from tokenspeed.runtime.models.flash_local_moe import PackedFLASHLocalMoE
 
-    config = LiteConfig()
+    config = FLASHLocalConfig()
     mapping = _production_mapping(role, rank)
     with torch.device("meta"):
         layer = PackedFLASHLocalMoE(config, mapping)

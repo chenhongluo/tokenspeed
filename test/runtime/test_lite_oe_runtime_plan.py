@@ -26,7 +26,6 @@ import pytest
 from tokenspeed.runtime.configs.model_config import resolve_oe_runtime_plan
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
-
 _CAPABILITIES = {
     "cuda": {"device": "runtime-full-history"},
     "npu": {"host": "cache-checkpointed-tail"},
@@ -47,12 +46,15 @@ def test_oe_runtime_plan_resolves_declared_pairs(
     requested: str,
     expected: tuple[str, str],
 ) -> None:
-    assert resolve_oe_runtime_plan(
-        use_over_embedding=True,
-        requested_placement=requested,
-        device=device,
-        capabilities=_CAPABILITIES,
-    ) == expected
+    assert (
+        resolve_oe_runtime_plan(
+            use_over_embedding=True,
+            requested_placement=requested,
+            device=device,
+            capabilities=_CAPABILITIES,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(("device", "requested"), [("cuda", "host"), ("npu", "device")])

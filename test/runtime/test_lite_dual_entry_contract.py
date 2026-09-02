@@ -18,72 +18,30 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Behavior guards for the temporary Flash-Lite dual model entries."""
+"""Behavior guards for the unified Flash-Lite runtime entry."""
 
 from test.runtime.test_lite_model_loader import lite_config_dict
 
 import pytest
 
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
-from tokenspeed.runtime.configs.lite_config import LiteConfig
 from tokenspeed.runtime.layers.over_embedding import HostLongCatOverEmbedding
 from tokenspeed.runtime.models.flash_kda import _canonical_flash_kda_weight_name
-from tokenspeed.runtime.models.lite import LiteCheckpointLayout
+from tokenspeed.runtime.models.flash_local_checkpoint import FLASHLocalCheckpointLayout
 
 
-def test_dual_entries_derive_the_same_model_semantics() -> None:
-    raw = lite_config_dict()
-    flash = FLASHLocalConfig.from_dict(raw)
-    lite = LiteConfig.from_dict(raw)
+def test_single_config_preserves_flash_lite_semantics() -> None:
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
 
-    shared_fields = (
-        "vocab_size",
-        "hidden_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "q_lora_rank",
-        "kv_lora_rank",
-        "qk_nope_head_dim",
-        "qk_rope_head_dim",
-        "v_head_dim",
-        "mla_scale_q_lora",
-        "mla_scale_kv_lora",
-        "mla_use_nope",
-        "mla_use_output_gate",
-        "n_routed_experts",
-        "routed_scaling_factor",
-        "moe_topk",
-        "moe_switch_token_num",
-        "moe_impl",
-        "moe_group_size",
-        "grouped_moe_norm_scale",
-        "zero_expert_num",
-        "zero_expert_type",
-        "ngram_vocab_size_ratio",
-        "emb_neighbor_num",
-        "emb_split_num",
-        "ngram_exclude_sp_token",
-        "ngram_fix_normalize_factor",
-        "fa_interval",
-        "linear_method",
-        "kda_nope",
-        "linear_hidden_size",
-        "linear_head_dim",
-        "linear_num_heads",
-        "linear_conv_size",
-        "kda_use_full_rank_gate",
-    )
-    assert {name: getattr(flash, name) for name in shared_fields} == {
-        name: getattr(lite, name) for name in shared_fields
-    }
-    assert flash.intermediate_size == lite.ffn_hidden_size
-    assert flash.moe_intermediate_size == lite.expert_ffn_hidden_size
-    assert flash.n_shared_experts == lite.num_shared_experts == 1
-    assert flash.linear_layer_ids == lite.linear_layer_ids
-    assert flash.full_attention_layer_ids == lite.full_attention_layer_ids
-    assert flash.layers_block_type == lite.layers_block_type
-    assert flash.oe_ignore_tokens == list(lite.special_token_ids)
-    assert flash.over_embedding_m == lite.oe_table_base_rows
+    assert config.architectures == ["FLASHLocalForCausalLM"]
+    assert config.strict_checkpoint_layout
+    assert config.intermediate_size == config.ffn_hidden_size == 96
+    assert config.moe_intermediate_size == config.expert_ffn_hidden_size == 16
+    assert config.n_shared_experts == config.num_shared_experts == 1
+    assert config.linear_layer_ids == [0, 1, 2]
+    assert config.full_attention_layer_ids == [3]
+    assert config.oe_ignore_tokens == list(config.special_token_ids)
+    assert config.over_embedding_m == config.oe_table_base_rows
 
 
 def test_shared_host_oe_accepts_the_canonical_flash_config() -> None:
@@ -129,7 +87,7 @@ def test_checkpoint_sources_preserve_current_physical_layouts(
     flash_target: str,
     lite_target: str,
 ) -> None:
-    layout = LiteCheckpointLayout(LiteConfig.from_dict(lite_config_dict()))
+    layout = FLASHLocalCheckpointLayout(FLASHLocalConfig.from_dict(lite_config_dict()))
 
     assert _canonical_flash_kda_weight_name(source_name) == flash_target
     assert layout.spec(source_name).target_name == lite_target

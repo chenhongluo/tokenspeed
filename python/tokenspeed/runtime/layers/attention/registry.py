@@ -195,7 +195,6 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "FLASHLocalForCausalLM",
     "KimiK3ForConditionalGeneration",
-    "LiteForCausalLM",
 }
 
 # Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.

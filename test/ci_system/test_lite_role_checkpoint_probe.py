@@ -33,8 +33,21 @@ from lite_role_checkpoint_probe import (
     role_mapping_kwargs,
 )
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
-from tokenspeed.runtime.models.lite import FLASHLocalForCausalLM
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
+
+
+def _real_config() -> FLASHLocalConfig:
+    return FLASHLocalConfig(
+        mla_scale_q_lora=True,
+        mla_scale_kv_lora=True,
+        ngram_vocab_size_ratio=28.8,
+        emb_neighbor_num=4,
+        emb_split_num=4,
+        ngram_exclude_sp_token=True,
+        special_token_scope="0:4,36:55",
+        ngram_fix_normalize_factor=True,
+    )
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
@@ -48,7 +61,11 @@ def test_role_mapping_and_exact_static_parameter_bytes(role) -> None:
     )
 
     with torch.device("meta"):
-        model = FLASHLocalForCausalLM(LiteConfig(), mapping(8, role=role))
+        model = FLASHLocalForCausalLM(
+            _real_config(),
+            mapping(8, role=role),
+            oe_table_placement="host",
+        )
     ledger = parameter_ledger(model)
 
     assert ledger["npu_parameter_bytes"] == EXPECTED_PARAMETER_BYTES[role]
@@ -64,9 +81,9 @@ def test_role_mapping_and_exact_static_parameter_bytes(role) -> None:
 
 
 def test_tiny_host_oe_is_excluded_from_accelerator_parameter_total() -> None:
-    config = LiteConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
     with torch.device("meta"):
-        model = FLASHLocalForCausalLM(config, mapping())
+        model = FLASHLocalForCausalLM(config, mapping(), oe_table_placement="host")
     model.model.ngram_embeddings.embedders[0].weight.data = torch.empty(
         (13, 8), dtype=torch.bfloat16
     )
