@@ -82,6 +82,11 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3MLP,
     _prepare_mla_kv_b_proj_weights,
 )
+from tokenspeed.runtime.models.flash_local_attention import (
+    PackedFLASHLocalKDA,
+    SeparateProjectionKimiLinearMLAAttention,
+    flash_local_prefers_packed_projections,
+)
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
 )
@@ -754,9 +759,9 @@ class SeperateFLASHLocal(nn.Module):
         self.linear_method = str(getattr(config, "linear_method", "FGBKDA")).upper()
         self.is_fgbkda = self.linear_method == "FGBKDA"
 
-        tp_rank = mapping.attn.tp_rank
-        tp_size = mapping.attn.tp_size
-        tp_group = mapping.attn.tp_group
+        tp_rank = mapping.linear_attn.tp_rank
+        tp_size = mapping.linear_attn.tp_size
+        tp_group = mapping.linear_attn.tp_group
 
         self.local_num_heads = self.num_heads // tp_size
         self.proj = self.num_heads * self.head_dim
@@ -951,7 +956,7 @@ class SeperateFLASHLocal(nn.Module):
             activation="silu",
             key_dim=self.proj,
             value_dim=self.proj,
-            attention_tp_size=self.mapping.attn.tp_size,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
             head_k_dim=hd,
             head_v_dim=hd,
             f_a_out=f_a_out,
@@ -1025,9 +1030,12 @@ class FLASHLocalDecoderLayer(nn.Module):
         # --- attention: KDA (linear) or gated NoPE-MLA (full); under "self_attn" ---
         attn_prefix = add_prefix("self_attn", prefix)
         if config.is_kda_layer(layer_id):
-            self.self_attn = SeperateFLASHLocal(
-                config, mapping, layer_id, quant_config, attn_prefix
-            )
+            if flash_local_prefers_packed_projections():
+                self.self_attn = PackedFLASHLocalKDA(config, mapping, layer_id)
+            else:
+                self.self_attn = SeperateFLASHLocal(
+                    config, mapping, layer_id, quant_config, attn_prefix
+                )
         else:
             # reduce_attn_results=False: the o_proj returns a TP partial and
             # CommManager.post_attn_reduce_norm owns the all-reduce / RSAG,
@@ -1043,26 +1051,35 @@ class FLASHLocalDecoderLayer(nn.Module):
             # parent builds rotary_emb iff skip_rope=False, and every rope
             # application in the absorbed-decode / chunked-prefill paths is
             # already guarded by ``self.rotary_emb is not None``.
-            self.self_attn = KimiLinearMLAAttention(
-                config=config,
-                mapping=mapping,
-                hidden_size=config.hidden_size,
-                num_heads=config.num_attention_heads,
-                qk_nope_head_dim=config.qk_nope_head_dim,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-                v_head_dim=config.v_head_dim,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=config.kv_lora_rank,
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                max_position_embeddings=max_position_embeddings,
-                quant_config=quant_config,
-                layer_id=layer_id,
-                prefix=attn_prefix,
-                reduce_attn_results=False,
-                alt_stream=alt_stream,
-                skip_rope=config.mla_use_nope,
-            )
+            if flash_local_prefers_packed_projections():
+                self.self_attn = SeparateProjectionKimiLinearMLAAttention(
+                    config,
+                    mapping,
+                    layer_id=layer_id,
+                    prefix=attn_prefix,
+                )
+            else:
+                self.self_attn = KimiLinearMLAAttention(
+                    config=config,
+                    mapping=mapping,
+                    component_mapping=mapping.mla_weight,
+                    hidden_size=config.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    qk_nope_head_dim=config.qk_nope_head_dim,
+                    qk_rope_head_dim=config.qk_rope_head_dim,
+                    v_head_dim=config.v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=config.kv_lora_rank,
+                    rope_theta=rope_theta,
+                    rope_scaling=rope_scaling,
+                    max_position_embeddings=max_position_embeddings,
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    prefix=attn_prefix,
+                    reduce_attn_results=False,
+                    alt_stream=alt_stream,
+                    skip_rope=config.mla_use_nope,
+                )
 
         # --- FFN: EveryLayer Group-MoE (no dense shortcut) ---
         # The Group-MoE block (``moe``) runs every layer; Flash-KDA's
@@ -1107,6 +1124,9 @@ class FLASHLocalDecoderLayer(nn.Module):
             prev_is_moe=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            attn_mapping=(
+                mapping.linear_attn if config.is_kda_layer(layer_id) else mapping.attn
+            ),
         )
 
     def _forward_attn(
@@ -1631,7 +1651,9 @@ class FLASHLocalForCausalLM(BaseCausalLM):
 
         for layer in self.model.layers:
             self_attn = layer.self_attn
-            if isinstance(self_attn, KimiLinearMLAAttention):
+            if isinstance(self_attn, SeparateProjectionKimiLinearMLAAttention):
+                self_attn.process_weights_after_loading()
+            elif isinstance(self_attn, KimiLinearMLAAttention):
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
                     self_attn.kv_b_proj.weight, self_attn
                 )
@@ -1645,6 +1667,8 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
+            elif isinstance(self_attn, PackedFLASHLocalKDA):
+                self_attn.process_weights_after_loading()
             elif isinstance(self_attn, SeperateFLASHLocal):
                 self_attn.fuse_conv_weights()
 

@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.models.flash_local_attention import WeightNZReplicatedLinear
 from tokenspeed.runtime.models.lite import FLASHLocalForCausalLM, _Weight
 
 
@@ -63,7 +64,8 @@ def test_lite_weight_nz_whitelist_is_exact():
     marked = {
         name: module.weight_nz
         for name, module in model.named_modules()
-        if isinstance(module, _Weight) and module.weight_nz is not None
+        if isinstance(module, (_Weight, WeightNZReplicatedLinear))
+        and module.weight_nz is not None
     }
     expected = {}
     for layer_id in range(4):

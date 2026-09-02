@@ -28,11 +28,13 @@ import pytest
 import torch
 
 from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.models.flash_local_attention import (
+    PackedFLASHLocalKDA,
+    SeparateProjectionKimiLinearMLAAttention,
+)
 from tokenspeed.runtime.models.lite import (
     FLASHLocalForCausalLM,
     LiteCheckpointLayout,
-    LiteKDAParameters,
-    LiteMLAParameters,
 )
 
 
@@ -105,6 +107,7 @@ def mapping(world_size=1, rank=0, role="prefill"):
             tp_group=(world_group if role in {"decode", "replicated"} else (rank,)),
         ),
         linear_attn=SimpleNamespace(tp_size=size, tp_rank=rank, tp_group=world_group),
+        mla_weight=SimpleNamespace(tp_size=1, tp_rank=0, tp_group=(rank,)),
         moe=SimpleNamespace(
             tp_size=1, ep_size=size, ep_rank=rank, ep_group=world_group
         ),
@@ -272,8 +275,11 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
     config = LiteConfig.from_dict(lite_config_dict())
     model = FLASHLocalForCausalLM(config, mapping(8, rank=3, role=role))
 
-    assert isinstance(model.model.layers[0].self_attn, LiteKDAParameters)
-    assert isinstance(model.model.layers[3].self_attn, LiteMLAParameters)
+    assert isinstance(model.model.layers[0].self_attn, PackedFLASHLocalKDA)
+    assert isinstance(
+        model.model.layers[3].self_attn,
+        SeparateProjectionKimiLinearMLAAttention,
+    )
     kda = model.model.layers[0].self_attn
     assert kda.input_projection.weight.shape == (24, 96)
     assert kda.input_projection.weight.numel() == (4 * 4 + 2 * 4) * 96
@@ -298,9 +304,45 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
     assert model.model.ngram_embeddings.projection.shape == (12, 8, 96)
 
 
+@pytest.mark.parametrize(("is_npu", "expected"), [(False, False), (True, True)])
+def test_flash_local_projection_layout_resolver_follows_platform(is_npu, expected):
+    import tokenspeed.runtime.models.flash_local_attention as attention
+
+    with mock.patch.object(
+        attention, "current_platform", return_value=SimpleNamespace(is_npu=is_npu)
+    ):
+        assert attention.flash_local_prefers_packed_projections() is expected
+
+
+def test_kimi_mla_default_geometry_still_follows_attention_mapping():
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
+
+    config = LiteConfig.from_dict(lite_config_dict())
+    parallel = mapping(8, rank=3, role="replicated")
+    layer = KimiLinearMLAAttention(
+        config=config,
+        mapping=parallel,
+        hidden_size=config.hidden_size,
+        num_heads=config.num_attention_heads,
+        qk_nope_head_dim=config.qk_nope_head_dim,
+        qk_rope_head_dim=config.qk_rope_head_dim,
+        v_head_dim=config.v_head_dim,
+        q_lora_rank=config.q_lora_rank,
+        kv_lora_rank=config.kv_lora_rank,
+        max_position_embeddings=config.max_position_embeddings,
+        layer_id=3,
+        skip_rope=True,
+    )
+
+    assert layer.component_mapping is parallel.attn
+    assert layer.num_local_heads == 1
+    assert layer.q_b_proj.weight.shape == (6, 24)
+    assert layer.fused_qkv_a_proj_with_mqa.weight.shape == (42, 96)
+
+
 def test_kda_merged_projection_splits_one_gemm_and_materializes_qkv():
     config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteKDAParameters(config, mapping(), layer_id=0)
+    layer = PackedFLASHLocalKDA(config, mapping(), layer_id=0)
     torch.manual_seed(1201)
     with torch.no_grad():
         layer.input_projection.weight.copy_(
@@ -323,7 +365,7 @@ def test_kda_merged_projection_splits_one_gemm_and_materializes_qkv():
 
 
 def test_kda_merged_projection_rejects_invalid_component_shape_and_id():
-    layer = LiteKDAParameters(
+    layer = PackedFLASHLocalKDA(
         LiteConfig.from_dict(lite_config_dict()), mapping(8), layer_id=0
     )
     projection = layer.input_projection
@@ -337,7 +379,7 @@ def test_kda_merged_projection_rejects_invalid_component_shape_and_id():
 def test_kda_merged_projection_meta_load_validates_without_copy():
     config = LiteConfig.from_dict(lite_config_dict())
     with torch.device("meta"):
-        layer = LiteKDAParameters(config, mapping(8), layer_id=0)
+        layer = PackedFLASHLocalKDA(config, mapping(8), layer_id=0)
 
     layer.input_projection.load_component(0, torch.empty(4, 96, dtype=torch.bfloat16))
     assert layer.input_projection.weight.is_meta

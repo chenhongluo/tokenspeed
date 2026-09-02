@@ -287,6 +287,31 @@ def test_flash_kda_maps_fgbkda_projection_weights_to_checkpoint_structure() -> N
     )
 
 
+def test_separate_kda_geometry_uses_linear_attention_mapping() -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+    from tokenspeed.runtime.models.flash_kda import SeperateFLASHLocal
+
+    config = FLASHLocalConfig(
+        hidden_size=16,
+        num_attention_heads=4,
+        qk_nope_head_dim=4,
+        linear_head_dim=4,
+        linear_num_heads=4,
+        num_hidden_layers=4,
+        fa_interval=4,
+    )
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+        linear_attn=SimpleNamespace(tp_rank=1, tp_size=2, tp_group=(0, 1)),
+    )
+
+    layer = SeperateFLASHLocal(config, mapping, layer_id=0)
+
+    assert layer.local_num_heads == 2
+    assert layer.q_proj.weight.shape == (8, 16)
+    assert layer.A_log.shape == (2,)
+
+
 def test_flash_lite_cache_allows_its_wider_recurrent_state() -> None:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         KimiK3Recipe,

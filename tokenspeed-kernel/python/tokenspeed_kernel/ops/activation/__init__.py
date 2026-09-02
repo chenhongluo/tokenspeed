@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.activation.flashinfer import (
 from tokenspeed_kernel.ops.activation.triton import (
     add3,
 )
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul as triton_sigmoid_mul
 from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul as triton_situ_and_mul
 from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
@@ -50,6 +51,27 @@ def silu_and_mul(
     ):
         return triton_silu_and_mul(x, out, enable_pdl=pdl_enabled(), limit=limit)
     return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
+
+
+def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Apply ``x *= sigmoid(gate)`` through a portable backend boundary."""
+    if current_platform().is_npu or x.device.type == "cpu":
+        if x.ndim != 2 or not x.is_contiguous():
+            raise ValueError("x must be contiguous 2D")
+        if x.dtype != gate.dtype:
+            raise ValueError(f"dtype mismatch: x={x.dtype} gate={gate.dtype}")
+        if gate.ndim == 3:
+            if (
+                gate.shape[0] != x.shape[0]
+                or gate.shape[1] * gate.shape[2] != x.shape[1]
+            ):
+                raise ValueError(f"shape mismatch: x={x.shape} gate={gate.shape}")
+            gate = gate.reshape_as(x)
+        elif gate.ndim != 2 or gate.shape != x.shape:
+            raise ValueError(f"shape mismatch: x={x.shape} gate={gate.shape}")
+        x.mul_(torch.sigmoid(gate.float()).to(x.dtype))
+        return x
+    return triton_sigmoid_mul(x, gate)
 
 
 def prepare_fp8_linear_activation(
@@ -111,6 +133,7 @@ def situ_and_mul(
 __all__ = [
     "add3",
     "prepare_fp8_linear_activation",
+    "sigmoid_mul",
     "silu_and_mul",
     "situ_and_mul",
 ]

@@ -413,7 +413,7 @@ def kimi3_mla_qkv_gate_projection(
     if solution not in {"auto", "fused", "split"}:
         raise ValueError(f"unknown Kimi K3 MLA projection solution {solution!r}")
     if solution == "auto":
-        solution = "split" if m > 32 else "fused"
+        solution = "split" if m > 32 or not hidden_states.is_cuda else "fused"
 
     if solution == "fused":
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv

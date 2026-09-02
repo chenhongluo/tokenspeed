@@ -497,9 +497,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         reduce_attn_results=True,
         alt_stream: torch.cuda.Stream | None = None,
         skip_rope: bool = False,
+        component_mapping=None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
+        self.component_mapping = component_mapping or mapping.attn
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -509,11 +511,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        if num_heads % self.mapping.attn.tp_size != 0:
+        if num_heads % self.component_mapping.tp_size != 0:
             raise ValueError(
-                f"num_heads={num_heads} must be divisible by attn_tp_size={self.mapping.attn.tp_size}."
+                f"num_heads={num_heads} must be divisible by "
+                f"component_tp_size={self.component_mapping.tp_size}."
             )
-        self.num_local_heads = num_heads // self.mapping.attn.tp_size
+        self.num_local_heads = num_heads // self.component_mapping.tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -543,9 +546,9 @@ class DeepseekV3AttentionMLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.component_mapping.tp_rank,
+                tp_size=self.component_mapping.tp_size,
+                tp_group=self.component_mapping.tp_group,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -554,9 +557,9 @@ class DeepseekV3AttentionMLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.component_mapping.tp_rank,
+                tp_size=self.component_mapping.tp_size,
+                tp_group=self.component_mapping.tp_group,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -573,9 +576,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.component_mapping.tp_rank,
+            tp_size=self.component_mapping.tp_size,
+            tp_group=self.component_mapping.tp_group,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -585,9 +588,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             reduce_results=reduce_attn_results,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.component_mapping.tp_rank,
+            tp_size=self.component_mapping.tp_size,
+            tp_group=self.component_mapping.tp_group,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 

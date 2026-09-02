@@ -31,7 +31,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tokenspeed.runtime.models.lite import LiteKDAParameters
+from tokenspeed.runtime.models.flash_local_attention import PackedFLASHLocalKDA
 
 
 def _load_reference():
@@ -248,7 +248,7 @@ def test_lite_kda_projects_featurewise_beta_and_applies_output_gate():
         linear_attn_config={"gate_lower_bound": -5.0},
     )
     mapping = SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
-    layer = LiteKDAParameters(config, mapping, layer_id=2)
+    layer = PackedFLASHLocalKDA(config, mapping, layer_id=2)
     with torch.no_grad():
         for index, parameter in enumerate(layer.parameters(), start=1):
             values = torch.arange(parameter.numel(), dtype=torch.float32).reshape(
@@ -380,7 +380,7 @@ def test_ascend_lite_model_uses_fused_output_epilogue():
         linear_attn_config={"gate_lower_bound": -5.0},
     )
     mapping = SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
-    layer = LiteKDAParameters(config, mapping, layer_id=2).to("npu")
+    layer = PackedFLASHLocalKDA(config, mapping, layer_id=2).to("npu")
     with torch.no_grad():
         for parameter in layer.parameters():
             parameter.zero_()

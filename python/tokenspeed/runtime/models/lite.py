@@ -36,12 +36,14 @@ from tokenspeed.runtime.configs.lite_config import (
     LiteConfig,
     is_lite_replicated_mla_mapping,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.unquant import create_dense_weight_pair
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.models.flash_local_attention import (
+    PackedFLASHLocalKDA,
+    SeparateProjectionKimiLinearMLAAttention,
+)
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 _EXPERT_RE = re.compile(r"^mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
@@ -448,68 +450,6 @@ class _Norm(_Weight):
         if residual is not None:
             return output, residual
         return output
-
-
-class _LiteKDAMergedProjection(nn.Module):
-    component_count = 6
-
-    def __init__(self, hidden_size: int, local_projection: int, head_dim: int):
-        super().__init__()
-        self.local_projection = local_projection
-        self.head_dim = head_dim
-        self._rows = (
-            local_projection,
-            local_projection,
-            local_projection,
-            local_projection,
-            head_dim,
-            head_dim,
-        )
-        self._offsets = (
-            0,
-            local_projection,
-            2 * local_projection,
-            3 * local_projection,
-            4 * local_projection,
-            4 * local_projection + head_dim,
-        )
-        self.weight = nn.Parameter(
-            torch.empty(sum(self._rows), hidden_size, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-
-    def load_component(self, component_id: int, local_weight: torch.Tensor) -> None:
-        if component_id < 0 or component_id >= self.component_count:
-            raise ValueError(f"Invalid Lite KDA projection component {component_id}.")
-        rows = self._rows[component_id]
-        expected = (rows, self.weight.shape[1])
-        if (
-            tuple(local_weight.shape) != expected
-            or local_weight.dtype != self.weight.dtype
-        ):
-            raise ValueError(
-                f"Lite KDA projection component {component_id} has "
-                f"shape/dtype {tuple(local_weight.shape)}/{local_weight.dtype}; "
-                f"expected {expected}/{self.weight.dtype}."
-            )
-        if not self.weight.is_meta:
-            start = self._offsets[component_id]
-            self.weight.data[start : start + rows].copy_(
-                local_weight.to(device=self.weight.device)
-            )
-
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        projected = F.linear(hidden_states, self.weight)
-        projection = self.local_projection
-        low_rank = self.head_dim
-        return (
-            projected[:, : 3 * projection].contiguous(),
-            projected[:, 3 * projection : 4 * projection],
-            projected[:, 4 * projection : 4 * projection + low_rank],
-            projected[:, 4 * projection + low_rank :],
-        )
 
 
 class _VocabEmbedding(_Weight):
@@ -933,388 +873,6 @@ class LiteGroupedMoEParameters(nn.Module):
         return routed + self._shared(hidden_states)
 
 
-class LiteKDAParameters(nn.Module):
-    def __init__(self, config: LiteConfig, mapping: Any, layer_id: int) -> None:
-        super().__init__()
-        tp = mapping.linear_attn.tp_size
-        projection = config.linear_num_heads * config.linear_head_dim
-        local_projection = projection // tp
-        self.config = config
-        self.mapping = mapping
-        self.layer_id = layer_id
-        self.local_num_heads = config.linear_num_heads // tp
-        self.head_dim = config.linear_head_dim
-        self.projection = projection
-        self.input_projection = _LiteKDAMergedProjection(
-            config.hidden_size, local_projection, config.linear_head_dim
-        )
-        self.q_conv1d = _Weight(
-            (local_projection, 1, config.linear_conv_size), torch.bfloat16
-        )
-        self.k_conv1d = _Weight(
-            (local_projection, 1, config.linear_conv_size), torch.bfloat16
-        )
-        self.v_conv1d = _Weight(
-            (local_projection, 1, config.linear_conv_size), torch.bfloat16
-        )
-        self.conv_weights: torch.Tensor | None = None
-        self.beta_b_proj = _Weight(
-            (local_projection, config.linear_head_dim), torch.bfloat16
-        )
-        self.f_b_proj = _Weight(
-            (local_projection, config.linear_head_dim), torch.bfloat16
-        )
-        self.A_log = nn.Parameter(
-            torch.empty(config.linear_num_heads // tp, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.dt_bias = nn.Parameter(
-            torch.empty(local_projection, dtype=torch.float32), requires_grad=False
-        )
-        self.o_norm = _Norm(config.linear_head_dim)
-        self.o_proj = _Weight(
-            (config.hidden_size, local_projection),
-            torch.bfloat16,
-            weight_nz="standard",
-        )
-
-    def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
-        if self.conv_weights is not None:
-            return
-        self.conv_weights = torch.cat(
-            [
-                conv.weight.squeeze(1)
-                for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
-            ],
-            dim=0,
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: Any,
-        out_cache_loc: torch.Tensor,
-        comm_manager: Any = None,
-        **_kwargs: Any,
-    ) -> torch.Tensor:
-        del positions, comm_manager
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-
-        qkv, output_gate, f_a_out, beta_down = self.input_projection(hidden_states)
-        beta_logits = F.linear(beta_down, self.beta_b_proj.weight)
-        conv_weights = self.conv_weights
-        if conv_weights is None:
-            self.process_weights_after_loading()
-            conv_weights = self.conv_weights
-        assert conv_weights is not None
-
-        core_output = ctx.attn_backend.forward(
-            q=None,
-            k=None,
-            v=None,
-            layer=None,
-            out_cache_loc=out_cache_loc,
-            token_to_kv_pool=ctx.token_to_kv_pool,
-            forward_mode=ctx.forward_mode,
-            bs=ctx.bs,
-            mixed_qkv=qkv,
-            conv_weights=conv_weights,
-            bias=None,
-            activation="silu",
-            key_dim=self.projection,
-            value_dim=self.projection,
-            attention_tp_size=self.mapping.linear_attn.tp_size,
-            head_k_dim=self.head_dim,
-            head_v_dim=self.head_dim,
-            f_a_out=f_a_out,
-            f_b_weight=self.f_b_proj.weight,
-            beta_raw=beta_logits,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            lower_bound=self.config.linear_attn_config["gate_lower_bound"],
-            output_gate=None,
-            norm_weight=None,
-            norm_eps=None,
-            layer_id=self.layer_id,
-            seq_len=hidden_states.shape[0],
-        ).reshape(-1, self.local_num_heads, self.head_dim)
-
-        if core_output.device.type in ("cuda", "npu"):
-            from tokenspeed_kernel.ops.activation.triton import (
-                rmsnorm_gated_sigmoid,
-            )
-
-            gated = rmsnorm_gated_sigmoid(
-                core_output.flatten(1).contiguous(),
-                output_gate,
-                self.o_norm.weight,
-                self.config.rms_norm_eps,
-                self.local_num_heads,
-                self.head_dim,
-            )
-        else:
-            core_fp32 = core_output.float()
-            normalized = core_fp32 * torch.rsqrt(
-                core_fp32.square().mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-            )
-            normalized = (normalized * self.o_norm.weight.float()).to(core_output.dtype)
-            output_gate = output_gate.reshape_as(normalized)
-            gated = normalized * torch.sigmoid(output_gate.float()).to(normalized.dtype)
-            gated = gated.flatten(1)
-        return F.linear(gated, self.o_proj.weight)
-
-
-class LiteMLAParameters(nn.Module):
-    def __init__(self, config: LiteConfig, mapping: Any, layer_id: int) -> None:
-        super().__init__()
-        qk_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.config = config
-        self.mapping = mapping
-        self.layer_id = layer_id
-        self.num_heads = config.num_attention_heads
-        self.qk_head_dim = qk_dim
-        self.scaling = qk_dim**-0.5
-        self.g_proj = _Weight(
-            (config.num_attention_heads * config.v_head_dim, config.hidden_size),
-            torch.bfloat16,
-        )
-        self.q_a_proj = _Weight(
-            (config.q_lora_rank, config.hidden_size),
-            torch.bfloat16,
-            weight_nz="transposed",
-        )
-        self.q_a_layernorm = _Norm(config.q_lora_rank)
-        self.q_b_proj = _Weight(
-            (config.num_attention_heads * qk_dim, config.q_lora_rank),
-            torch.bfloat16,
-            weight_nz="standard",
-        )
-        self.kv_a_proj_with_mqa = _Weight(
-            (config.kv_lora_rank + config.qk_rope_head_dim, config.hidden_size),
-            torch.bfloat16,
-            weight_nz="transposed",
-        )
-        self.kv_a_layernorm = _Norm(config.kv_lora_rank)
-        self.kv_b_proj = _Weight(
-            (
-                config.num_attention_heads
-                * (config.qk_nope_head_dim + config.v_head_dim),
-                config.kv_lora_rank,
-            ),
-            torch.bfloat16,
-        )
-        self.o_proj = _Weight(
-            (config.hidden_size, config.num_attention_heads * config.v_head_dim),
-            torch.bfloat16,
-            weight_nz="standard",
-        )
-        self.attn_mqa = PagedAttention(
-            config.num_attention_heads,
-            config.kv_lora_rank + config.qk_rope_head_dim,
-            self.scaling,
-            num_kv_heads=1,
-            layer_id=layer_id,
-            v_head_dim=config.kv_lora_rank,
-            group_id=FULL_ATTENTION,
-        )
-        self.attn_mha = PagedAttention(
-            config.num_attention_heads,
-            qk_dim,
-            self.scaling,
-            num_kv_heads=config.num_attention_heads,
-            layer_id=layer_id,
-            v_head_dim=config.v_head_dim,
-            group_id=FULL_ATTENTION,
-        )
-        self.register_buffer("w_kc", None, persistent=False)
-        self.register_buffer("w_vc", None, persistent=False)
-
-    def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
-        if self.w_kc is not None:
-            return
-        if self.config.mla_scale_q_lora:
-            self.q_a_layernorm.weight.data.mul_(
-                math.sqrt(self.config.hidden_size / self.config.q_lora_rank)
-            )
-        if self.config.mla_scale_kv_lora:
-            self.kv_a_layernorm.weight.data.mul_(
-                math.sqrt(self.config.hidden_size / self.config.kv_lora_rank)
-            )
-        packed = self.kv_b_proj.weight.unflatten(
-            0,
-            (
-                self.num_heads,
-                self.config.qk_nope_head_dim + self.config.v_head_dim,
-            ),
-        )
-        w_kc, w_vc = packed.split(
-            [self.config.qk_nope_head_dim, self.config.v_head_dim], dim=1
-        )
-        self.w_kc = w_kc.contiguous()
-        self.w_vc = w_vc.transpose(1, 2).contiguous()
-
-    def _project_q_latent(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_a = self.q_a_proj(hidden_states)
-        latent = self.kv_a_proj_with_mqa(hidden_states)
-        kv_a = latent[..., : self.config.kv_lora_rank]
-        if hidden_states.device.type == "npu":
-            from tokenspeed_kernel.ops.attention import mla_normalize_project_query
-
-            q = mla_normalize_project_query(
-                q_a,
-                kv_a,
-                self.q_a_layernorm.weight,
-                self.kv_a_layernorm.weight,
-                self.q_b_proj.weight,
-                eps=self.config.rms_norm_eps,
-            ).query
-        else:
-            q_a_fp32 = q_a.float()
-            q_norm = q_a_fp32 * torch.rsqrt(
-                q_a_fp32.square().mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-            )
-            q = F.linear(
-                (q_norm * self.q_a_layernorm.weight.float()).to(q_a.dtype),
-                self.q_b_proj.weight,
-            )
-            kv_fp32 = kv_a.float()
-            kv_a.copy_(
-                (
-                    kv_fp32
-                    * torch.rsqrt(
-                        kv_fp32.square().mean(dim=-1, keepdim=True)
-                        + self.config.rms_norm_eps
-                    )
-                    * self.kv_a_layernorm.weight.float()
-                ).to(kv_a.dtype)
-            )
-        return q, latent, F.linear(hidden_states, self.g_proj.weight)
-
-    def _write_cache(
-        self,
-        latent: torch.Tensor,
-        ctx: Any,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
-            self.attn_mqa, out_cache_loc, ctx.forward_mode
-        )
-        kv_a, auxiliary = latent.split(
-            [self.config.kv_lora_rank, self.config.qk_rope_head_dim], dim=-1
-        )
-        ctx.token_to_kv_pool.set_mla_kv_buffer(
-            self.attn_mqa,
-            out_cache_loc,
-            kv_a.unsqueeze(1),
-            auxiliary.unsqueeze(1),
-        )
-        return out_cache_loc
-
-    def _absorbed_attention(
-        self,
-        q: torch.Tensor,
-        latent: torch.Tensor,
-        gate: torch.Tensor,
-        ctx: Any,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        assert self.w_kc is not None and self.w_vc is not None
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
-        q_nope, q_auxiliary = q.split(
-            [self.config.qk_nope_head_dim, self.config.qk_rope_head_dim], dim=-1
-        )
-        q_absorbed = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
-        q_absorbed = torch.cat((q_absorbed, q_auxiliary), dim=-1)
-        self._write_cache(latent, ctx, out_cache_loc)
-        latent_output = self.attn_mqa(
-            q_absorbed,
-            None,
-            None,
-            ctx,
-            out_cache_loc,
-            save_kv_cache=False,
-        ).view(-1, self.num_heads, self.config.kv_lora_rank)
-        if latent_output.device.type == "npu":
-            from tokenspeed_kernel.ops.attention import mla_project_value
-
-            return mla_project_value(latent_output, self.w_vc, gate=gate)
-        projected = torch.bmm(
-            latent_output.transpose(0, 1).contiguous(), self.w_vc
-        ).transpose(0, 1)
-        projected = projected.reshape(latent_output.shape[0], -1)
-        projected.mul_(torch.sigmoid(gate).to(projected.dtype))
-        return projected
-
-    def _explicit_prefill(
-        self,
-        q: torch.Tensor,
-        latent: torch.Tensor,
-        gate: torch.Tensor,
-        ctx: Any,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
-        kv_a, auxiliary = latent.split(
-            [self.config.kv_lora_rank, self.config.qk_rope_head_dim], dim=-1
-        )
-        kv = F.linear(kv_a, self.kv_b_proj.weight).view(
-            -1,
-            self.num_heads,
-            self.config.qk_nope_head_dim + self.config.v_head_dim,
-        )
-        k_nope, v = kv.split(
-            [self.config.qk_nope_head_dim, self.config.v_head_dim], dim=-1
-        )
-        k = torch.cat(
-            (k_nope, auxiliary.unsqueeze(1).expand(-1, self.num_heads, -1)), dim=-1
-        )
-        self._write_cache(latent, ctx, out_cache_loc)
-        output = self.attn_mha(
-            q,
-            k,
-            v,
-            ctx,
-            out_cache_loc,
-            save_kv_cache=False,
-        ).view(q.shape[0], -1)
-        output.mul_(torch.sigmoid(gate).to(output.dtype))
-        return output
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: Any,
-        out_cache_loc: torch.Tensor,
-        comm_manager: Any = None,
-        **_kwargs: Any,
-    ) -> torch.Tensor:
-        del positions, comm_manager
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        if ctx.forward_mode.is_mixed() or ctx.forward_mode.is_idle():
-            raise NotImplementedError(
-                "Lite MLA phase 5 supports pure Prefill or Decode"
-            )
-        if self.w_kc is None:
-            self.process_weights_after_loading()
-        q, latent, gate = self._project_q_latent(hidden_states)
-        cached_extend = ctx.forward_mode.is_extend() and getattr(
-            ctx.attn_backend.chunked_prefill_metadata,
-            "use_absorbed_cached_extend",
-            False,
-        )
-        if ctx.forward_mode.is_decode() or cached_extend:
-            output = self._absorbed_attention(q, latent, gate, ctx, out_cache_loc)
-        else:
-            output = self._explicit_prefill(q, latent, gate, ctx, out_cache_loc)
-        return F.linear(output, self.o_proj.weight)
-
-
 class LiteDecoderLayer(nn.Module):
     def __init__(self, config: LiteConfig, mapping: Any, layer_id: int) -> None:
         super().__init__()
@@ -1322,9 +880,14 @@ class LiteDecoderLayer(nn.Module):
         self.is_kda = config.is_kda_layer(layer_id)
         self.input_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = (
-            LiteKDAParameters(config, mapping, layer_id)
+            PackedFLASHLocalKDA(config, mapping, layer_id)
             if self.is_kda
-            else LiteMLAParameters(config, mapping, layer_id)
+            else SeparateProjectionKimiLinearMLAAttention(
+                config,
+                mapping,
+                layer_id=layer_id,
+                prefix=f"model.layers.{layer_id}.self_attn",
+            )
         )
         self.post_attention_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.mlp = LiteGroupedMoEParameters(config, mapping)
@@ -1996,7 +1559,6 @@ class LiteForCausalLM(nn.Module):
             local_expert_ids=self._local_expert_ids(),
         )
         expected_targets = set(params)
-        modules = dict(self.named_modules())
         seen_sources: set[str] = set()
         loaded_targets: set[str] = set()
         packed_components: dict[str, set[int]] = {}
@@ -2050,11 +1612,11 @@ class LiteForCausalLM(nn.Module):
                     raise ValueError(
                         f"Missing Lite KDA component for {spec.source_name!r}."
                     )
-                module_name = spec.target_name.removesuffix(".weight")
-                module = modules.get(module_name)
-                if not isinstance(module, _LiteKDAMergedProjection):
+                param = params.get(spec.target_name)
+                weight_loader = getattr(param, "weight_loader", None)
+                if param is None or weight_loader is None:
                     raise ValueError(
-                        f"Missing Lite KDA projection target {module_name!r}."
+                        f"Missing Lite KDA projection target {spec.target_name!r}."
                     )
                 components = packed_components.setdefault(spec.target_name, set())
                 if spec.component_id in components:
@@ -2062,11 +1624,13 @@ class LiteForCausalLM(nn.Module):
                         f"Duplicate Lite KDA projection component "
                         f"{spec.component_id} for {spec.target_name!r}."
                     )
-                module.load_component(
-                    spec.component_id, self._local_weight(spec, loaded_weight)
+                weight_loader(
+                    param,
+                    self._local_weight(spec, loaded_weight),
+                    spec.component_id,
                 )
                 components.add(spec.component_id)
-                if len(components) == module.component_count:
+                if len(components) == 6:
                     loaded_targets.add(spec.target_name)
                 continue
             if spec.target_name in loaded_targets:
@@ -2098,7 +1662,8 @@ class LiteForCausalLM(nn.Module):
                     f"{tuple(local_weight.shape)}/{spec.dtype}."
                 )
             if not param.is_meta:
-                param.copy_(local_weight.to(device=param.device))
+                with torch.no_grad():
+                    param.copy_(local_weight.to(device=param.device))
             loaded_targets.add(spec.target_name)
 
         missing_sources = sorted(expected_sources.difference(seen_sources))
