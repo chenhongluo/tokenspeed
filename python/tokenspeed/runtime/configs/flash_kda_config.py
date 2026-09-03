@@ -327,6 +327,8 @@ class FLASHLocalConfig(PretrainedConfig):
         activation_situ_linear_beta: float | None = 25.0,
         rms_norm_eps: float = 1e-5,
         max_position_embeddings: int = 8192,
+        # Released Flash-Lite checkpoint fields, migrated from the removed
+        # LiteConfig. Legacy Flash-KDA configs keep these no-op defaults.
         use_cache: bool = True,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
@@ -742,7 +744,9 @@ class FLASHLocalConfig(PretrainedConfig):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         mapping = global_server_args_dict["mapping"]
-        attn_tp_size = mapping.linear_attn.tp_size
+        # KDA state follows the KDA head shard. ``mapping.attn`` may instead
+        # describe an independent MLA CP/DP execution domain.
+        linear_attn_tp_size = mapping.linear_attn.tp_size
 
         la = self.linear_attn_config
         num_heads = la["linear_num_heads"]
@@ -751,11 +755,11 @@ class FLASHLocalConfig(PretrainedConfig):
 
         conv_dim = 3 * num_heads * head_dim
         conv_state_shape = (
-            divide(conv_dim, attn_tp_size),
+            divide(conv_dim, linear_attn_tp_size),
             conv_kernel_size - 1,
         )
         temporal_state_shape = (
-            divide(num_heads, attn_tp_size),
+            divide(num_heads, linear_attn_tp_size),
             head_dim,
             head_dim,
         )

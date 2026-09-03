@@ -267,6 +267,9 @@ class ModelExecutorConfig:
             getattr(text_config, "ple_layer_ids", None)
             or getattr(text_config, "indexer_n_heads", None) is not None
         )
+        # This is keyed by OE state ownership, not Host/Device placement. Both
+        # admitted providers currently depend on token-indexed state that the
+        # Prefill graph input ABI cannot rebind safely; Decode graph is separate.
         disable_prefill_graph = (
             bool(server_args.disable_prefill_graph)
             or (model_config.attention_arch == AttentionArch.DSA)

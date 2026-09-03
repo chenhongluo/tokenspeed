@@ -472,6 +472,13 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 
 class DeepseekV3AttentionMLA(nn.Module):
+    """MLA semantics with independently selectable execution and weight domains.
+
+    ``mapping.attn`` owns attention/cache execution. ``component_mapping`` owns
+    only head geometry and q-b/kv-b/o projection sharding, and defaults to
+    ``mapping.attn`` so existing models are unchanged.
+    """
+
     # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
     _MLA_KERNEL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
     # Backends that support chunked ragged prefill with prefix replay.

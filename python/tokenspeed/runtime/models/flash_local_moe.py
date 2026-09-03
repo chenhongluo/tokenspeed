@@ -37,7 +37,12 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def flash_local_prefers_packed_moe() -> bool:
-    """Resolve the initial FLASHLocal Grouped MoE physical layout."""
+    """Select the Grouped MoE physical leaf at model construction.
+
+    Ascend packs each rank's group-balanced EP-owned experts into ``w13/w2``
+    containers for its fused executor. Other backends retain the existing
+    ``MoELayer`` layout. Routing math and checkpoint source keys are shared.
+    """
     return current_platform().is_npu
 
 
@@ -257,7 +262,11 @@ class _PackedSharedExpert(nn.Module):
 
 
 class PackedFLASHLocalMoE(nn.Module):
-    """FLASHLocal Grouped MoE with the validated packed Ascend layout."""
+    """FLASHLocal Grouped MoE with the validated packed Ascend layout.
+
+    ``packed`` means EP-local runtime expert storage and the Ascend collective
+    schedule; it does not mean a different checkpoint format or routing rule.
+    """
 
     def __init__(self, config: Any, mapping: Any) -> None:
         super().__init__()
@@ -334,6 +343,11 @@ class PackedFLASHLocalMoE(nn.Module):
     def load_group_router_weight(
         self, group_id: int, field: str, loaded_weight: torch.Tensor
     ) -> None:
+        """Load one group router into its separate Ascend runtime module.
+
+        Expert ownership is independent: every EP rank owns an equal slice from
+        every group, as defined by ``grouped_moe_local_expert_ids``.
+        """
         if not 0 <= group_id < len(self.expert_groups):
             raise ValueError(f"Invalid FLASHLocal router group {group_id}.")
         router = self.expert_groups[group_id].router

@@ -116,7 +116,14 @@ def resolve_oe_runtime_plan(
     device: str,
     capabilities: Mapping[str, Mapping[str, str]],
 ) -> tuple[str | None, str | None]:
-    """Resolve one class-declared OE table/state implementation pair."""
+    """Resolve OE storage and state ownership before model construction.
+
+    Table placement and context-state ownership are separate concerns, but only
+    model/backend pairs declared in ``capabilities`` are safe to construct. A
+    single early resolution keeps the model leaf, cache recipe, request-history
+    allocation, and graph admission on the same validated pair. ``auto`` prefers
+    Device storage; explicit unsupported choices fail instead of falling back.
+    """
     if requested_placement not in {"auto", "host", "device"}:
         raise ValueError(
             "oe_table_placement must be one of auto, host, or device; "

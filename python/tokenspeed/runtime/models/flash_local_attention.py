@@ -40,7 +40,12 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def flash_local_prefers_packed_projections() -> bool:
-    """Resolve the initial FLASHLocal physical projection capability."""
+    """Select a physical projection layout once during model construction.
+
+    Ascend uses the packed KDA and separate Weight-NZ MLA leaves; other
+    backends keep the existing separate KDA and fused Kimi MLA leaves. The
+    checkpoint schema and attention math are unchanged.
+    """
     return current_platform().is_npu
 
 
@@ -93,7 +98,11 @@ class WeightNZReplicatedLinear(ReplicatedLinear):
 
 
 class PackedKDAProjection(nn.Module):
-    """One physical parameter for q/k/v/g/f-a/b-a checkpoint components."""
+    """Pack six separate checkpoint projections into one runtime GEMM weight.
+
+    The component-aware loader writes q/k/v/g/f-a/b-a into fixed row slices;
+    ``forward`` performs one projection and returns the same semantic tensors.
+    """
 
     component_count = 6
 
@@ -329,7 +338,13 @@ class PackedFLASHLocalKDA(nn.Module):
 
 
 class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
-    """Shared Kimi MLA dataflow with separate Weight-NZ-capable projections."""
+    """Shared Kimi MLA dataflow with separate Weight-NZ-capable projections.
+
+    Here ``separate`` describes the Ascend runtime parameters: q-a, kv-a, and
+    output-gate weights remain distinct instead of using Kimi's fused input
+    parameter. All cache, Prefill, absorbed-Decode, and output-gate math stays in
+    the inherited implementation.
+    """
 
     def __init__(
         self,

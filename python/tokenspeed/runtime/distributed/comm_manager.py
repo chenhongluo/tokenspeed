@@ -30,7 +30,12 @@ from tokenspeed.runtime.execution.context import ForwardContext
 
 
 class CommManager:
-    """Manages communication patterns (all_reduce vs RSAG) for each decoder layer."""
+    """Manage all-reduce/RSAG using the current layer's attention domain.
+
+    Most decoders use ``mapping.attn``. Hybrid decoders may inject
+    ``mapping.linear_attn`` for a KDA layer whose head/state TP differs from the
+    MLA execution/cache topology; both implement ``AttentionLayerMapping``.
+    """
 
     def __init__(
         self,

@@ -572,6 +572,13 @@ class FLASHLocalMoE(nn.Module):
     def load_group_router_weight(
         self, group_id: int, field: str, loaded_weight: torch.Tensor
     ) -> None:
+        """Load one separately stored checkpoint router into CUDA fused storage.
+
+        A ``[E, H/G]`` classifier is copied into group ``g``'s column slice of
+        the runtime ``[E, H]`` classifier; correction-bias slices are placed
+        analogously. This reconstructs router storage only. Expert placement is
+        handled separately by the EP loader and is not group-colocated here.
+        """
         if not 0 <= group_id < self.moe_group_size:
             raise ValueError(f"Invalid FLASHLocal router group {group_id}.")
         if field == "classifier.weight":
@@ -1138,6 +1145,9 @@ class FLASHLocalDecoderLayer(nn.Module):
                 "Flash-KDA requires EveryLayer-MoE (first_k_dense_replace=0); "
                 f"got layer {layer_id} not flagged as MoE."
             )
+        # Both leaves implement the same four-group routing math. ``packed``
+        # denotes Ascend's group-major EP-local w13/w2 runtime storage; CUDA
+        # retains the existing MoELayer layout and kernels.
         self.moe = (
             PackedFLASHLocalMoE(config, mapping)
             if flash_local_prefers_packed_moe()
@@ -1492,6 +1502,13 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         )
 
     def resolve_lm_head(self, config, quant_config, prefix):
+        """Construct the head in the domain that owns the final hidden state.
+
+        The migrated Host-OE/NPU leaf follows the dense TP/DP domain used by the
+        former Lite entry. Device-OE/GPU keeps BaseCausalLM's existing attention
+        domain. Process-group initialization cannot own this choice because it
+        has no model, vocabulary, quantization, or layer-construction context.
+        """
         if self.oe_table_placement != "host":
             return super().resolve_lm_head(config, quant_config, prefix)
         if self.mapping.dense.has_dp:
@@ -1595,10 +1612,11 @@ class FLASHLocalForCausalLM(BaseCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load the ``model.*`` / ``lm_head.*`` text weights.
 
-        Reuses the DeepSeek / Kimi-K3 machinery for MLA and MoE, while KDA
-        weights follow Flash-KDA's separate Megatron-style layout
-        (q/k/v, f_proj, g_proj, b_proj, q/k/v_conv1d, A_log, dt_bias,
-        o_norm, o_proj).
+        Model-owned ``load_weights`` is the repository convention for mapping a
+        checkpoint schema onto model-specific parameters. This implementation
+        keeps source keys stable, validates strict Flash-Lite streams, and lets
+        the selected KDA/MLA/MoE/OE target leaf own packing and sharding. Legacy
+        Flash-KDA still follows its separate Megatron-style KDA layout.
         """
         config = self.config
         stacked_params_mapping = [

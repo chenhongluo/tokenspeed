@@ -350,7 +350,13 @@ class LongCatOverEmbedding(nn.Module):
 
 
 class HostLongCatOverEmbedding(nn.Module):
-    """Host-resident OE tables plus Device projection and staged activations."""
+    """Host-table OE leaf migrated from the former Lite model entry.
+
+    It stays separate from ``LongCatOverEmbedding`` because its physical ABI is
+    different: table weights remain on CPU, raw activations are staged to the
+    accelerator, and request context comes from checkpointed three-token tails.
+    Both leaves implement the same word-plus-n-gram embedding semantics.
+    """
 
     def __init__(self, config: Any) -> None:
         super().__init__()
