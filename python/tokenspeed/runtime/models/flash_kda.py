@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Callable, Iterable
 
@@ -51,7 +50,6 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -80,8 +78,6 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
-    DeepseekV3AttentionMLA,
-    DeepseekV3FusedQkvAProjWithMqa,
     DeepseekV3MLP,
     _prepare_mla_kv_b_proj_weights,
 )
