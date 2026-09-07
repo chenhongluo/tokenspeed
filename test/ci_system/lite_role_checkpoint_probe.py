@@ -69,6 +69,7 @@ def role_mapping_kwargs(role: str) -> dict[str, int]:
             "moe_tp_size": 1,
             "moe_ep_size": 8,
             "linear_attn_tp_size": 8,
+            "mla_weight_tp_size": 1,
         }
     if role == "decode":
         return {
@@ -79,6 +80,7 @@ def role_mapping_kwargs(role: str) -> dict[str, int]:
             "moe_tp_size": 1,
             "moe_ep_size": 8,
             "linear_attn_tp_size": 8,
+            "mla_weight_tp_size": 1,
         }
     raise ValueError(f"Unknown Lite role {role!r}.")
 
@@ -89,9 +91,9 @@ def _parameter_category(name: str, config: Any) -> str:
     if ".self_attn." in name:
         layer_id = int(name.split(".layers.", 1)[1].split(".", 1)[0])
         return "kda" if config.is_kda_layer(layer_id) else "mla"
-    if ".mlp.experts." in name:
+    if ".moe.experts." in name:
         return "moe_experts"
-    if ".mlp." in name:
+    if ".moe." in name:
         return "grouped_moe"
     if ".ngram_embeddings.embedders." in name:
         return "host_oe"
@@ -277,6 +279,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         mapping.attn.tp_group,
         mapping.attn.dp_group,
         mapping.linear_attn.tp_group,
+        mapping.mla_weight.tp_group,
         mapping.dense.tp_group,
         mapping.moe.tp_ep_group,
     ):

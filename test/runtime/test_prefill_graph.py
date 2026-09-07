@@ -241,15 +241,12 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertFalse(graph.disable)
         capture.assert_not_called()
 
-    def test_context_dependent_embedding_disables_prefill_graph(self):
+    def test_request_history_capability_disables_prefill_graph(self):
         from unittest import mock
 
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
-            model=SimpleNamespace(
-                model=inner_model,
-                requires_request_token_history=True,
-            ),
+            model=SimpleNamespace(model=inner_model),
             is_generation=True,
             is_multimodal=False,
         )
@@ -257,6 +254,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             enforce_eager=False,
             disable_prefill_graph=False,
             data_parallel_size=1,
+            requires_request_token_history=True,
         )
         with mock.patch(
             "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",

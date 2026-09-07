@@ -711,8 +711,8 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
-    requires_request_token_history = bool(
-        getattr(target.model, "requires_request_token_history", False)
+    requires_request_token_history = (
+        model_config.oe_state_provider == "runtime-full-history"
     )
     executor = create_model_executor(
         server_args=server_args,

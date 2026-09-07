@@ -25,12 +25,17 @@ from tokenspeed.runtime.distributed.comm_ops import (
     token_all_gather,
     token_reduce_scatter,
 )
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import AttentionLayerMapping, Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 
 
 class CommManager:
-    """Manages communication patterns (all_reduce vs RSAG) for each decoder layer."""
+    """Manage all-reduce/RSAG using the current layer's attention domain.
+
+    Most decoders use ``mapping.attn``. Hybrid decoders may inject
+    ``mapping.linear_attn`` for a KDA layer whose head/state TP differs from the
+    MLA execution/cache topology; both implement ``AttentionLayerMapping``.
+    """
 
     def __init__(
         self,
@@ -40,8 +45,10 @@ class CommManager:
         prev_is_moe: bool,
         input_layernorm: torch.nn.Module | None = None,
         post_attn_layernorm: torch.nn.Module | None = None,
+        attn_mapping: AttentionLayerMapping | None = None,
     ) -> None:
         self.mapping = mapping
+        self.attn_mapping = attn_mapping or mapping.attn
         self.layer_id = layer_id
         self.is_moe = is_moe
         self.prev_is_moe = prev_is_moe
@@ -67,14 +74,14 @@ class CommManager:
         )
         if global_counts is not None:
             scattered = []
-            for attn_dp_rank in range(self.mapping.attn.dp_size):
+            for attn_dp_rank in range(self.attn_mapping.dp_size):
                 # global_counts is indexed by global rank with dp stride
                 # tp_size * cp_size; cp peers report the same count.
                 num_tokens = global_counts[
-                    attn_dp_rank * self.mapping.attn.tp_size * self.mapping.attn.cp_size
+                    attn_dp_rank * self.attn_mapping.tp_size * self.attn_mapping.cp_size
                 ]
                 scattered.extend(
-                    self._scatter_count(num_tokens, self.mapping.attn.tp_size)
+                    self._scatter_count(num_tokens, self.attn_mapping.tp_size)
                 )
             return scattered
         num_tokens = (
@@ -82,11 +89,11 @@ class CommManager:
             if ctx.collective_num_tokens is not None
             else ctx.input_num_tokens
         )
-        return self._scatter_count(num_tokens, self.mapping.attn.tp_size)
+        return self._scatter_count(num_tokens, self.attn_mapping.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
-        start = self.mapping.attn.tp_size * self.mapping.attn.dp_rank
-        end = start + self.mapping.attn.tp_size
+        start = self.attn_mapping.tp_size * self.attn_mapping.dp_rank
+        end = start + self.attn_mapping.tp_size
         return self.scattered_num_tokens(ctx)[start:end]
 
     def dense_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
@@ -103,13 +110,13 @@ class CommManager:
         )
         # Without DP, all ranks share the batch and the scattered table needs
         # no global metadata, so the lookup below stays valid.
-        if global_counts is not None or not self.mapping.attn.has_dp:
+        if global_counts is not None or not self.attn_mapping.has_dp:
             # After post_attn_comm reduce-scatter, each rank holds its
             # scattered share of its attn dp group's tokens, not the raw
             # global count; MoE collectives must size from those rows.
             scattered = self.scattered_num_tokens(ctx)
             return [
-                scattered[self.mapping.attn.scatter_index(rank)]
+                scattered[self.attn_mapping.scatter_index(rank)]
                 for rank in self.mapping.moe.tp_ep_group
             ]
         # With DP but no gathered metadata, other dp groups' counts are
@@ -127,14 +134,14 @@ class CommManager:
 
     def use_all_reduce(self, is_moe: bool):
         if is_moe:
-            return self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
-        return self.mapping.attn.tp_size == self.mapping.dense.tp_size
+            return self.attn_mapping.tp_size == self.mapping.moe.tp_ep_size
+        return self.attn_mapping.tp_size == self.mapping.dense.tp_size
 
     def pre_attn_comm(self, hidden_states: torch.Tensor, ctx: ForwardContext):
         if self.layer_id == 0:
             return hidden_states
 
-        if not self.mapping.has_attn_tp:
+        if not self.attn_mapping.has_tp:
             return hidden_states
 
         if self.use_all_reduce(self.prev_is_moe):
@@ -142,7 +149,7 @@ class CommManager:
 
         return token_all_gather(
             hidden_states,
-            group=self.mapping.attn.tp_group,
+            group=self.attn_mapping.tp_group,
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
 
@@ -154,45 +161,45 @@ class CommManager:
         """
         if self.layer_id == 0:
             return residual
-        if not self.mapping.has_attn_tp:
+        if not self.attn_mapping.has_tp:
             return residual
         if self.use_all_reduce(self.prev_is_moe):
             return residual
         return token_all_gather(
             residual,
-            group=self.mapping.attn.tp_group,
+            group=self.attn_mapping.tp_group,
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
 
     def post_attn_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if not self.mapping.has_attn_tp:
+        if not self.attn_mapping.has_tp:
             return hidden_states, residual
 
         if self.use_all_reduce(self.is_moe):
-            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
+            hidden_states = all_reduce(hidden_states, self.attn_mapping.tp_group)
             # The output residual is expected to have attn_tp_num_tokens.
             # For first layer, the input residual has attn_tp_num_tokens.
             # Otherwise, if this layer experiences a RSAG -> AR switch, residual needs allgather.
             if self.layer_id > 0 and not self.use_all_reduce(self.prev_is_moe):
                 residual = token_all_gather(
                     residual,
-                    group=self.mapping.attn.tp_group,
+                    group=self.attn_mapping.tp_group,
                     scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
                 )
         else:
             token_list = self.attn_tp_group_scattered_num_tokens(ctx)
             hidden_states = token_reduce_scatter(
                 hidden_states,
-                group=self.mapping.attn.tp_group,
+                group=self.attn_mapping.tp_group,
                 scattered_num_tokens=token_list,
             )
             # The output residual is expected to have scattered_num_tokens.
             # For first layer, the input residual has attn_tp_num_tokens, so needs slice.
             # Otherwise, if this layer experiences a AR -> RSAG switch, residual needs slice.
             if self.layer_id == 0 or self.use_all_reduce(self.prev_is_moe):
-                offset = sum(token_list[: self.mapping.attn.tp_rank])
+                offset = sum(token_list[: self.attn_mapping.tp_rank])
                 residual = residual[offset : offset + hidden_states.size(0)]
 
         return hidden_states, residual
@@ -272,13 +279,13 @@ class CommManager:
     def post_final_norm_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if not self.mapping.has_attn_tp:
+        if not self.attn_mapping.has_tp:
             return hidden_states, residual
         if self.use_all_reduce(self.is_moe):
             return hidden_states, residual
         hidden_states = token_all_gather(
             hidden_states,
-            group=self.mapping.attn.tp_group,
+            group=self.attn_mapping.tp_group,
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
         return hidden_states, residual
@@ -290,7 +297,7 @@ class CommManager:
 
         return (
             self.use_all_reduce(self.is_moe)
-            and self.mapping.has_attn_tp
+            and self.attn_mapping.has_tp
             and global_server_args_dict.get("enable_allreduce_fusion", False)
         )
 
@@ -312,8 +319,8 @@ class CommManager:
         elif self.should_fuse(hidden_states.shape[0]):
             hidden_states, residual, *_ = (
                 self.input_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
+                    self.attn_mapping.tp_rank,
+                    self.attn_mapping.tp_group,
                     hidden_states,
                     residual,
                 )
@@ -328,8 +335,8 @@ class CommManager:
         if self.should_fuse(hidden_states.shape[0]):
             hidden_states, residual, *_ = (
                 self.post_attn_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
+                    self.attn_mapping.tp_rank,
+                    self.attn_mapping.tp_group,
                     hidden_states,
                     residual,
                 )
@@ -359,8 +366,8 @@ class CommManager:
 
         if self.should_fuse(hidden_states.shape[0]):
             hidden_states, residual_out, *_ = norm.forward_with_allreduce_fusion(
-                self.mapping.attn.tp_rank,
-                self.mapping.attn.tp_group,
+                self.attn_mapping.tp_rank,
+                self.attn_mapping.tp_group,
                 hidden_states,
                 residual,
             )

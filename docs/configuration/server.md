@@ -121,6 +121,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
 | `--linear-attn-tp-size` | Tensor parallel size for linear-attention layers. Defaults to attention TP. |
+| `--mla-weight-tp-size` | Tensor parallel size for MLA parameters. Defaults to attention TP and may differ from the attention execution group. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |

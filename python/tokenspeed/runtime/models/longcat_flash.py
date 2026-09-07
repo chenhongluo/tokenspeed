@@ -806,6 +806,10 @@ class _RuntimeLongcatDSAModel(_RuntimeLongcatModel):
 
 class LongcatFlashForCausalLM(_BaseCausalLM):
     model_cls = _RuntimeLongcatModel
+    oe_runtime_capabilities = {
+        "cuda": {"device": "runtime-full-history"},
+        "npu": {"device": "runtime-full-history"},
+    }
 
     def __init__(
         self,
@@ -823,8 +827,6 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             quant_config=quant_config,
             prefix=prefix,
         )
-        embed = self.model.embed_tokens
-        self.requires_request_token_history = isinstance(embed, _LongCatOverEmbedding)
 
     def resolve_model(
         self,

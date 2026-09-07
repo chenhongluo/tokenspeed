@@ -60,12 +60,12 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
     rmsnorm_gated_sigmoid,
-    sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention import mla_normalize_project_query
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd, attn_res_fwd_available
@@ -331,6 +331,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         prefix: str = "",
         reduce_attn_results: bool = True,
         alt_stream: torch.cuda.Stream | None = None,
+        component_mapping=None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -352,6 +353,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             reduce_attn_results=reduce_attn_results,
             alt_stream=alt_stream,
             skip_rope=True,  # K3 MLA is NoPE (mla_use_nope=True)
+            component_mapping=component_mapping,
         )
         self.use_output_gate = config.mla_use_output_gate
         if self.use_output_gate:
@@ -362,7 +364,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # kernel is shape-locked to 2112 rows and measures below nvjet's
             # effective bandwidth here anyway.)
             self._qkv_a_width = q_lora_rank + kv_lora_rank + qk_rope_head_dim
-            self._gate_width = num_heads * v_head_dim // mapping.attn.tp_size
+            self._gate_width = num_heads * v_head_dim // self.component_mapping.tp_size
             fused_prefix = add_prefix("fused_qkv_a_proj_with_mqa", prefix)
             fused_out = self._qkv_a_width + self._gate_width
             # FP8_PB_WO (w8a8) fused projection: pad the output rows to the

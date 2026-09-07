@@ -144,6 +144,22 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    from tokenspeed.runtime.configs.model_config import resolve_oe_runtime_plan
+
+    text_config = model_config.hf_text_config
+    use_over_embedding = bool(
+        getattr(text_config, "use_over_embedding", False)
+        or getattr(text_config, "ngram_vocab_size_ratio", None) is not None
+        or getattr(text_config, "oe_vocab_size_ratio", None) is not None
+    )
+    placement, state_provider = resolve_oe_runtime_plan(
+        use_over_embedding=use_over_embedding,
+        requested_placement=model_config._oe_table_placement_request,
+        device=model_config.device,
+        capabilities=getattr(model_class, "oe_runtime_capabilities", {}),
+    )
+    model_config.oe_table_placement = placement
+    model_config.oe_state_provider = state_provider
     quant_config = _get_quantization_config(model_config, load_config)
     if quant_config is not None:
         replacements = getattr(model_class, "quant_module_name_replacements", None)
@@ -155,6 +171,8 @@ def _initialize_model(
     if model_config.is_multimodal:
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
+    if getattr(model_class, "supports_oe_table_placement", False):
+        extra_kwargs["oe_table_placement"] = placement
     return model_class(
         config=model_config.hf_config,
         mapping=mapping,

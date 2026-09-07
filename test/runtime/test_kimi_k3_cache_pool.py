@@ -16,6 +16,21 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 
+def test_kda_geometry_uses_linear_attention_mapping() -> None:
+    recipe = kimi_recipe(tp_size=8)
+    recipe.attn_config.attn_tp_size = 1
+    recipe._text_config.model_type = "not-lite"
+    linear = recipe._text_config.linear_attn_config
+
+    assert recipe._kda_shapes == (
+        (
+            3 * linear["num_heads"] * linear["head_dim"] // 8,
+            linear["short_conv_kernel_size"] - 1,
+        ),
+        (linear["num_heads"] // 8, linear["head_dim"], linear["head_dim"]),
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     text_config = KimiLinearConfig()

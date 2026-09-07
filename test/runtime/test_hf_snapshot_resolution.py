@@ -515,7 +515,6 @@ class HFSnapshotResolutionTests(unittest.TestCase):
     def test_longcat_tokenizers_enable_mistral_regex_fix(self) -> None:
         for architecture in (
             "FLASHLocalForCausalLM",
-            "LiteForCausalLM",
             "LongcatCausalLM",
         ):
             with self.subTest(architecture=architecture):

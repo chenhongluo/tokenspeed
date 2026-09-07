@@ -267,14 +267,14 @@ class ModelExecutorConfig:
             getattr(text_config, "ple_layer_ids", None)
             or getattr(text_config, "indexer_n_heads", None) is not None
         )
-        lite_has_host_oe = "LiteForCausalLM" in (
-            getattr(text_config, "architectures", None) or ()
-        )
+        # This is keyed by OE state ownership, not Host/Device placement. Both
+        # admitted providers currently depend on token-indexed state that the
+        # Prefill graph input ABI cannot rebind safely; Decode graph is separate.
         disable_prefill_graph = (
             bool(server_args.disable_prefill_graph)
             or (model_config.attention_arch == AttentionArch.DSA)
             or qwen4_exp_has_side_state
-            or lite_has_host_oe
+            or getattr(model_config, "oe_state_provider", None) is not None
         )
 
         return ModelExecutorConfig(

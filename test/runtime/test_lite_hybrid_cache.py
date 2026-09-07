@@ -27,13 +27,13 @@ from typing import Any
 import pytest
 import torch
 
-from tokenspeed.runtime.configs.lite_config import LiteConfig
+from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
 
-_ARCHITECTURE = "LiteForCausalLM"
+_ARCHITECTURE = "FLASHLocalForCausalLM"
 _STATE_GROUPS = tuple(f"{LINEAR_ATTENTION}_{index}" for index in range(3))
 
 
@@ -58,13 +58,15 @@ def _lite_recipe(
 ) -> Any:
     try:
         from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.lite import LiteRecipe
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.checkpointed_tail_oe import (
+            CheckpointedTailOERecipe,
+        )
     except ModuleNotFoundError as exc:
         if exc.name == "compressed_tensors":
             pytest.skip("full attention config dependencies are not installed")
         raise
 
-    text_config = LiteConfig()
+    text_config = FLASHLocalConfig()
     text_config.architectures = [_ARCHITECTURE]
     attn_config = MLAConfig(
         device=device,
@@ -91,7 +93,7 @@ def _lite_recipe(
         max_scheduled_tokens=128,
         pd_disaggregation_enabled=True,
     )
-    return LiteRecipe(
+    return CheckpointedTailOERecipe(
         server_args=SimpleNamespace(
             max_total_tokens=token_limit,
             chunked_prefill_size=128,
@@ -101,7 +103,10 @@ def _lite_recipe(
                 linear_attn=SimpleNamespace(tp_size=tp_size),
             ),
         ),
-        model_config=SimpleNamespace(hf_config=text_config),
+        model_config=SimpleNamespace(
+            hf_config=text_config,
+            oe_state_provider="cache-checkpointed-tail",
+        ),
         attn_config=attn_config,
         draft_model_config=None,
         draft_attn_config=None,
@@ -194,13 +199,14 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
             pytest.skip("full attention config dependencies are not installed")
         raise
 
-    text_config = LiteConfig()
+    text_config = FLASHLocalConfig()
     text_config.architectures = [_ARCHITECTURE]
     mapping = Mapping(
         rank=0,
         world_size=8,
         attn_tp_size=8,
         linear_attn_tp_size=8,
+        mla_weight_tp_size=1,
         dense_tp_size=8,
         moe_tp_size=1,
         moe_ep_size=8,
@@ -243,7 +249,7 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
 
     text_config.architectures = ["OtherForCausalLM"]
     config = MLAConfig.generate(server_args, model_config, is_draft=False)
-    assert config.attn_tp_size == 8
+    assert config.attn_tp_size == 1
 
 
 @pytest.mark.parametrize(
@@ -360,9 +366,9 @@ def test_lite_tp8_capacity_accounts_for_history_and_request_state() -> None:
 def test_lite_pd_manifest_restores_only_the_latest_oe_context() -> None:
     from test.runtime.test_lite_model_loader import lite_config_dict
 
-    from tokenspeed.runtime.models.lite import (
-        LiteNgramParameters,
-        LiteOEStatePreparer,
+    from tokenspeed.runtime.layers.over_embedding import (
+        CheckpointedTailOEStatePreparer,
+        HostLongCatOverEmbedding,
     )
     from tokenspeed.runtime.pd.cache_protocol import (
         CacheTransferContract,
@@ -390,8 +396,8 @@ def test_lite_pd_manifest_restores_only_the_latest_oe_context() -> None:
     assert oe_blocks.block_ids == (2,)
     assert plan.field("layer.0.lite.oe.context").payload_bytes == 12
 
-    config = LiteConfig.from_dict(lite_config_dict())
-    layer = LiteNgramParameters(config)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = HostLongCatOverEmbedding(config)
     for table_id, table in enumerate(layer.embedders):
         table.weight.data = torch.arange(
             config.oe_table_rows(table_id) * config.oe_hidden_size,
@@ -399,7 +405,7 @@ def test_lite_pd_manifest_restores_only_the_latest_oe_context() -> None:
         ).reshape(config.oe_table_rows(table_id), config.oe_hidden_size)
     source_pages = torch.zeros((3, 3), dtype=torch.int32)
     destination_pages = torch.zeros_like(source_pages)
-    prefill = LiteOEStatePreparer(
+    prefill = CheckpointedTailOEStatePreparer(
         layer,
         context_pages=source_pages,
         checkpoint_granularity=128,
@@ -428,7 +434,7 @@ def test_lite_pd_manifest_restores_only_the_latest_oe_context() -> None:
         source_pages[oe_blocks.block_ids[0]]
     )
 
-    decode = LiteOEStatePreparer(
+    decode = CheckpointedTailOEStatePreparer(
         layer,
         context_pages=destination_pages,
         checkpoint_granularity=128,
@@ -470,6 +476,33 @@ def test_lite_setup_dispatches_to_the_oe_recipe() -> None:
         raise
 
     recipe = _lite_recipe(8)
+    setup = prepare_cache_setup(
+        family="kimi_k3",
+        server_args=recipe.server_args,
+        model_config=recipe.model_config,
+        attn_config=recipe.attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=recipe.cache_budget_bytes,
+        decode_input_tokens=recipe.decode_input_tokens,
+        overlap_schedule_depth=recipe.overlap_schedule_depth,
+    )
+
+    assert setup.spec.memory_plan.field("layer.0.lite.oe.context").shape == (3,)
+
+
+def test_lite_setup_dispatches_by_provider_not_architecture() -> None:
+    try:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+            prepare_cache_setup,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "compressed_tensors":
+            pytest.skip("full attention config dependencies are not installed")
+        raise
+
+    recipe = _lite_recipe(8)
+    recipe.model_config.hf_config.architectures = ["FLASHLocalForCausalLM"]
     setup = prepare_cache_setup(
         family="kimi_k3",
         server_args=recipe.server_args,

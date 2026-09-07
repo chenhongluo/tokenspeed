@@ -250,6 +250,25 @@ def test_flash_kda_identity_zero_expert_is_partitioned_across_moe_ranks() -> Non
     assert topk_output.topk_weights.tolist() == [[0.0, 0.25], [0.75, 0.0]]
 
 
+def test_flash_local_decoder_selects_packed_moe_by_capability(monkeypatch) -> None:
+    from test.runtime.test_lite_model_loader import lite_config_dict
+
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import flash_kda
+    from tokenspeed.runtime.models.flash_local_moe import PackedFLASHLocalMoE
+
+    monkeypatch.setattr(flash_kda, "flash_local_prefers_packed_moe", lambda: True)
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    mapping = Mapping(rank=0, world_size=1)
+
+    with torch.device("meta"):
+        layer = flash_kda.FLASHLocalDecoderLayer(config, 0, mapping)
+
+    assert isinstance(layer.moe, PackedFLASHLocalMoE)
+    assert layer.moe.local_expert_ids == tuple(range(32))
+
+
 def test_flash_kda_maps_fgbkda_projection_weights_to_checkpoint_structure() -> None:
     from tokenspeed.runtime.models.flash_kda import (
         _canonical_flash_kda_weight_name,
@@ -285,6 +304,31 @@ def test_flash_kda_maps_fgbkda_projection_weights_to_checkpoint_structure() -> N
         )
         == "model.layers.4.self_attn.q_proj.weight"
     )
+
+
+def test_separate_kda_geometry_uses_linear_attention_mapping() -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+    from tokenspeed.runtime.models.flash_kda import SeperateFLASHLocal
+
+    config = FLASHLocalConfig(
+        hidden_size=16,
+        num_attention_heads=4,
+        qk_nope_head_dim=4,
+        linear_head_dim=4,
+        linear_num_heads=4,
+        num_hidden_layers=4,
+        fa_interval=4,
+    )
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+        linear_attn=SimpleNamespace(tp_rank=1, tp_size=2, tp_group=(0, 1)),
+    )
+
+    layer = SeperateFLASHLocal(config, mapping, layer_id=0)
+
+    assert layer.local_num_heads == 2
+    assert layer.q_proj.weight.shape == (8, 16)
+    assert layer.A_log.shape == (2,)
 
 
 def test_flash_lite_cache_allows_its_wider_recurrent_state() -> None:
@@ -332,7 +376,9 @@ def test_flash_lite_oe_keeps_its_special_token_policy(
     with mock.patch(
         "tokenspeed.runtime.models.flash_kda.LongCatOverEmbedding"
     ) as over_embedding:
-        model._build_embed_tokens(config, quant_config=None)
+        model._build_embed_tokens(
+            config, quant_config=None, oe_table_placement="device"
+        )
 
     kwargs = over_embedding.call_args.kwargs
     assert kwargs["ignored_token_ids"] == ((2, 3) if exclude_special_tokens else ())

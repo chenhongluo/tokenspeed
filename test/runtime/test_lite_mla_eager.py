@@ -19,13 +19,16 @@
 # SOFTWARE.
 
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.models.lite import LiteMLAParameters
+from tokenspeed.runtime.models.flash_local_attention import (
+    SeparateProjectionKimiLinearMLAAttention,
+)
 
 _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -42,6 +45,8 @@ def _config():
         rms_norm_eps=1e-5,
         mla_scale_q_lora=True,
         mla_scale_kv_lora=True,
+        mla_use_output_gate=True,
+        max_position_embeddings=128,
     )
 
 
@@ -50,8 +55,19 @@ class _Pool:
         self.events = events
         self.rows = None
 
-    def set_mla_kv_buffer(self, layer, loc, kv, auxiliary):
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc,
+        kv=None,
+        auxiliary=None,
+        *,
+        cache_k_nope=None,
+        cache_k_rope=None,
+    ):
         self.events.append("write")
+        kv = kv if kv is not None else cache_k_nope
+        auxiliary = auxiliary if auxiliary is not None else cache_k_rope
         self.rows = (layer, loc.clone(), kv.clone(), auxiliary.clone())
 
 
@@ -60,8 +76,19 @@ class _Backend:
         self.events = events
         self.output = output
         self.chunked_prefill_metadata = SimpleNamespace(
-            use_absorbed_cached_extend=False
+            use_absorbed_cached_extend=False,
+            extend_seq_lens_cpu=[output.shape[0]],
+            extend_seq_lens=torch.tensor(
+                [output.shape[0]], dtype=torch.int32, device=output.device
+            ),
+            cum_extend_seq_lens=torch.tensor(
+                [0, output.shape[0]], dtype=torch.int32, device=output.device
+            ),
+            max_extend_seq_len=output.shape[0],
+            chunked_loop_num=0,
         )
+        self.spec_num_tokens = 1
+        self.supports_mla_projected_value_decode = False
 
     def select_out_cache_loc(self, _layer, loc, _mode):
         return loc
@@ -70,26 +97,48 @@ class _Backend:
         self.events.append("attention")
         assert self.events[-2:] == ["write", "attention"]
         if v is not None:
-            assert layer.qk_head_dim == 3
+            assert _q.shape[-1] == layer.qk_head_dim
         return self.output
+
+    def forward_extend_chunked(self, _q, _k, _v, *_args, out=None, **_kwargs):
+        self.events.append("attention")
+        assert self.events[-2:] == ["write", "attention"]
+        out.copy_(self.output)
+        return out, torch.zeros(1, device=out.device)
+
+
+@dataclass
+class _Context:
+    forward_mode: ForwardMode
+    attn_backend: _Backend
+    token_to_kv_pool: _Pool
+    bs: int
+    num_extends: int
+    input_num_tokens: int
 
 
 def _layer():
     torch.manual_seed(5501)
-    layer = LiteMLAParameters(
-        _config(), SimpleNamespace(attn=SimpleNamespace(tp_size=1)), layer_id=3
-    )
+    component = SimpleNamespace(tp_size=1, tp_rank=0, tp_group=(0,))
+    layer = SeparateProjectionKimiLinearMLAAttention(
+        _config(),
+        SimpleNamespace(attn=component, mla_weight=component),
+        layer_id=3,
+    ).to(torch.bfloat16)
     for parameter in layer.parameters():
         parameter.data.normal_(mean=0.0, std=0.2)
     return layer
 
 
 def _ctx(mode, output, events):
-    return SimpleNamespace(
+    num_extends = output.shape[0] if mode.is_extend() else 0
+    return _Context(
         forward_mode=mode,
         attn_backend=_Backend(events, output),
         token_to_kv_pool=_Pool(events),
         bs=output.shape[0],
+        num_extends=num_extends,
+        input_num_tokens=output.shape[0],
     )
 
 
@@ -125,7 +174,8 @@ def test_lite_mla_writes_one_live_cache_before_attention_and_applies_gate(mode):
     ctx = _ctx(mode, attention, events)
     locations = torch.tensor([3, 5], dtype=torch.int64)
 
-    output = layer(torch.arange(2), hidden, ctx, locations, comm_manager=None)
+    with torch.no_grad():
+        output = layer(torch.arange(2), hidden, ctx, locations, comm_manager=None)
 
     assert output.shape == hidden.shape
     assert events == ["write", "attention"]
@@ -140,7 +190,8 @@ def test_lite_mla_nope_auxiliary_is_preserved_without_rotation():
     layer = _layer()
     layer.process_weights_after_loading()
     hidden = torch.randn(3, 8, dtype=torch.bfloat16)
-    q, latent, _ = layer._project_q_latent(hidden)
+    with torch.no_grad():
+        q, latent, _, _ = layer._project_q_latent_gated(hidden, None, None, None)
     q_auxiliary = q.view(3, 2, 3)[..., -1].clone()
     latent_auxiliary = latent[..., -1].clone()
     events = []
@@ -150,16 +201,17 @@ def test_lite_mla_nope_auxiliary_is_preserved_without_rotation():
         events,
     )
 
-    layer._absorbed_attention(
-        q,
-        latent,
-        torch.zeros(3, 4, dtype=torch.bfloat16),
-        ctx,
-        torch.arange(3),
-    )
+    with torch.no_grad():
+        absorbed, _ = layer.forward_absorb_qkv_proj(
+            q,
+            latent,
+            torch.arange(3),
+            ctx,
+            torch.arange(3),
+        )
 
     torch.testing.assert_close(ctx.token_to_kv_pool.rows[3][:, 0, 0], latent_auxiliary)
-    assert torch.equal(q.view(3, 2, 3)[..., -1], q_auxiliary)
+    assert torch.equal(absorbed[..., -1], q_auxiliary)
 
 
 def test_lite_mla_cached_extend_uses_absorbed_attention():
@@ -174,7 +226,8 @@ def test_lite_mla_cached_extend_uses_absorbed_attention():
     )
     ctx.attn_backend.chunked_prefill_metadata.use_absorbed_cached_extend = True
 
-    output = layer(torch.arange(2), hidden, ctx, torch.tensor([3, 5]))
+    with torch.no_grad():
+        output = layer(torch.arange(2), hidden, ctx, torch.tensor([3, 5]))
 
     assert output.shape == hidden.shape
     assert events == ["write", "attention"]
@@ -195,12 +248,13 @@ def test_ascend_lite_mla_model_path_uses_registered_projection(mode):
     )
     ctx = _ctx(mode, attention, events)
 
-    output = layer(
-        torch.arange(2, device="npu"),
-        hidden,
-        ctx,
-        torch.tensor([3, 5], dtype=torch.int64, device="npu"),
-    )
+    with torch.no_grad():
+        output = layer(
+            torch.arange(2, device="npu"),
+            hidden,
+            ctx,
+            torch.tensor([3, 5], dtype=torch.int64, device="npu"),
+        )
 
     assert output.shape == hidden.shape
     assert events == ["write", "attention"]

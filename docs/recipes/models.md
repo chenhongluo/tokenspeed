@@ -22,6 +22,7 @@ Representative launch shapes are:
 # LongCat Flash-Lite
 tokenspeed serve /path/to/longcat-flash-lite \
   --tensor-parallel-size 4 \
+  --oe-table-placement device \
   --attention-backend trtllm_mla \
   --moe-backend triton
 
@@ -43,9 +44,10 @@ owned by `RuntimeStates` and keyed by request-pool slot. `InputBuffers` owns the
 packed batch layout, and `ForwardContext` carries a non-owning view combining
 the two for the OE layer. Extend requests copy their full committed prefix into
 that history at a cached-prefix boundary; subsequent input tokens are appended
-directly by the OE kernel. The `LiteForCausalLM` NPU path is separate: its
-host-resident OE tables and cache-backed context continue to use the Lite
-external-input preparation flow.
+directly by the OE kernel. Flash-Lite on Ascend selects `host`, whose table
+lookup uses the existing cache-backed three-token context and external-input
+staging. `auto` chooses only a model/backend pair that is declared supported;
+an explicit unsupported placement fails startup without fallback.
 
 ## Inkling
 
