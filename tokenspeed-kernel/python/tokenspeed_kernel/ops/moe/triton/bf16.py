@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -210,8 +210,8 @@ def _validate(
 
 @triton.jit
 def _stage1_kernel(
-    x_desc,
-    w13_desc,
+    x_ptr,
+    w13_ptr,
     inter_ptr,
     expert_route_ids_ptr,
     expert_counts_ptr,
@@ -232,6 +232,7 @@ def _stage1_kernel(
     route_count = num_tokens * top_k
     tile_idx = tl.program_id(0)
     problem_start = 0
+    w13_expert_stride = 2 * intermediate_size * hidden_size
 
     for expert_id in range(num_experts):
         group_m = tl.load(expert_counts_ptr + expert_id)
@@ -252,29 +253,40 @@ def _stage1_kernel(
             ).to(tl.int32)
             token_ids = tl.where(row_mask, route_ids // top_k, 0).to(tl.int32)
             n_offset = tile_n * BLOCK_N
+            n_offsets = n_offset + tl.arange(0, BLOCK_N)
             gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            expert_w13 = w13_ptr + expert_id * w13_expert_stride
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset)
-                gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
-                    (BLOCK_N, BLOCK_K)
+                k_offsets = k_offset + tl.arange(0, BLOCK_K)
+                x = tl.load(
+                    x_ptr + token_ids[:, None] * hidden_size + k_offsets[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
                 )
-                up = w13_desc.load(
-                    [expert_id, intermediate_size + n_offset, k_offset]
-                ).reshape((BLOCK_N, BLOCK_K))
+                gate = tl.load(
+                    expert_w13 + n_offsets[:, None] * hidden_size + k_offsets[None, :]
+                )
+                up = tl.load(
+                    expert_w13
+                    + (intermediate_size + n_offsets)[:, None] * hidden_size
+                    + k_offsets[None, :]
+                )
                 gate_acc += tl.dot(x, gate.T)
                 up_acc += tl.dot(x, up.T)
 
             if ACTIVATION == "situ":
-                gate = gate_acc.to(x_desc.dtype).to(tl.float32)
-                up = up_acc.to(x_desc.dtype).to(tl.float32)
+                gate = gate_acc.to(inter_ptr.dtype.element_ty).to(tl.float32)
+                up = up_acc.to(inter_ptr.dtype.element_ty).to(tl.float32)
                 gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
                 if HAS_LINEAR_BETA:
                     up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
-                activated = (gate * up).to(x_desc.dtype)
+                activated = (gate * up).to(inter_ptr.dtype.element_ty)
             else:
-                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
+                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(
+                    inter_ptr.dtype.element_ty
+                )
             inter_offsets = (
                 route_ids[:, None] * intermediate_size
                 + n_offset
@@ -289,7 +301,7 @@ def _stage1_kernel(
 @triton.jit
 def _stage2_kernel(
     inter_ptr,
-    w2_desc,
+    w2_ptr,
     route_output_ptr,
     expert_route_ids_ptr,
     expert_counts_ptr,
@@ -306,6 +318,7 @@ def _stage2_kernel(
     route_count = num_tokens * top_k
     tile_idx = tl.program_id(0)
     problem_start = 0
+    w2_expert_stride = hidden_size * intermediate_size
 
     for expert_id in range(num_experts):
         group_m = tl.load(expert_counts_ptr + expert_id)
@@ -326,9 +339,12 @@ def _stage2_kernel(
             ).to(tl.int32)
             route_ids = tl.where(row_mask, route_ids, -1).to(tl.int32)
             n_offset = tile_n * BLOCK_N
+            n_offsets = n_offset + tl.arange(0, BLOCK_N)
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            expert_w2 = w2_ptr + expert_id * w2_expert_stride
 
             for k_offset in range(0, intermediate_size, BLOCK_K):
+                k_offsets = k_offset + tl.arange(0, BLOCK_K)
                 intermediate_offsets = (
                     route_ids[:, None] * intermediate_size
                     + k_offset
@@ -339,8 +355,10 @@ def _stage2_kernel(
                     mask=row_mask[:, None],
                     other=0.0,
                 )
-                weight = w2_desc.load([expert_id, n_offset, k_offset]).reshape(
-                    (BLOCK_N, BLOCK_K)
+                weight = tl.load(
+                    expert_w2
+                    + n_offsets[:, None] * intermediate_size
+                    + k_offsets[None, :]
                 )
                 acc += tl.dot(intermediate, weight.T)
 
@@ -393,13 +411,9 @@ def _moe(
     stage2_programs = min(
         num_sms, route_count * triton.cdiv(hidden_size, stage2_block_n)
     )
-    x_desc = TensorDescriptor.from_tensor(x, [1, block_k])
-    w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k])
-    w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])
-
     _stage1_kernel[(stage1_programs,)](
-        x_desc,
-        w13_desc,
+        x,
+        w13,
         intermediate,
         expert_route_ids,
         expert_counts,
@@ -421,7 +435,7 @@ def _moe(
     )
     _stage2_kernel[(stage2_programs,)](
         intermediate,
-        w2_desc,
+        w2,
         route_output,
         expert_route_ids,
         expert_counts,

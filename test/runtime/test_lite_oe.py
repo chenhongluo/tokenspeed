@@ -23,7 +23,6 @@ from __future__ import annotations
 import gc
 from test.runtime.test_lite_model_loader import (
     lite_config_dict,
-    mapping,
     weights,
 )
 from types import SimpleNamespace
@@ -33,6 +32,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.over_embedding import (
     CheckpointedTailOEStatePreparer,
     HostLongCatOverEmbedding,
@@ -42,7 +42,6 @@ from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 
 def test_shared_flash_loader_delegates_host_oe_weights(monkeypatch) -> None:
     from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
-    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.models import flash_kda
 
     monkeypatch.setattr(
@@ -162,6 +161,7 @@ def test_lite_oe_lookup_projection_normalize_and_special() -> None:
         ],
         dim=1,
     ).to(torch.int64)
+    ids[1].zero_()
 
     raw = layer.lookup_host(ids)
     expected_raw = torch.stack(
@@ -174,9 +174,9 @@ def test_lite_oe_lookup_projection_normalize_and_special() -> None:
     actual = layer.project_and_merge(word, raw, input_ids)
     projected = sum(raw[:, i].float() @ layer.projection[i].float() for i in range(12))
     expected = (word.float() + projected) / (13**0.5)
-    expected[1] = word[1].float()
+    expected[1] = word[1].float() + projected[1]
 
-    assert torch.equal(actual[1], word[1])
+    assert not torch.equal(actual[1], word[1])
     assert torch.isfinite(actual).all()
     assert torch.allclose(actual.float(), expected, atol=0.02, rtol=0.02)
     empty = layer.project_and_merge(
@@ -492,7 +492,9 @@ def test_lite_oe_fixed_staging_replays_updated_values() -> None:
 
 def test_lite_oe_loader_adopts_safetensors_mapping(tmp_path) -> None:
     config = FLASHLocalConfig.from_dict(lite_config_dict())
-    model = FLASHLocalForCausalLM(config, mapping(), oe_table_placement="host")
+    model = FLASHLocalForCausalLM(
+        config, Mapping(rank=0, world_size=1), oe_table_placement="host"
+    )
     name = "model.ngram_embeddings.embedders.0.weight"
     source = torch.arange(13 * 8, dtype=torch.bfloat16).reshape(13, 8)
     checkpoint = tmp_path / "oe.safetensors"

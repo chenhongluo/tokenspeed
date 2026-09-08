@@ -126,6 +126,30 @@ def _branch_index(weight_name: str, *, projection: bool) -> int | None:
     return None
 
 
+def _add_megatron_special_token_oe(
+    merged: torch.Tensor,
+    projected_oe: torch.Tensor,
+    special_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Restore learned OE rows at special positions without normalization.
+
+    Args:
+        merged: ``[tokens, hidden]`` merge result; special positions must still
+            hold the unscaled word embedding (or its TP-local contribution).
+        projected_oe: OE projection, either ``[tokens, hidden]`` from Host lookup
+            or ``[1, hidden]`` from Device TP-local learned row-zero fragments.
+        special_mask: Device-local bool ``[tokens]`` marking excluded tokens.
+
+    Returns:
+        A tensor with unscaled word-plus-OE at special positions and unchanged
+        ordinary rows. The caller retains ownership of any TP reduction.
+
+    This compatibility boundary can be removed only once both physical leaves
+    implement the same learned-row semantics themselves.
+    """
+    return torch.where(special_mask.unsqueeze(-1), merged + projected_oe, merged)
+
+
 class LongCatOverEmbedding(nn.Module):
     """Word embedding plus TP-local OE branches and one final TP reduction."""
 
@@ -328,6 +352,13 @@ class LongCatOverEmbedding(nn.Module):
             spec=self.spec,
             enable_pdl=True,
         )
+        special_projection = None
+        if self.spec.profile == "longcat-lite" and bypass_mask is not None:
+            # Lite checkpoints retain the learned row-zero OE projection at
+            # special positions. Only normalization is bypassed; a zero hash
+            # index is not a zero embedding. Sum TP-local contributions below.
+            zero_lookup = torch.cat([table[0] for table in self.oe_tables]).unsqueeze(0)
+            special_projection = F.linear(zero_lookup, self.projection.t())
         local_partial = project_add_word_(
             word_partial,
             activation,
@@ -335,6 +366,10 @@ class LongCatOverEmbedding(nn.Module):
             scale=self.normalize_scale,
             bypass_mask=bypass_mask,
         )
+        if special_projection is not None:
+            local_partial = _add_megatron_special_token_oe(
+                local_partial, special_projection, bypass_mask
+            )
         if self.tp_size > 1:
             local_partial = all_reduce(local_partial, self.tp_group)
         return local_partial
@@ -594,7 +629,8 @@ class HostLongCatOverEmbedding(nn.Module):
         )
         merged = (word_hidden_states + projected) / self.normalize_scale
         special = (input_ids.unsqueeze(-1) == self.ignore_tokens).any(dim=-1)
-        return torch.where(special.unsqueeze(-1), word_hidden_states, merged)
+        merged = torch.where(special.unsqueeze(-1), word_hidden_states, merged)
+        return _add_megatron_special_token_oe(merged, projected, special)
 
     def initialize_runtime(
         self,
