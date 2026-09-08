@@ -351,7 +351,6 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_LONGCAT_DSA_ARCHITECTURES,
         configure=configure_longcat_lsa_attention,
         default_backend="dsa",
-        supports_target_verify_forward_mode=True,
     ),
     _AttentionFamilySpec(
         name="GLM",
