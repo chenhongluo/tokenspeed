@@ -23,12 +23,244 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    copy_state_rows,
+    fused_fp8_set_kv_buffer,
     index_k_block_split_scatter,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 32])
+def test_fused_fp8_set_kv_buffer_matches_qsa_store(device: str, tokens: int) -> None:
+    torch.manual_seed(tokens)
+    page_size, num_slots = 16, 64
+    # Match Qwen4-Exp TP4: Q/Gate precede one 256-wide K and V in the GEMM
+    # output, so both inputs are strided views rather than contiguous tensors.
+    qkv = torch.randn((tokens, 3584), device=device, dtype=torch.bfloat16)
+    k = qkv[:, 3072:3328].view(tokens, 1, 256)
+    v = qkv[:, 3328:3584].view(tokens, 1, 256)
+    assert k.stride(-1) == v.stride(-1) == 1
+    if tokens > 1:
+        assert k.stride(0) == qkv.stride(0) == v.stride(0)
+    cache_locs = torch.randperm(num_slots, device=device)[:tokens].to(torch.int32)
+    k_cache = torch.zeros((num_slots, 1, 256), device=device, dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros_like(k_cache)
+    expected_k = torch.zeros_like(k_cache)
+    expected_v = torch.zeros_like(v_cache)
+    expected_k[cache_locs.to(torch.long)] = k.to(torch.float8_e4m3fn)
+    expected_v[cache_locs.to(torch.long)] = v.to(torch.float8_e4m3fn)
+
+    fused_fp8_set_kv_buffer(
+        k,
+        v,
+        k_cache,
+        v_cache,
+        cache_locs,
+        page_size=page_size,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(k_cache.view(torch.uint8), expected_k.view(torch.uint8))
+    assert torch.equal(v_cache.view(torch.uint8), expected_v.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "src_row_dtype,dst_row_dtype",
+    [
+        (torch.int32, torch.int32),
+        (torch.int32, torch.int64),
+        (torch.int64, torch.int32),
+        (torch.int64, torch.int64),
+    ],
+)
+def test_copy_state_rows_accepts_32_and_64_bit_row_ids(
+    device: str, src_row_dtype: torch.dtype, dst_row_dtype: torch.dtype
+) -> None:
+    num_layers = 2
+    row_i32 = 5
+    row_stride_i32 = 8
+    rows_per_layer = 3
+    src_slabs = [
+        torch.arange(
+            layer * 1_000,
+            layer * 1_000 + 5 * row_stride_i32,
+            device=device,
+            dtype=torch.int32,
+        ).reshape(5, row_stride_i32)
+        for layer in range(num_layers)
+    ]
+    dst_slabs = [
+        torch.full(
+            (6, row_stride_i32),
+            -1,
+            device=device,
+            dtype=torch.int32,
+        )
+        for _ in range(num_layers)
+    ]
+    src_rows = torch.tensor([4, -1, 1, 0, 3, 2], device=device, dtype=src_row_dtype)
+    dst_rows = torch.tensor([0, 2, 4, 1, 3, 5], device=device, dtype=dst_row_dtype)
+    src_addresses = torch.tensor(
+        [slab.data_ptr() for slab in src_slabs], device=device, dtype=torch.uint64
+    )
+    dst_addresses = torch.tensor(
+        [slab.data_ptr() for slab in dst_slabs], device=device, dtype=torch.uint64
+    )
+    row_strides = torch.full(
+        (num_layers,), row_stride_i32, device=device, dtype=torch.int64
+    )
+
+    copy_state_rows(
+        src_addresses,
+        dst_addresses,
+        src_rows,
+        dst_rows,
+        row_bytes=row_i32 * 4,
+        src_row_strides=row_strides,
+        dst_row_strides=row_strides,
+    )
+    torch.cuda.synchronize()
+
+    expected = [torch.full_like(slab, -1) for slab in dst_slabs]
+    for layer in range(num_layers):
+        for row in range(rows_per_layer):
+            work_index = layer * rows_per_layer + row
+            dst_row = int(dst_rows[work_index])
+            src_row = int(src_rows[work_index])
+            if src_row < 0:
+                expected[layer][dst_row, :row_i32] = 0
+            else:
+                expected[layer][dst_row, :row_i32] = src_slabs[layer][src_row, :row_i32]
+
+    for actual, reference in zip(dst_slabs, expected, strict=True):
+        assert torch.equal(actual, reference)
+
+
+def test_copy_state_rows_commits_verified_state(device: str) -> None:
+    batch_size, draft_tokens, num_layers = 4, 3, 3
+    page_size, num_pages = 4, 48
+    conv_words, ssm_words = 7, 1100
+    scratch_rows = batch_size * (draft_tokens + 1)
+
+    conv_scratch = [
+        (
+            torch.arange(
+                scratch_rows * conv_words, device=device, dtype=torch.int32
+            ).view(scratch_rows, conv_words)
+            + layer * 100_000
+        )
+        for layer in range(num_layers)
+    ]
+    ssm_scratch = [
+        (
+            torch.arange(
+                scratch_rows * ssm_words, device=device, dtype=torch.int32
+            ).view(scratch_rows, ssm_words)
+            + layer * 1_000_000
+        )
+        for layer in range(num_layers)
+    ]
+    conv_committed = [
+        torch.full((num_pages, conv_words), -1, device=device, dtype=torch.int32)
+        for _ in range(num_layers)
+    ]
+    ssm_committed = [
+        torch.full((num_pages, ssm_words), -1, device=device, dtype=torch.int32)
+        for _ in range(num_layers)
+    ]
+
+    def pointer_table(tensors: list[torch.Tensor]) -> torch.Tensor:
+        return torch.tensor(
+            [tensor.data_ptr() for tensor in tensors],
+            device=device,
+            dtype=torch.uint64,
+        )
+
+    def stride_table(tensors: list[torch.Tensor]) -> torch.Tensor:
+        return torch.tensor(
+            [tensor.stride(0) for tensor in tensors],
+            device=device,
+            dtype=torch.int64,
+        )
+
+    tables = (
+        torch.tensor(
+            [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
+            device=device,
+            dtype=torch.int32,
+        ),
+        torch.tensor(
+            [
+                [21, 22, 23, 24],
+                [25, 26, 27, 28],
+                [29, 30, 31, 32],
+                [33, 34, 35, 36],
+            ],
+            device=device,
+            dtype=torch.int32,
+        ),
+    )
+    group_sel = torch.tensor([0, 1, 0], device=device, dtype=torch.int64)
+    committed = torch.tensor([3, 4, 7, 8], device=device, dtype=torch.int64)
+    accepted = torch.tensor([1, 2, 3, 9], device=device, dtype=torch.int32)
+
+    expected_conv = [tensor.clone() for tensor in conv_committed]
+    expected_ssm = [tensor.clone() for tensor in ssm_committed]
+    accepted_ref = accepted.to(torch.int64).clamp(1, draft_tokens)
+    for layer in range(num_layers):
+        table = tables[int(group_sel[layer])]
+        for request in range(batch_size):
+            src_row = request * (draft_tokens + 1) + int(accepted_ref[request])
+            slot = (
+                int(committed[request]) + int(accepted_ref[request]) - 1
+            ) // page_size
+            slot = min(max(slot, 0), table.shape[1] - 1)
+            dst_row = max(int(table[request, slot]), 0)
+            expected_conv[layer][dst_row] = conv_scratch[layer][src_row]
+            expected_ssm[layer][dst_row] = ssm_scratch[layer][src_row]
+
+    accepted_rows = accepted.clamp(1, draft_tokens)
+    src_rows = (
+        torch.arange(batch_size, device=device, dtype=torch.int32) * (draft_tokens + 1)
+        + accepted_rows
+    ).repeat(num_layers)
+    slots = torch.div(
+        committed + accepted_rows.to(torch.int64) - 1,
+        page_size,
+        rounding_mode="floor",
+    ).clamp(0, tables[0].shape[1] - 1)
+    destination_by_group = torch.stack(
+        [table.gather(1, slots[:, None]).squeeze(1) for table in tables]
+    )
+    dst_rows = destination_by_group.index_select(0, group_sel).reshape(-1)
+
+    copy_state_rows(
+        pointer_table(conv_scratch),
+        pointer_table(conv_committed),
+        src_rows,
+        dst_rows,
+        row_bytes=conv_words * 4,
+        src_row_strides=stride_table(conv_scratch),
+        dst_row_strides=stride_table(conv_committed),
+    )
+    copy_state_rows(
+        pointer_table(ssm_scratch),
+        pointer_table(ssm_committed),
+        src_rows,
+        dst_rows,
+        row_bytes=ssm_words * 4,
+        src_row_strides=stride_table(ssm_scratch),
+        dst_row_strides=stride_table(ssm_committed),
+    )
+    torch.cuda.synchronize()
+
+    for actual, expected in zip(conv_committed, expected_conv):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(ssm_committed, expected_ssm):
+        assert torch.equal(actual, expected)
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

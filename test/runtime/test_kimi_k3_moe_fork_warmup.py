@@ -96,12 +96,14 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
 
     plan = SimpleNamespace(
         lane=None,
+        symm_outputs=None,
         split_shared_rs=False,
         routed_in_fork=False,
         defer_finalize=False,
     )
     comm = SimpleNamespace(
-        plan=lambda num_tokens, hs: plan,
+        # Absorb keyword axes so the stub does not pin plan's signature.
+        plan=lambda num_tokens, hs, **_: plan,
         run=lambda *a, **k: hidden,
         reduce_scatter_shared=lambda x: x,
         reduce_project_routed=lambda x: x,
@@ -121,6 +123,9 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
             torch.zeros(2, 1),
             torch.zeros(2, 1),
         ),
+        # None keeps this on the separate per-module projections, which is the
+        # composition whose fork structure these tests pin.
+        _latent_input_projections=lambda hs, shared_out=None: None,
         shared_experts=lambda hs, down_out=None: hs,
         routed_expert_down_proj=lambda hs: (hs, None),
         experts=SimpleNamespace(_situ_output_buffer=None),

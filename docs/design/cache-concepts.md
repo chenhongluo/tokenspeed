@@ -204,6 +204,36 @@ already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
 
+The Host-transfer workspace resolves transport capability for its buffer
+binding before publishing consumer waits. NVIDIA mapped-Host transfers can
+use a single full-geometry H2D launch with per-layer ready flags; other paths
+publish per-layer events. Device-resident geometry is metadata, not evidence
+that a particular completion protocol is supported. Automatic DMA fallback
+is limited to unavailable Host-pointer mapping, scoped to that workspace and
+buffer binding; validation, allocation, and kernel-launch failures propagate.
+Transfer callers explicitly select the backend, staging synchronization,
+grid cap, and optional layer flags. For an unflagged layer with no matching
+blocks, the transfer boundary validates the loaded block count and returns
+before mapping Host pointers or touching the accelerator runtime. Flagged
+loads still publish readiness for empty consumers.
+
+Writeback uploads block metadata asynchronously on the caller stream. An
+event recorded after both metadata copies protects the pinned CPU staging
+tables: before refilling them, the next submission waits only if that event
+is incomplete. This does not wait for the payload transfer or publish a
+writeback ACK. Device metadata reuse stays ordered after the previous payload
+by caller-stream FIFO; the forward-to-cache and cache-to-page-reuse fences
+remain unchanged. Even a partially submitted metadata upload records its
+retirement event before propagating a staging failure.
+
+Ready flags are valid only for a full-geometry H2D transfer. Consumers first
+wait for the current generation's flag initialization event, then its layer
+flag. Workspace reuse also waits for the previous transfer's completion;
+layer readiness alone does not retire metadata still read by the transfer.
+On submission failure, retirement fences protect reuse without publishing a
+successful load ACK. If neither event publication nor stream synchronization
+can establish retirement, the executor must reject further loads.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under
@@ -344,7 +374,16 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries.
+  acquire/contains/pin queries. During prefill, each completed scheduling
+  boundary queues all newly published full-attention pages and one checkpoint
+  per snapshot-state group; the pending candidates are merged into a batched
+  writeback. The first decode admission from `PrefillDone` applies the same
+  policy to the final prompt boundary. Ordinary decode still publishes Device
+  entries but does not stream full-attention or snapshot-state entries to
+  Host. At finish or retraction, all eligible Device-resident non-state pages
+  and only the newest Device-resident checkpoint per state group are queued
+  before request ownership is released. Ordinary sliding-window entries
+  always stream when published.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.
@@ -539,24 +578,23 @@ and never touches packing. No refactor needed here.
   `page_table` concept exists only where paged-KV kernel tables exist, i.e.
   in Python.
 * The Python residues are cleaned: `FlashMLADecodeMetadata.page_table`, the
-  TRT-LLM MLA chunked-prefill metadata's `page_table`,
-  `_page_table_aliased`, inkling's `col_block_table` (conv state), and the
-  `CacheGroupsMixin` docstring. Third-party kernel keyword names
+  TRT-LLM MLA chunked-prefill metadata's `page_table`, inkling's
+  `col_block_table` (conv state), and the base-class group routing
+  docstrings. Third-party kernel keyword names
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
 * The state backend's replay hook names no `page_table` parameter — state
   attention has no page table, so the shared call's keyword is absorbed unused
-  via `**kwargs`. And `input_buffer.py::fill_input_buffers` takes a
-  unit-neutral `out_loc_table`: the batch-ordered table `out_cache_loc`
-  derives from, which is the scheduler's full-history table on the target path
-  and the staged draft table on the drafter path.
+  via `**kwargs`. `input_buffer.py` carries no table at all anymore: KV write
+  locations are backend-owned (`write_locations`), so the runner's input prep
+  writes positions and seq_lens only.
 
-### Principle 5 — Python perceives the logical quantities minimally: leaks fixed, mapping owners still four
+### Principle 5 — Python perceives the logical quantities minimally: fixed; one conversion point, one slot invariant
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
-leaking it; `expand_page_table` (`attention/page_table.py`) is the single
-expansion primitive; state attention and KV share one plan/arena/`CacheBlock`
-view, mirrored by the host tier. Specifically:
+leaking it; the router's `GroupTableStacks` fill (`backends/group_tables.py`)
+is the single expansion primitive; state attention and KV share one
+plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 
 * No magic `prefix_granularity == 128` branches: the constraint is named
   `MXFP8_KV_SCALE_TILE_TOKENS`, defined in `recipes/plan.py` beside the scale
@@ -572,14 +610,40 @@ view, mirrored by the host tier. Specifically:
 * Spec geometry is shape-checked at construction: row geometry and
   `checkpoint_granularity` are mutually exclusive, both positive, and
   family-gated (`CacheGroupSpec.__post_init__`).
-
-Remaining known item (deliberate, separate project): the mapping *primitive*
-is single but the *owners* are four — MLA `CacheBatchMetadata.kernel_table`,
-the MHA `CacheGroupsMixin` (eager plus two graph paths),
-`DraftPageStaging.publish`, and DeepSeek-V4's bespoke slot mapping — each
-with its own caching and validation, and the write-location math triplicated
-alongside. Consolidating them means touching every backend family at once;
-do it as its own milestone.
+* Group consumption is claimed positively, from one declaration: each
+  consumer takes exactly the delivered `block_tables` entries for the
+  groups it serves — the router builds one leaf per paged (history-family)
+  group of its bound pool view and fails a live batch missing any of them;
+  state consumers (Mamba/KDA, Inkling conv, V4) index the dict by their own
+  group ids. `cache_consumer_families` remains the boot-time coverage
+  declaration (`validate_scheduler_config`). Extra delivered groups ride
+  through untouched; a table for a group the bound pool never published
+  fails loudly.
+* The logical→physical conversion has ONE home per pool view:
+  `CacheGroupRouter` (`backends/router.py`) learns each group's
+  `block_granularity` and each leaf's `kernel_page_size` into one
+  `CacheGroupGeometry`, expands the bridge's raw block tables into
+  kernel-page stacks, and derives every KV write location — extend spans,
+  the decode/verify window, and the drafters' published step windows — from
+  those same tables (`backends/write_locations.py`, pure functions). Paged
+  leaves see kernel vocabulary only. The bridge's per-group table views
+  (`CacheBatchMetadata`) are the router's input — block vocabulary in,
+  kernel pages out, one expand launch per group. Models and the runner never
+  compute locations — `write_locations(layer, mode)` is the single accessor
+  (`unified_path.md`, "Write locations have one owner").
+* The slot *arithmetic* itself lives in the mapping layer in exactly two
+  spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
+  is page-size invariant): the router's stacked window/span math
+  (`backends/write_locations.py`, failing to slot 0 — the reserved dummy
+  page) and the token-shaped resolve
+  (`attention/page_table.py::group_slot_mapping_from_raw` +
+  `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
+  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
+  a *composer*, not an owner: its SWA / compressor-state / indexer-state
+  writes call the shared token-shaped resolve over its delivered tables;
+  only the compression-boundary orchestration (per-ratio strides, boundary
+  masks, the fused dsv4 kernel) is V4-specific
+  (`kv_cache/hybrid_deepseek_v4.py`).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -638,6 +702,15 @@ do it as its own milestone.
   bytes in it. `CacheFieldSpec` carries no `group_id` and `CacheGroupSpec` no
   packing: the declaring group is positional, and packing is the layout's
   answer, so neither can be stated twice and disagree. ✓
+* The model side names the same ids: every `PagedAttention` layer carries a
+  mandatory `group_id`, checked against the pool's published specs at startup
+  (`validate_cache_group_ids`, single-group pools included), and backends
+  index their learned geometry by it with no fallback
+  (`CacheGroupGeometry.granularity_of` raises on unknown ids).
+  Block drafters that write at target cache locations therefore use the
+  target's `full_attention` storage group even when a draft layer applies a
+  sliding-window compute mask; visibility and cache retention are separate
+  contracts. ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

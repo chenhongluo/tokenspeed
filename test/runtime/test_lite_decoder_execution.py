@@ -120,9 +120,7 @@ def test_decoder_matches_double_residual_oracle() -> None:
     layer.moe_comm.post_attn_layernorm = layer.post_attention_layernorm
     hidden = torch.arange(12, dtype=torch.float32).view(3, 4)
 
-    actual, residual = layer(
-        torch.arange(3), hidden, _ctx(), torch.arange(3), residual=None
-    )
+    actual, residual = layer(torch.arange(3), hidden, _ctx(), residual=None)
 
     assert torch.equal(actual + residual, 12 * hidden + 2)
     assert layer.input_layernorm.residual_calls == 0
@@ -214,9 +212,7 @@ def test_idle_layer_keeps_graph_shape_without_attention() -> None:
     layer.moe = _MLP(-2)
     hidden = torch.randn(2, 4)
 
-    output, residual = layer(
-        torch.arange(2), hidden, _ctx(idle=True), torch.arange(2), residual=None
-    )
+    output, residual = layer(torch.arange(2), hidden, _ctx(idle=True), residual=None)
 
     assert torch.equal(output, hidden * 2 - 2)
     assert residual is hidden
@@ -236,9 +232,7 @@ def test_model_merges_prepared_oe_before_layers() -> None:
         prepared_raw_oe=lambda num_tokens: raw[:num_tokens]
     )
 
-    output, auxiliary = model(
-        torch.tensor([2, 60]), torch.arange(2), _ctx(), torch.arange(2)
-    )
+    output, auxiliary = model(torch.tensor([2, 60]), torch.arange(2), _ctx())
 
     assert auxiliary is None
     assert torch.equal(output[0], torch.full((96,), 2, dtype=torch.bfloat16))
@@ -272,7 +266,7 @@ def test_causal_wrapper_uses_dense_head_and_shared_logits_processor(
         lambda _ctx: "metadata",
     )
 
-    output = model(_ctx(), torch.tensor([5, 6]), torch.arange(2), torch.arange(2))
+    output = model(_ctx(), torch.tensor([5, 6]), torch.arange(2))
 
     assert output is hidden
 
@@ -337,7 +331,6 @@ def test_decoder_residual_path_on_npu() -> None:
         torch.arange(2, device="npu:0"),
         hidden,
         _ctx(),
-        torch.arange(2, device="npu:0"),
         residual=None,
     )
     attention = _rms_oracle(hidden_before, config.rms_norm_eps) + 0.25
@@ -380,7 +373,6 @@ def test_oe_embedding_and_logits_on_npu() -> None:
     output = model(
         _ctx(),
         input_ids,
-        torch.arange(2, device="npu:0"),
         torch.arange(2, device="npu:0"),
     )
     word = torch.stack(

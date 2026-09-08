@@ -135,16 +135,24 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         const auto local_prefill_peak = [&] {
             if (group.IsSnapshotStateGroup()) {
                 if (token_limit == 0) return std::int64_t{0};
-                const std::int64_t input_lookback =
-                    max_prompt_tokens > chunk_tokens ? coordinator_.GroupBoundaryLookbackPages(i) : 0;
-                const std::int64_t first_split_checkpoint_peak =
-                    max_first_chunk_tail_tokens == 0 ? 0 : 1 + ceilDiv(max_first_chunk_tail_tokens, block_granularity);
-                const std::int64_t later_split_checkpoint_peak =
-                    max_later_chunk_tail_tokens == 0 ? 0
-                                                     : coordinator_.GroupBoundaryLookbackPages(i) + 1 +
-                                                           ceilDiv(max_later_chunk_tail_tokens, block_granularity);
-                return std::max(
-                    {std::int64_t{2}, input_lookback + 1, first_split_checkpoint_peak, later_split_checkpoint_peak});
+                // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
+                // + endpoint + max(growth, tail). P banks no growth; overlap keeps one more
+                // decode step live. A rebased recovery prompt may exceed max_prompt_tokens.
+                const std::int64_t growth_blocks =
+                    config_.role == Role::kP
+                        ? 0
+                        : ceilDiv(std::max<std::int64_t>(block_granularity, decode_width + protected_tokens),
+                                  block_granularity);
+                const std::int64_t lookback = coordinator_.GroupBoundaryLookbackPages(i);
+                const std::int64_t first_chunk_peak =
+                    (config_.disable_prefix_cache ? 0 : lookback) + 1 +
+                    std::max(growth_blocks, ceilDiv(max_first_chunk_tail_tokens, block_granularity));
+                const std::int64_t later_chunk_peak =
+                    max_prompt_tokens > chunk_tokens
+                        ? lookback + 1 +
+                              std::max(growth_blocks, ceilDiv(max_later_chunk_tail_tokens, block_granularity))
+                        : 0;
+                return std::max(first_chunk_peak, later_chunk_peak);
             }
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
@@ -164,7 +172,8 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
-                const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 1;
+                // Remote landing: endpoint snapshot + banked growth block.
+                const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 2;
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
@@ -413,6 +422,7 @@ std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
+    std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     std::erase_if(requests_, [this](const auto& request) {
         if (!request->template Is<fsm::Finished>()) {
             return false;
@@ -430,11 +440,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
-
     ExecutionPlan plan;
-    std::vector<WriteBackOperation> write_back_operations;
     auto [forward_operations, load_back_operations] =
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
+
     plan.With(ForwardBatch{std::move(forward_operations)});
 
     if (config_.StreamsDeviceCacheToHost()) {
@@ -442,6 +451,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             write_back_operations.push_back(std::move(*store));
         }
     }
+
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }

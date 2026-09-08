@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention import KdaPrefillResult
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -37,9 +37,12 @@ from tokenspeed_kernel.signature import (
 )
 
 if current_platform().is_amd:
-    _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
+    _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048, 2049, 2050, 2051})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
+    from tokenspeed_kernel.ops.attention.gluon.kpool_select import (
+        gluon_kpool_prefill_topk_fp8_gfx950 as _kpool_prefill_topk_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
@@ -59,19 +62,19 @@ if current_platform().is_amd:
         gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_indexer_decode_topk_mxfp4_gfx950 as _dsv4_indexer_decode_topk_impl,
+        gluon_dsv4_decode_split_gfx950 as _dsv4_decode_split_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950 as _dsv4_indexer_prefill_topk_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_paged_selected_attention_split_gfx950 as _dsv4_paged_selected_attention_split_impl,
+        gluon_dsv4_decode_topk_mxfp4_gfx950 as _dsv4_decode_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
         gluon_dsv4_plan_gfx950 as _dsv4_plan_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_selected_attention_gfx950 as _dsv4_selected_attention_impl,
+        gluon_dsv4_prefill_gfx950 as _dsv4_prefill_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
+        gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
@@ -146,7 +149,13 @@ if current_platform().is_amd:
         gluon_dsa_decode_topk_fp8_gfx1250 as _dsa_decode_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_decode_topk_standard_gfx1250 as _dsa_decode_topk_standard_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
         gluon_dsa_prefill_topk_fp8_gfx1250 as _dsa_prefill_topk_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_prefill_topk_standard_gfx1250 as _dsa_prefill_topk_standard_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_fused_decode_gfx1250 as _kda_fused_decode_gfx1250_impl,
@@ -203,8 +212,8 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
-        "dsv4_indexer_prefill_topk",
-        name="gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950",
+        "dsv4_prefill_topk",
+        name="gluon_dsv4_prefill_topk_mxfp4_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -216,13 +225,13 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         tags={"amd", "gfx950", "mxfp4", "sparse", "radix_topk"},
     )
-    def gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950(*args, **kwargs):
-        return _dsv4_indexer_prefill_topk_impl(*args, **kwargs)
+    def gluon_dsv4_prefill_topk_mxfp4_gfx950(*args, **kwargs):
+        return _dsv4_prefill_topk_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
-        "dsv4_indexer_decode_topk",
-        name="gluon_dsv4_indexer_decode_topk_mxfp4_gfx950",
+        "dsv4_decode_topk",
+        name="gluon_dsv4_decode_topk_mxfp4_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -234,8 +243,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         tags={"amd", "gfx950", "mxfp4", "sparse", "radix_topk"},
     )
-    def gluon_dsv4_indexer_decode_topk_mxfp4_gfx950(*args, **kwargs):
-        return _dsv4_indexer_decode_topk_impl(*args, **kwargs)
+    def gluon_dsv4_decode_topk_mxfp4_gfx950(*args, **kwargs):
+        return _dsv4_decode_topk_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -257,8 +266,8 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
-        "dsv4_paged_selected_attention",
-        name="gluon_dsv4_paged_selected_attention_split_gfx950",
+        "dsv4_decode",
+        name="gluon_dsv4_decode_split_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -291,13 +300,13 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx950", "paged_cache", "selected_attention"},
     )
-    def gluon_dsv4_paged_selected_attention_split_gfx950(*args, **kwargs):
-        return _dsv4_paged_selected_attention_split_impl(*args, **kwargs)
+    def gluon_dsv4_decode_split_gfx950(*args, **kwargs):
+        return _dsv4_decode_split_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
-        "dsv4_selected_attention",
-        name="gluon_dsv4_selected_attention_gfx950",
+        "dsv4_prefill",
+        name="gluon_dsv4_prefill_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -322,8 +331,8 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx950", "selected_attention"},
     )
-    def gluon_dsv4_selected_attention_gfx950(*args, **kwargs):
-        return _dsv4_selected_attention_impl(*args, **kwargs)
+    def gluon_dsv4_prefill_gfx950(*args, **kwargs):
+        return _dsv4_prefill_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -589,6 +598,7 @@ if current_platform().is_amd:
     def gluon_kda_fused_replay_gfx950(
         descriptors: torch.Tensor,
         *,
+        group_indices: torch.Tensor,
         read_indices: torch.Tensor,
         write_indices: torch.Tensor,
         accepted_length: torch.Tensor,
@@ -603,12 +613,12 @@ if current_platform().is_amd:
         state_stride: int,
         gate_stride: int,
         conv_width: int,
-        layers_per_group: int,
         lower_bound: float,
     ) -> None:
         """Replay all gfx950 layers from persistent BF16 raw-g descriptors."""
         _kda_fused_replay_impl(
             descriptors,
+            group_indices,
             read_indices,
             write_indices,
             accepted_length,
@@ -623,7 +633,6 @@ if current_platform().is_amd:
             state_stride=state_stride,
             gate_stride=gate_stride,
             conv_width=conv_width,
-            layers_per_group=layers_per_group,
             lower_bound=lower_bound,
         )
 
@@ -839,6 +848,7 @@ if current_platform().is_amd:
     def gluon_kda_fused_replay_gfx1250(
         descriptors: torch.Tensor,
         *,
+        group_indices: torch.Tensor,
         read_indices: torch.Tensor,
         write_indices: torch.Tensor,
         accepted_length: torch.Tensor,
@@ -853,12 +863,12 @@ if current_platform().is_amd:
         state_stride: int,
         gate_stride: int,
         conv_width: int,
-        layers_per_group: int,
         lower_bound: float,
     ) -> None:
         """Replay all gfx1250 layers from persistent BF16 raw-g descriptors."""
         _kda_fused_replay_gfx1250_impl(
             descriptors,
+            group_indices,
             read_indices,
             write_indices,
             accepted_length,
@@ -873,7 +883,6 @@ if current_platform().is_amd:
             state_stride=state_stride,
             gate_stride=gate_stride,
             conv_width=conv_width,
-            layers_per_group=layers_per_group,
             lower_bound=lower_bound,
         )
 
@@ -1725,6 +1734,34 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
+        "kpool_prefill_topk",
+        name="gluon_kpool_prefill_topk_fp8_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "index_heads": frozenset({32}),
+            "head_dim": frozenset({128}),
+            "pool_size": frozenset({4}),
+            "page_size": frozenset({16}),
+            "topk_pools": frozenset({512}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "score_activation": frozenset({"relu"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "prefill_plan": frozenset({False, True}),
+        },
+        tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
+    )
+    def gluon_kpool_prefill_topk_fp8_gfx950(*args, **kwargs):
+        return _kpool_prefill_topk_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
         "dsa_decode",
         name="gluon_dsa_decode_gfx950",
         solution="gluon",
@@ -1744,9 +1781,9 @@ if current_platform().is_amd:
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
-            "qk_nope_head_dim": frozenset({128, 192}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
-            "qk_rope_head_dim": frozenset({64}),
+            "qk_rope_head_dim": frozenset({0, 64}),
             "topk": _DSA_FULL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
             "sparse_kv_cache_available": frozenset({False, True}),
@@ -1756,7 +1793,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
-        kwargs.pop("request_seq_lens", None)
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1778,9 +1815,9 @@ if current_platform().is_amd:
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({128, 192}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
-            "qk_rope_head_dim": frozenset({64}),
+            "qk_rope_head_dim": frozenset({0, 64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
             "sparse_kv_cache_available": frozenset({False, True}),
@@ -1790,6 +1827,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1824,7 +1862,77 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_decode_topk",
+        name="gluon_dsa_decode_topk_standard_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(q_dtype),
+                    weights=dense_tensor_format(weight_dtype),
+                )
+                for q_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                for weight_dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "topk": _DSA_FULL_TOPK_WIDTHS,
+            "page_size": frozenset({64}),
+            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
+        },
+        tags={"amd", "gfx1250"},
+    )
+    def gluon_dsa_decode_topk_standard_gfx1250(*args, **kwargs):
+        return _dsa_decode_topk_standard_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_prefill_topk",
+        name="gluon_dsa_prefill_topk_standard_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(q_dtype),
+                    weights=dense_tensor_format(weight_dtype),
+                )
+                for q_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                for weight_dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "topk": _DSA_PREFILL_TOPK_WIDTHS,
+            "page_size": frozenset({64}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
+        },
+        tags={"amd", "gfx1250"},
+    )
+    def gluon_dsa_prefill_topk_standard_gfx1250(*args, **kwargs):
+        return _dsa_prefill_topk_standard_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -1931,7 +2039,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
-        kwargs.pop("request_seq_lens", None)
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1966,6 +2074,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -2001,6 +2110,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(

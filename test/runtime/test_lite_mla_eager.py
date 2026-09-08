@@ -90,8 +90,8 @@ class _Backend:
         self.spec_num_tokens = 1
         self.supports_mla_projected_value_decode = False
 
-    def select_out_cache_loc(self, _layer, loc, _mode):
-        return loc
+    def write_locations(self, _layer, _mode):
+        return self.locations
 
     def forward(self, _q, _k, v, layer, *_args, **_kwargs):
         self.events.append("attention")
@@ -173,9 +173,10 @@ def test_lite_mla_writes_one_live_cache_before_attention_and_applies_gate(mode):
     )
     ctx = _ctx(mode, attention, events)
     locations = torch.tensor([3, 5], dtype=torch.int64)
+    ctx.attn_backend.locations = locations
 
     with torch.no_grad():
-        output = layer(torch.arange(2), hidden, ctx, locations, comm_manager=None)
+        output = layer(torch.arange(2), hidden, ctx, comm_manager=None)
 
     assert output.shape == hidden.shape
     assert events == ["write", "attention"]
@@ -225,9 +226,10 @@ def test_lite_mla_cached_extend_uses_absorbed_attention():
         events,
     )
     ctx.attn_backend.chunked_prefill_metadata.use_absorbed_cached_extend = True
+    ctx.attn_backend.locations = torch.tensor([3, 5])
 
     with torch.no_grad():
-        output = layer(torch.arange(2), hidden, ctx, torch.tensor([3, 5]))
+        output = layer(torch.arange(2), hidden, ctx)
 
     assert output.shape == hidden.shape
     assert events == ["write", "attention"]
@@ -247,13 +249,13 @@ def test_ascend_lite_mla_model_path_uses_registered_projection(mode):
         else torch.randn(2, 2, 3, dtype=torch.bfloat16, device="npu")
     )
     ctx = _ctx(mode, attention, events)
+    ctx.attn_backend.locations = torch.tensor([3, 5], dtype=torch.int64, device="npu")
 
     with torch.no_grad():
         output = layer(
             torch.arange(2, device="npu"),
             hidden,
             ctx,
-            torch.tensor([3, 5], dtype=torch.int64, device="npu"),
         )
 
     assert output.shape == hidden.shape

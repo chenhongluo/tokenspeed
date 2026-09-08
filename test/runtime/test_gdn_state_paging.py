@@ -21,14 +21,6 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
 
-class _CacheMetadata:
-    def __init__(self, tables):
-        self.tables = tables
-
-    def require_table(self, group_id, active_forward_op=None):
-        return self.tables[group_id]
-
-
 class _ContractPool:
     def __init__(self, page_size, components):
         # The arena publishes the contract; a view only names its arena.
@@ -56,6 +48,72 @@ class _ContractPool:
         return conv_state if name == "conv_state" else recurrent_state
 
 
+def _mamba_config_pair(
+    torch,
+    *,
+    heads,
+    head_dim,
+    spec_tokens=1,
+    max_bs=8,
+    device="cpu",
+    replay_ssm=False,
+):
+    """(AttnConfig, softmax spec) for MambaAttnBackend: model-wide facts live on
+    the config, softmax geometry on the softmax spec, and the GDN geometry plus
+    replay_ssm on the LinearAttnConfig component."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+        LinearAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    spec = MHAConfig(
+        num_attention_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        attn_tp_size=1,
+    )
+    linear = LinearAttnConfig(
+        num_k_heads=heads,
+        num_v_heads=heads,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        conv_kernel_size=4,
+        layer_ids=(0,),
+        tp_size=1,
+        replay_ssm=replay_ssm,
+    )
+    config = AttnConfig(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=64,
+        context_len=4096,
+        max_bs=max_bs,
+        speculative_num_draft_tokens=spec_tokens,
+        components=(spec, linear),
+    )
+    return config, spec
+
+
+def _extend_kwargs(torch, extend_seq_lens_cpu, extend_prefix_lens_cpu, device):
+    """The ``init_forward_metadata`` extend bundle from its host mirrors."""
+    return dict(
+        extend_seq_lens=extend_seq_lens_cpu.to(device),
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_prefix_lens=extend_prefix_lens_cpu.to(device),
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+    )
+
+
+def _no_extends(torch, device):
+    """The extend bundle of a decode-mode call: no extend rows."""
+    empty = torch.zeros(0, dtype=torch.int32)
+    return _extend_kwargs(torch, empty, empty, device)
+
+
 class ComputeStatePageIndicesTest(unittest.TestCase):
     """CPU-only contract tests for the pure dual-index helper."""
 
@@ -63,7 +121,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -121,6 +179,25 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
     def test_out_slot_hole_raises(self):
         with self.assertRaises(ValueError):
             self._run([[7, 0, 12]], [4], [5])
+
+    def test_index_plan_preserves_int32_inputs(self):
+        torch = self.torch
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _compute_state_block_index_plan,
+        )
+
+        plan = _compute_state_block_index_plan(
+            4,
+            torch.tensor([4, 7], dtype=torch.int32),
+            torch.tensor([5, 8], dtype=torch.int32),
+        )
+
+        self.assertEqual(plan.before.dtype, torch.int32)
+        self.assertEqual(plan.after.dtype, torch.int32)
+        self.assertEqual(plan.in_slots.dtype, torch.int32)
+        self.assertEqual(plan.out_slots.dtype, torch.int32)
+        self.assertEqual(plan.in_slots.tolist(), [0, 1])
+        self.assertEqual(plan.out_slots.tolist(), [1, 1])
 
     def test_out_slot_pad_raises(self):
         with self.assertRaises(ValueError):
@@ -181,25 +258,16 @@ class CacheContractMetadataTest(unittest.TestCase):
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
             )
-            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.ForwardMode = ForwardMode
-        config = SimpleNamespace(
-            device="cpu",
-            num_attention_heads=16,
-            num_kv_heads=16,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            head_dim=128,
-            is_draft=False,
-            speculative_num_draft_tokens=1,
-            max_bs=8,
+        backend = MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=16, head_dim=128, spec_tokens=1)
         )
-        backend = MambaAttnBackend(config)
         stub_pool = _ContractPool(
             self.P,
             {0: ("linear_attention", object(), object())},
@@ -211,14 +279,31 @@ class CacheContractMetadataTest(unittest.TestCase):
     def test_decode_metadata(self):
         torch = self.torch
         backend = self.backend
-        backend.init_forward_metadata(
-            bs=1,
-            req_pool_indices=torch.tensor([0], dtype=torch.int32),
-            seq_lens=torch.tensor([9], dtype=torch.int32),
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([9], dtype=torch.int32)
+        block_tables = {
+            "linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)
+        }
+        # Decode metadata is the refresh's alone; a DECODE init is a contract
+        # violation on every node, the state backend included.
+        with self.assertRaisesRegex(RuntimeError, "refresh_decode_metadata"):
+            backend.init_forward_metadata(
+                bs=1,
+                num_extends=0,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=self.ForwardMode.DECODE,
+                block_tables=block_tables,
+                **_no_extends(torch, "cpu"),
+            )
+        backend.init_cuda_graph_state(max_bs=1)
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            req_pool_indices,
+            seq_lens,
             forward_mode=self.ForwardMode.DECODE,
-            cache_metadata=_CacheMetadata(
-                {"linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)}
-            ),
+            block_tables=block_tables,
         )
         md = backend.forward_metadata
         # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
@@ -232,13 +317,18 @@ class CacheContractMetadataTest(unittest.TestCase):
         backend = self.backend
         backend.init_forward_metadata(
             bs=1,
+            num_extends=1,
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
             seq_lens=torch.tensor([8], dtype=torch.int32),
             forward_mode=self.ForwardMode.EXTEND,
-            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
-            cache_metadata=_CacheMetadata(
-                {"linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)}
+            block_tables={
+                "linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)
+            },
+            **_extend_kwargs(
+                torch,
+                torch.tensor([8], dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                "cpu",
             ),
         )
         md = backend.forward_metadata
@@ -252,21 +342,6 @@ class CacheContractMetadataTest(unittest.TestCase):
         self.assertEqual(md.extend_seq_lens_cpu.tolist(), [8])
         self.assertEqual(md.query_start_loc.tolist(), [0, 8])
 
-    def test_extend_metadata_requires_host_lens(self):
-        torch = self.torch
-        backend = self.backend
-        with self.assertRaisesRegex(RuntimeError, "host extend lengths"):
-            backend.init_forward_metadata(
-                bs=1,
-                req_pool_indices=torch.tensor([0], dtype=torch.int32),
-                seq_lens=torch.tensor([8], dtype=torch.int32),
-                forward_mode=self.ForwardMode.EXTEND,
-                extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
-                cache_metadata=_CacheMetadata(
-                    {"linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)}
-                ),
-            )
-
     def test_mixed_metadata_pads_decode_rows(self):
         torch = self.torch
         backend = self.backend
@@ -276,10 +351,14 @@ class CacheContractMetadataTest(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
             seq_lens=torch.tensor([8, 9], dtype=torch.int32),
             forward_mode=self.ForwardMode.MIXED,
-            extend_seq_lens=torch.tensor([5, 1], dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
-            cache_metadata=_CacheMetadata(
-                {"linear_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)}
+            block_tables={
+                "linear_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+            },
+            **_extend_kwargs(
+                torch,
+                torch.tensor([5], dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                "cpu",
             ),
         )
         md = backend.forward_metadata
@@ -292,7 +371,7 @@ class CacheContractMetadataTest(unittest.TestCase):
     def test_capture_replay_metadata(self):
         torch = self.torch
         backend = self.backend
-        backend.init_cuda_graph_state(max_num_tokens=2)
+        backend.init_cuda_graph_state(max_bs=2)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=1,
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
@@ -306,14 +385,16 @@ class CacheContractMetadataTest(unittest.TestCase):
             md.state_out_blocks_by_group["linear_attention"].tolist(), [-1]
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=1,
-            req_pool_indices=torch.tensor([0], dtype=torch.int32),
-            seq_lens=torch.tensor([9], dtype=torch.int32),
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([9], dtype=torch.int32),
             forward_mode=self.ForwardMode.DECODE,
-            cache_metadata=_CacheMetadata(
-                {"linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)}
-            ),
+            for_graph_replay=True,
+            block_tables={
+                "linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)
+            },
         )
         md = backend.forward_metadata
         self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [2])
@@ -330,25 +411,16 @@ class VerifyMetadataTest(unittest.TestCase):
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
             )
-            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.ForwardMode = ForwardMode
-        config = SimpleNamespace(
-            device="cpu",
-            num_attention_heads=2,
-            num_kv_heads=2,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            head_dim=2,
-            is_draft=False,
-            speculative_num_draft_tokens=4,
-            max_bs=8,
+        self.backend = MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=2, head_dim=2, spec_tokens=4)
         )
-        self.backend = MambaAttnBackend(config)
         self.state_buffers = {
             layer_id: (
                 torch.zeros((8, 2, 3), dtype=torch.bfloat16),
@@ -367,27 +439,29 @@ class VerifyMetadataTest(unittest.TestCase):
             },
         )
         self.backend.set_kv_pool(stub_pool)
-        self.backend.init_cuda_graph_state(max_num_tokens=2)
+        self.backend.init_cuda_graph_state(max_bs=2)
 
     def test_target_verify_uses_per_layer_scratch(self):
         torch = self.torch
-        self.backend.init_forward_metadata(
-            bs=1,
-            req_pool_indices=torch.tensor([1], dtype=torch.int32),
-            seq_lens=torch.tensor([8], dtype=torch.int32),
+        self.backend.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([8], dtype=torch.int32),
             forward_mode=self.ForwardMode.DECODE,
-            tokens_per_req=4,
-            cache_metadata=_CacheMetadata(
-                {
-                    "linear_attention_0": torch.tensor([[3, 4]], dtype=torch.int32),
-                    "linear_attention_1": torch.tensor([[5, 6]], dtype=torch.int32),
-                }
-            ),
+            block_tables={
+                "linear_attention_0": torch.tensor([[3, 4]], dtype=torch.int32),
+                "linear_attention_1": torch.tensor([[5, 6]], dtype=torch.int32),
+            },
         )
 
         metadata = self.backend.forward_metadata
         self.assertEqual(metadata.mamba_output_indices.tolist(), [[1, 2, 3, 4]])
         self.assertEqual(metadata.mamba_output_indices.dtype, torch.int32)
+        self.assertEqual(
+            metadata.state_in_blocks_by_group["linear_attention_0"].dtype,
+            torch.int32,
+        )
         self.assertEqual(
             metadata.state_in_blocks_by_group["linear_attention_0"].tolist(),
             [3],
@@ -429,7 +503,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
             )
-            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -447,25 +521,23 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self, conv_slab, ssm_slab, spec_num_tokens=1, *, replay_ssm=False
     ):
         torch = self.torch
-        config = SimpleNamespace(
-            device="cuda",
-            num_attention_heads=self.H,
-            num_kv_heads=self.H,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            head_dim=self.D,
-            is_draft=False,
-            speculative_num_draft_tokens=spec_num_tokens,
-            replay_ssm=replay_ssm,
-            max_bs=8,
+        backend = self.MambaAttnBackend(
+            *_mamba_config_pair(
+                torch,
+                heads=self.H,
+                head_dim=self.D,
+                spec_tokens=spec_num_tokens,
+                device="cuda",
+                replay_ssm=replay_ssm,
+            )
         )
-        backend = self.MambaAttnBackend(config)
         stub_pool = _ContractPool(
             self.P,
             {0: ("linear_attention", conv_slab, ssm_slab)},
         )
         backend.set_kv_pool(stub_pool)
         self.assertTrue(backend.state_paging_active)
+        backend.init_cuda_graph_state(max_bs=2)
         return backend
 
     def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
@@ -486,19 +558,17 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         backend = self._make_backend(
             conv_slab, ssm_slab, spec_num_tokens=4, replay_ssm=True
         )
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
-            seq_lens=torch.tensor([8, 8], dtype=torch.int32, device="cuda"),
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            torch.tensor([8, 8], dtype=torch.int32, device="cuda"),
             forward_mode=self.ForwardMode.DECODE,
-            tokens_per_req=4,
-            cache_metadata=_CacheMetadata(
-                {
-                    "linear_attention": torch.tensor(
-                        [[3, 4], [5, 6]], dtype=torch.int32, device="cuda"
-                    )
-                }
-            ),
+            block_tables={
+                "linear_attention": torch.tensor(
+                    [[3, 4], [5, 6]], dtype=torch.int32, device="cuda"
+                )
+            },
         )
 
         backend._seed_verify_scratch_batched(2, 4)
@@ -602,17 +672,20 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         # Prefill 8 tokens: in = null page 0, out = page 2 (slot 1).
         backend.init_forward_metadata(
             bs=1,
+            num_extends=1,
             req_pool_indices=req_pool_indices,
             seq_lens=torch.tensor([self.PREFILL], dtype=torch.int32, device="cuda"),
             forward_mode=ForwardMode.EXTEND,
-            extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device="cuda"),
-            extend_seq_lens_cpu=torch.tensor([self.PREFILL], dtype=torch.int32),
-            cache_metadata=_CacheMetadata(
-                {
-                    "linear_attention": torch.tensor(
-                        [[1, 2]], dtype=torch.int32, device="cuda"
-                    )
-                }
+            block_tables={
+                "linear_attention": torch.tensor(
+                    [[1, 2]], dtype=torch.int32, device="cuda"
+                )
+            },
+            **_extend_kwargs(
+                torch,
+                torch.tensor([self.PREFILL], dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                "cuda",
             ),
         )
         self.assertEqual(
@@ -653,12 +726,13 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         expected_pages = [(2, 3), (3, 3), (3, 3)]
         for i in range(self.DECODES):
             pos = self.PREFILL + i
-            backend.init_forward_metadata(
-                bs=1,
-                req_pool_indices=req_pool_indices,
-                seq_lens=torch.tensor([pos + 1], dtype=torch.int32, device="cuda"),
+            backend.refresh_decode_metadata(
+                1,
+                1,
+                req_pool_indices,
+                torch.tensor([pos + 1], dtype=torch.int32, device="cuda"),
                 forward_mode=ForwardMode.DECODE,
-                cache_metadata=_CacheMetadata({"linear_attention": rows}),
+                block_tables={"linear_attention": rows},
             )
             self.assertEqual(
                 backend.forward_metadata.state_in_blocks_by_group[

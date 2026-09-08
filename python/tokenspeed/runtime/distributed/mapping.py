@@ -404,6 +404,9 @@ class Mapping(MappingBase):
             tp_size=vision_tp_size,
             dp_size=vision_dp_size,
         )
+        # Linear-attention layers follow the attention TP width unless
+        # overridden — the default is behavior-identical to reading
+        # mapping.attn.tp_size.
         self.linear_attn = LinearAttnLayerMapping(
             rank=rank,
             world_size=stage_world_size,

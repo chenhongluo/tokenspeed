@@ -42,9 +42,11 @@ from tokenspeed_kernel.ops.gemm.deep_gemm import (
     transform_sf_into_required_layout,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_fp8_blockscale,
     has_flashinfer_mxfp8,
     prepare_flashinfer_fp8_blockscale_weight_scales,
+    prepare_nvfp4_a16_weights,
     use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
@@ -88,6 +90,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
@@ -100,6 +103,7 @@ __all__ = [
     "mm",
     "prepare_fp8_linear",
     "prepare_weight_nz",
+    "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
 
@@ -769,6 +773,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
         "deep_gemm_mm_fp8_blockscale",
+        "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
     }
 )
@@ -831,6 +836,20 @@ def _gemm_format_signature(
         return format_signature(
             a=tensor_format("scaled-fp8", A.dtype, scale=scale),
             b=tensor_format("scaled-fp8", B.dtype, scale=scale),
+        )
+    if quant == "nvfp4_a16":
+        if A_scales is not None:
+            raise ValueError("nvfp4_a16 requires A_scales=None for dense activations")
+        if B_scales is None:
+            raise ValueError("nvfp4_a16 format selection requires B_scales")
+        b_scale = ScaleFormat(
+            storage_dtype=B_scales.dtype,
+            granularity="block",
+            block_shape=(16,),
+        )
+        return format_signature(
+            a=dense_tensor_format(A.dtype),
+            b=tensor_format("nvfp4", B.dtype, scale=b_scale),
         )
     if quant == "nvfp4":
         a_scale = ScaleFormat(
@@ -1040,12 +1059,13 @@ def mm(
         out: Optional output buffer. The output may be a strided view
             but must have contiguous rows (``stride(-1) == 1``).
         out_dtype: Output dtype (defaults to ``A.dtype``).
-        alpha: Global scaling factor (nvfp4 only).
+        alpha: Global scaling factor (nvfp4 modes only).
         block_size: Block size for block-wise quantization, e.g.
             ``[128, 128]``
-        quant: Explicit quant type override.  One of ``"mxfp8"``,
-            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
-            If ``None``, inferred from input dtypes and scales.
+        quant: Explicit quant type override. One of ``"mxfp8"``, ``"fp8"``,
+            ``"nvfp4"``, ``"nvfp4_a16"``, ``"mxfp4"``, ``"none"``.
+            ``"nvfp4_a16"`` uses dense BF16 activations and prepared packed
+            NVFP4 weights. If ``None``, inferred from input dtypes and scales.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         prepacked_scales: Whether the FP8 block scales already use the selected
@@ -1058,6 +1078,9 @@ def mm(
     M = A.shape[0]
     if quant == "mxfp4":
         K = A.shape[-1] * 2
+        N = B.shape[0]
+    elif quant == "nvfp4_a16":
+        K = A.shape[-1]
         N = B.shape[0]
     else:
         K = A.shape[-1]

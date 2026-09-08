@@ -276,7 +276,7 @@ def test_lite_kda_projects_featurewise_beta_and_applies_output_gate():
         forward_mode=object(),
         bs=2,
     )
-    output = layer(torch.arange(2), hidden, ctx, torch.tensor([0, 1]))
+    output = layer(torch.arange(2), hidden, ctx)
 
     assert layer.conv_weights is backend.kwargs["conv_weights"]
     cached_conv_weights = layer.conv_weights
@@ -411,7 +411,6 @@ def test_ascend_lite_model_uses_fused_output_epilogue():
         torch.arange(2, device="npu"),
         hidden,
         ctx,
-        torch.arange(2, dtype=torch.int32, device="npu"),
     )
     gate = F.linear(
         hidden,
@@ -506,7 +505,7 @@ def test_ascend_registry_runs_scalar_and_featurewise_kda_reference(featurewise):
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_lite_kda_production_shape_prefill_matches_continuous_decode():
-    from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
+    from tokenspeed.runtime.layers.attention.backends.state.kda import (
         KdaAttnBackend,
     )
 

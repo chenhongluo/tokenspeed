@@ -101,18 +101,39 @@ def test_flash_kda_registers_hybrid_mla_kda_attention() -> None:
 
 def test_fgbkda_backend_disables_incompatible_verify_replay(monkeypatch) -> None:
     from tokenspeed.runtime.layers.attention import registry
-    from tokenspeed.runtime.layers.attention.backends import hybrid_kda
+    from tokenspeed.runtime.layers.attention.backends.state import kda
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         LINEAR_ATTENTION,
     )
 
-    config = SimpleNamespace(
-        device=torch.device("cpu"),
+    softmax = SoftmaxAttnConfig(
         num_attention_heads=2,
         num_kv_heads=2,
         attn_tp_size=1,
-        dtype=torch.bfloat16,
         head_dim=8,
+    )
+    linear = LinearAttnConfig(
+        num_k_heads=2,
+        num_v_heads=2,
+        head_k_dim=8,
+        head_v_dim=8,
+        conv_kernel_size=4,
+        layer_ids=(0,),
+        tp_size=1,
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method=None,
+        prefix_granularity=128,
+        context_len=128,
+        components=(softmax, linear),
         is_draft=False,
         speculative_num_draft_tokens=1,
         max_bs=1,
@@ -133,7 +154,9 @@ def test_fgbkda_backend_disables_incompatible_verify_replay(monkeypatch) -> None
             runtime_contract=SimpleNamespace(group_specs=(state_group,))
         ),
         state_group_by_layer={0: LINEAR_ATTENTION},
-        get_component=lambda _layer_id, _name: None,
+        get_component=lambda _layer_id, name: (
+            torch.zeros(2, 48, 3) if name == "conv_state" else torch.zeros(2, 2, 8, 8)
+        ),
     )
     monkeypatch.setattr(
         registry,
@@ -142,7 +165,7 @@ def test_fgbkda_backend_disables_incompatible_verify_replay(monkeypatch) -> None
     )
     monkeypatch.setattr(registry, "_resolve_kda_backend", lambda _name: "auto")
     monkeypatch.setattr(
-        hybrid_kda, "kda_replay_commit_supported", lambda *_args, **_kwargs: True
+        kda, "kda_replay_commit_supported", lambda *_args, **_kwargs: True
     )
 
     backend = registry._create_hybrid_linear_attn_backend(
@@ -408,7 +431,6 @@ class _CaptureLayer(torch.nn.Module):
         positions,
         hidden_states,
         ctx,
-        out_cache_loc,
         residual,
         capture_hidden_state=None,
     ):
@@ -439,7 +461,6 @@ def test_flash_lite_eagle3_captures_materialized_completed_layer_residual() -> N
         input_ids=torch.empty(1, dtype=torch.int64),
         positions=torch.empty(1, dtype=torch.int64),
         ctx=ctx,
-        out_cache_loc=torch.empty(1, dtype=torch.int64),
         input_embeds=torch.ones(1, 1),
     )
 

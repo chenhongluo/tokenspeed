@@ -66,12 +66,6 @@ class RuntimeStates:
         self.remote_spec_candidate_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
-        self.linear_penalties = torch.zeros(
-            (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
-        )
-        self.scaling_penalties = torch.ones(
-            (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
-        )
 
     @property
     def has_request_token_history(self) -> bool:
@@ -107,8 +101,6 @@ class RuntimeStates:
         extend_prefix_lens: torch.Tensor,
     ) -> None:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
-        self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
-        self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
         self.remote_spec_candidate_ready[extend_request_pool_indices] = False
 
     def seed_request_token_history(

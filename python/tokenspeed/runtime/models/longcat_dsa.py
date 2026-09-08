@@ -34,8 +34,6 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
-    current_forward_ctx,
-    slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -756,7 +754,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         *,
         selection: LongCatDSASelection | None,
@@ -766,7 +763,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             comm_manager,
             block_scale,
             selection,
@@ -782,7 +778,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
         selection: LongCatDSASelection | None,
@@ -803,12 +798,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         logical_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
         qkv = qkv[..., :logical_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
-        metadata = getattr(ctx.attn_backend, "forward_metadata", None)
-        token_to_req = getattr(metadata, "token_to_req_indices", None)
-        if current_forward_ctx() is not None and token_to_req is not None:
-            positions, qkv, out_cache_loc = slice_to_real_tokens(
-                token_to_req.numel(), positions, qkv, out_cache_loc
-            )
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
         )
@@ -826,18 +815,31 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             total_tokens=int(q_norm.shape[0]),
         )
         num_prefill_tokens = window.start
+        prefill_locs = (
+            ctx.attn_backend.write_locations(self.attn_mqa, ForwardMode.EXTEND)
+            if num_prefill_tokens > 0
+            else None
+        )
+        decode_locs = (
+            ctx.attn_backend.write_locations(self.attn_mqa, ForwardMode.DECODE)
+            if window.num_tokens > 0
+            else None
+        )
+        if prefill_locs is not None and decode_locs is not None:
+            out_cache_loc = torch.cat((prefill_locs, decode_locs))
+        elif prefill_locs is not None:
+            out_cache_loc = prefill_locs
+        else:
+            out_cache_loc = decode_locs
         if self.computes_selection:
             indexer_hidden = comm_manager.pre_attn_comm(hidden_states, ctx)
             indexer_hidden = _slice_indexer_rows(
                 indexer_hidden, expected_rows=int(q_norm.shape[0])
             )
             indexer_output = self._require_indexer()(indexer_hidden, q_norm, positions)
-            index_cache_loc = ctx.attn_backend.select_out_cache_loc(
-                self.attn_mqa, out_cache_loc, ctx.forward_mode
-            )
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.selection_owner_layer_id,
-                index_cache_loc,
+                out_cache_loc,
                 indexer_output.key,
             )
             if ctx.num_extends > 0:
@@ -873,7 +875,7 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
                 q[:num_prefill_tokens],
                 latent_cache[:num_prefill_tokens],
                 prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
+                prefill_locs,
                 output[:num_prefill_tokens],
                 active_selection.prefill,
             )
@@ -896,12 +898,12 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
                 q[window.start : window.end],
                 latent_cache[window.start : window.end],
                 decode_ctx,
-                out_cache_loc[window.start : window.end],
+                decode_locs,
                 output[window.start : window.end],
                 topk_indices,
                 topk_lens,
             )
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             output = output.index_select(0, ctx.gather_ids)
         return self.o_proj(output)[0]
 
@@ -959,7 +961,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             key,
             key[..., : self.kv_lora_rank] if key is not None else None,
             ctx,
-            out_cache_loc,
             save_kv_cache=need_save_kv,
             topk_indices=topk_indices,
             topk_lens=topk_lens,

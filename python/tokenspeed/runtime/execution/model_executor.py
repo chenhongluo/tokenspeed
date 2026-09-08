@@ -34,20 +34,19 @@ from tokenspeed_kernel.ops.tuning import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
-from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -63,6 +62,9 @@ from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
     setup_grammar_step,
+)
+from tokenspeed.runtime.layers.attention.backends.base import (
+    resolve_cuda_graph_support,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -194,7 +196,6 @@ class ModelExecutorConfig:
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
-    use_v4_mtp_paged_metadata: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -252,28 +253,11 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
-        # DSA's sparse indexer reads the attention backend's
-        # ``chunked_prefill_metadata`` from inside the captured prefill segment,
-        # but the prefill graph rebinds only the live ForwardContext at replay --
-        # the backend metadata object stays frozen at capture-time (dummy) values.
-        # Qwen4-Exp's PLE/QSA modules likewise own token-indexed side-state writes;
-        # replay pads token rows to a bucket while their cache metadata remains
-        # real-token shaped. Keep those prefills eager so padding can never
-        # advance n-gram, short-conv, or compressed-key state.
-        text_config = model_config.hf_text_config
-        qwen4_exp_has_side_state = getattr(text_config, "model_type", None) == (
-            "qwen4_exp_text"
-        ) and bool(
-            getattr(text_config, "ple_layer_ids", None)
-            or getattr(text_config, "indexer_n_heads", None) is not None
-        )
         # This is keyed by OE state ownership, not Host/Device placement. Both
         # admitted providers currently depend on token-indexed state that the
         # Prefill graph input ABI cannot rebind safely; Decode graph is separate.
         disable_prefill_graph = (
             bool(server_args.disable_prefill_graph)
-            or (model_config.attention_arch == AttentionArch.DSA)
-            or qwen4_exp_has_side_state
             or getattr(model_config, "oe_state_provider", None) is not None
         )
 
@@ -317,7 +301,6 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
-            use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
         )
@@ -348,91 +331,23 @@ class ModelExecutor:
         # Every pool runs on the shared cache arena and publishes a runtime
         # contract; the per-group tables travel as CacheBatchMetadata. Fail
         # fast here rather than at the first forward or, worse, a CUDA-graph
-        # capture-path assert: a missing contract means the model family has
-        # no cache recipe yet, and an uncovered family means a backend that
-        # never reads that group's tables.
+        # capture-path assert: an uncovered contract family means a backend
+        # that never reads that group's tables.
         validate_scheduler_config(
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
         )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
-
-        # The batch-ordered full-history table backs out_cache_loc and the
-        # draft page table. First contract group with family=history and
-        # retention=full_history.
-        self._full_history_group_id = next(
-            (
-                str(spec.group_id)
-                for spec in self._cache_runtime_contract.group_specs
-                if spec.family == "history" and spec.retention == "full_history"
-            ),
-            None,
-        )
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
 
-        # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
-        # The grain comes off the draft view's arena (the plan's P), never from
-        # the view itself -- a recipe may pin a P the config never saw.
-        self._block_granularity = int(
-            _cache_arena_attr(draft_token_to_kv_pool, "prefix_granularity", 0)
-            or config.prefix_granularity
-        )
-        draft_kernel_page_size = getattr(draft_attn_backend, "kernel_page_size", None)
-        if draft_attn_backend is not None and draft_kernel_page_size is None:
-            raise RuntimeError("draft attention backend must expose kernel_page_size")
-        # Without a draft backend the staging path degenerates to the
-        # scheduler table grain (identity expansion).
-        self._draft_kernel_page_size = int(
-            draft_kernel_page_size or self._block_granularity
-        )
-        if self._block_granularity % self._draft_kernel_page_size:
-            raise ValueError(
-                f"prefix granularity {self._block_granularity} is not a multiple "
-                f"of the draft kernel page size {self._draft_kernel_page_size}"
-            )
-        # DraftPageStaging.publish expands the target full-history table into the
-        # draft backend's kernel pages once, and every draft backend reads that
-        # staged table as-is (identity). No backend re-expands with a logical
-        # size, so there is no double-expansion to guard against here.
-
-        # physical_context_len already covers the spec-verify overshoot of a
-        # finished request lingering one overlap step, including the lingering
-        # step's next draft block (see _SPEC_OVERSHOOT_SPANS in server_args.py).
-        # A write past this width would go out of bounds and hang the attention
-        # kernel; the output processor's physical-extent tripwire raises first.
-        max_num_pages_per_req = (
-            config.physical_context_len + self._draft_kernel_page_size - 1
-        ) // self._draft_kernel_page_size
-
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
-        # Address-stable staging of the full-history table for in-graph draft
-        # consumers; also the zero/dummy placeholder for idle/warmup forwards
-        # before the cache contract binds. Single writer; unit is the draft
-        # kernel page; publish scrubs [bs, padded_bs).
-        self._draft_staging = DraftPageStaging(
-            max_bs=max_bs,
-            max_pages_per_req=max_num_pages_per_req,
-            block_granularity=self._block_granularity,
-            draft_kernel_page_size=self._draft_kernel_page_size,
-            full_history_group_id=self._full_history_group_id,
-            enabled=not getattr(
-                attn_backend, "cache_group_tables_replace_draft_page_table", False
-            ),
-            device=self.device,
-        )
-        self.draft_page_table = self._draft_staging.table
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            # Indexes the scheduler's full-history table: scheduler-table page ids.
-            page_size=self._block_granularity,
-            # The cache arena reserves parent 0 as the null page, so slot 0
-            # is the dummy slot padded tokens write into.
-            dummy_kv_slot=0,
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
@@ -465,7 +380,6 @@ class ModelExecutor:
                 draft_model_runner=draft_model_runner,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
-                cache_view=self._draft_staging.view,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
@@ -515,6 +429,12 @@ class ModelExecutor:
                 draft_token_to_kv_pool.arena.cache_group_specs,
             )
 
+        # Backend-declared CUDA-graph support, AND-composed over the target
+        # and draft trees (the decode graph records the whole step, drafter
+        # loop included). Startup-time and class-attribute-driven, so every
+        # DP rank resolves the same answer.
+        graph_support = resolve_cuda_graph_support(attn_backend, draft_attn_backend)
+
         self.dp_sampling_runtime_config = setup_dp_sampling(
             model=self.model_runner.model,
             sampling_backend=self.sampling_backend,
@@ -549,7 +469,7 @@ class ModelExecutor:
                 device=self.device,
             )
 
-        self.forward_step = CudaGraphWrapper(
+        self.forward_step = ForwardStepRunner(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
@@ -562,6 +482,7 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         if config.enforce_eager:
@@ -578,8 +499,8 @@ class ModelExecutor:
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
-            page_table=self.draft_page_table,
             drafter=self.drafter,
+            graph_supported=graph_support.prefill_graph,
         )
 
         self._autotune()
@@ -681,7 +602,7 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
             ctx.request_token_history = self._request_token_history_view(ctx.bs)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
@@ -693,7 +614,6 @@ class ModelExecutor:
                     ctx=ctx,
                     input_ids=ib.input_ids_buf[:num_tokens],
                     positions=positions,
-                    out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
                 )
         set_autotune_process_group(None)
         torch.get_device_module(self.device).synchronize()
@@ -729,19 +649,6 @@ class ModelExecutor:
             self.grammar_runtime
             if isinstance(self.grammar_runtime, EagerGrammarBuffers)
             else None
-        )
-
-    def _publish_draft_page_table(self, forward_op, block_tables) -> None:
-        """Stage the full-history table for the draft (see DraftPageStaging).
-
-        The upcoming replay may read up to the widest captured batch; without
-        the wrapper's padded_bs at hand, scrub through the table end.
-        """
-        if self.drafter is None:
-            return
-        bs = len(forward_op.request_pool_indices)
-        self._draft_staging.publish(
-            block_tables, bs=bs, padded_bs=self.draft_page_table.shape[0]
         )
 
     def _pp_recv_stage_state(self, num_tokens: int):
@@ -801,7 +708,7 @@ class ModelExecutor:
         return self.config.pp_rank == 0
 
     @nvtx_range("target_forward", color="red")
-    def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+    def _run_target_forward(self, ctx: ForwardContext):
         positions = self._active_positions_override
         if positions is None:
             if self.config.model_is_mrope:
@@ -819,12 +726,6 @@ class ModelExecutor:
                 ctx,
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
-                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-                req_pool_indices=req_pool_indices,
-                seq_lens=self.input_buffers.seq_lens_buf[:bs],
-                extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                    : ctx.num_extends
-                ],
                 pp_inbound=pp_inbound,
             )
             return output
@@ -845,12 +746,6 @@ class ModelExecutor:
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
-            self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            req_pool_indices=req_pool_indices,
-            seq_lens=self.input_buffers.seq_lens_buf[:bs],
-            extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                : ctx.num_extends
-            ],
             multimodal_context=self._active_multimodal_context,
         )
 
@@ -868,6 +763,26 @@ class ModelExecutor:
         ]
         return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
+    def _decode_candidates(self, ctx: ForwardContext) -> torch.Tensor | None:
+        """This step's decode-row candidate window: ``[num_decodes, N]``.
+
+        Decode rows' input ids sit at the tail of ``input_ids_buf`` (prefill
+        tokens first), N tokens per request: column 0 the last verified
+        token, columns 1.. the draft candidates. Non-speculative serving is
+        the N == 1 case — a one-column window with nothing to accept, which
+        verify() resolves to exactly one sampled token (equivalence pinned
+        by test_decode_verify_n1_equivalence.py). A persistent-buffer view,
+        so the captured sampler reads live ids on every replay.
+        """
+        num_decodes = ctx.bs - ctx.num_extends
+        if num_decodes == 0:
+            return None
+        n = self.config.output_length
+        num_prefill_tokens = ctx.input_num_tokens - num_decodes * n
+        return self.input_buffers.input_ids_buf[
+            num_prefill_tokens : ctx.input_num_tokens
+        ].reshape(num_decodes, n)
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -876,9 +791,13 @@ class ModelExecutor:
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
     ):
-        if self.drafter is None:
-            return self.sampling_backend.sample(logits_output, sampling_info)
+        """One sampling rule for every batch: prefill rows sample, decode
+        rows verify.
 
+        Non-speculative decode is verify's N == 1 case: the one-column
+        candidate window accepts nothing and resolves to exactly one sampled
+        token through the same pool kernels sample() uses (equivalence
+        pinned by test_decode_verify_n1_equivalence.py)."""
         num_extends = ctx.num_extends
         num_decodes = ctx.bs - num_extends
 
@@ -899,6 +818,15 @@ class ModelExecutor:
         prefill_tokens, prefill_accept = self.sampling_backend.sample(
             prefill_out, sampling_info[:num_extends]
         )
+        # sample() lands its outputs (tokens, accept lengths and, with output
+        # logprobs on, the selected logprobs) in the backend's packed output
+        # region — the same buffer prefix verify() writes next, so snapshot
+        # the prefill rows before verifying. Mixed rounds are eager-only, so
+        # the allocation never lands inside a captured graph.
+        prefill_tokens = prefill_tokens.clone()
+        prefill_accept = prefill_accept.clone()
+        if prefill_out.next_token_logprobs is not None:
+            prefill_out.next_token_logprobs = prefill_out.next_token_logprobs.clone()
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
             decode_out, sampling_info[num_extends:], candidates
@@ -966,8 +894,6 @@ class ModelExecutor:
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
     ):
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-
         # Fork grammar onto its side stream so fill + H2D overlap with
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
@@ -978,18 +904,10 @@ class ModelExecutor:
             )
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
-        if (
-            self.drafter is not None
-            and getattr(self.drafter, "_incremental_proj_enabled", False)
-            and ctx.num_extends == 0
-        ):
-            self.drafter._prepare_incremental_proj(
-                ctx.input_num_tokens,
-                self.input_buffers.positions_buf[: ctx.input_num_tokens],
-                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            )
+        if self.drafter is not None:
+            self.drafter.prepare_target_forward(ctx)
 
-        logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+        logits_output = self._run_target_forward(ctx)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not
@@ -1000,19 +918,10 @@ class ModelExecutor:
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
             return output_tokens, accept_lengths, None
 
-        if self.drafter is not None and getattr(
-            self.drafter, "_incremental_proj_enabled", False
-        ):
-            self.drafter.target_language_model.model._dflash_incr_active = False
-
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
 
-        candidates = (
-            self.drafter.get_candidates(ctx)
-            if self.config.spec_algo is not None
-            else None
-        )
+        candidates = self._decode_candidates(ctx)
 
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
@@ -1086,15 +995,10 @@ class ModelExecutor:
             )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
-    def _build_sampling_info(
-        self,
-        bs: int,
-        sampling_params_list: list[SamplingParams],
-    ) -> SamplingBatchInfo:
+    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -1130,7 +1034,6 @@ class ModelExecutor:
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            is_all_greedy=True,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -1148,16 +1051,20 @@ class ModelExecutor:
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
             # only the model forward, which still participates in collectives.
-            # A rank that previously served a larger batch still has real page
-            # ids in the padded_bs rows the captured drafter steps read; their
-            # draft KV writes would alias live requests' pages (#955).
-            self._draft_staging.publish(None, bs=0, padded_bs=padded_bs)
+            # The draft router's idle refresh zeroes its history stack rows,
+            # so the captured drafter steps' KV writes land on the dummy
+            # page (#955's aliasing hazard is handled at the table source).
+            ib = self.input_buffers
             with nvtx_range("forward_step idle", color="blue"):
                 self.forward_step(
                     bs=0,
                     ctx=ctx,
                     sampling_info=sampling_info,
-                    page_table=self.draft_page_table,
+                    extend_with_prefix=False,
+                    extend_prefix_lens=ib.extend_prefix_lens_buf[:0],
+                    extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
+                    extend_seq_lens=ib.extend_seq_lens_buf[:0],
+                    extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
                 )
             return
 
@@ -1169,7 +1076,6 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
-            out_cache_loc=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1205,9 +1111,17 @@ class ModelExecutor:
                     draft_ctx,
                     input_ids=empty,
                     positions=empty,
-                    out_cache_loc=empty,
                     spec_step_idx=step_idx,
                 )
+
+    def order_cache_operations(self) -> None:
+        """Order caller-stream cache work after previously submitted forwards.
+
+        Called on the forward thread before D2H or page reuse. This inserts
+        a GPU dependency, not a host synchronization; the forward prologue's
+        wait is too late to protect cache operations submitted before it.
+        """
+        self.device_module.current_stream().wait_stream(self.execution_stream)
 
     def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
@@ -1371,24 +1285,10 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-            # out_cache_loc reads the batch-ordered full-history table (row i ==
-            # batch position i). Without a full-history group the zeroed draft
-            # table stands in (out_cache_loc then lands on the dummy page 0;
-            # such pools address their KV through their own per-group tables).
-            page_table = (
-                block_tables.get(self._full_history_group_id)
-                if self._full_history_group_id is not None
-                else None
-            )
-            if page_table is None:
-                page_table = self.draft_page_table
-            # Drafts read their pages from the batch-ordered draft page table.
-            self._publish_draft_page_table(forward_op, block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
-                out_loc_table=page_table,
             )
             if request_history_seeds:
                 slots, prefix_lengths, seed_token_ids = zip(*request_history_seeds)
@@ -1494,7 +1394,7 @@ class ModelExecutor:
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs, sampling_params_list)
+                    sampling_info = self._build_sampling_info(bs)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
@@ -1559,7 +1459,6 @@ class ModelExecutor:
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
-                        page_table=self.draft_page_table,
                         extend_with_prefix=extend_with_prefix,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                             :num_extends
@@ -1574,10 +1473,6 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
-                        cache_metadata=cache_metadata,
-                        forward_batch=(
-                            forward_op if cache_metadata is not None else None
-                        ),
                     )
                     if timing_enabled:
                         forward_step_ms = (

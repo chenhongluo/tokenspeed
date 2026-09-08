@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -31,8 +32,12 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_qwen4_exp,
 )
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import (
+    AttnConfig,
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
@@ -68,14 +73,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def _ordinary_cache_family(config: BaseAttnConfig | None) -> CacheModelFamily | None:
-    if type(config) is MHAConfig:
+def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None:
+    if config is None:
+        return None
+    softmax_attn = config.component(SoftmaxAttnConfig)
+    if type(softmax_attn) is MHAConfig:
         return "mha"
-    if type(config) is MLAConfig:
+    if type(softmax_attn) is MLAConfig:
         return "mla"
-    if isinstance(config, DSAConfig):
+    if isinstance(softmax_attn, DSAConfig):
         return "dsa"
-    if isinstance(config, MSAConfig):
+    if isinstance(softmax_attn, MSAConfig):
         return "msa"
     return None
 
@@ -118,10 +126,8 @@ def _cache_storage_report(
     fixed_workspace_bytes: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
-    arena = getattr(pool, "arena", None)
-    plan = getattr(arena, "plan", None)
-    if plan is None:
-        raise RuntimeError("cache pool has no memory plan; every pool is LCM-planned")
+    arena = pool.arena
+    plan = arena.plan
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
@@ -196,6 +202,13 @@ _HYBRID_MLA_KDA_ARCHITECTURES = {
     "FLASHLocalForCausalLM",
     "KimiK3ForConditionalGeneration",
 }
+_HYBRID_DSA_KDA_TARGET_ARCHITECTURES = {
+    "Glm53FlashForConditionalGeneration",
+}
+_HYBRID_DSA_KDA_ARCHITECTURES = {
+    *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
+    "Glm53FlashForConditionalGenerationNextN",
+}
 
 # Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.
 _INKLING_ARCHITECTURES = {
@@ -203,11 +216,175 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGenerationNextN",
 }
 
+_DSPARK_DRAFT_ARCHITECTURE = "DeepseekV4ForCausalLMDSpark"
 
-# Aliases for backward compatibility with server_args choices
-_BACKEND_ALIASES = {
-    "trtllm_mha": "trtllm",
-}
+
+@dataclasses.dataclass(frozen=True)
+class _AttnSideProfile:
+    """Architecture-derived family facts for one side (target or draft).
+
+    Everything here resolves from the model's ``hf_config`` before any
+    attention config exists, so the target and draft sides share one
+    derivation instead of two interleaved copies.
+    """
+
+    architectures: tuple[str, ...]
+    requested_backend: str | None
+    is_hybrid_gdn: bool
+    is_kda: bool
+    # KDA hybrid whose full-attention layers are DSA (GLM-5.3-Flash); a
+    # subset of ``is_kda`` that selects the DSA history consumer and the
+    # glm53_flash cache family.
+    is_dsa_kda: bool
+    is_inkling: bool
+    is_deepseek_v4: bool
+    is_dspark: bool
+
+    @property
+    def is_hybrid_linear(self) -> bool:
+        # GDN and KDA both take the hybrid-linear path; they differ only in
+        # the linear kernel (GDN scalar decay vs KDA per-channel) and the
+        # base attn arch (MHA vs MLA vs DSA).
+        return self.is_hybrid_gdn or self.is_kda
+
+
+def _resolve_attn_side(
+    model_config: ModelConfig, requested_backend: str | None
+) -> _AttnSideProfile:
+    hf_config = model_config.hf_config
+    architectures = getattr(hf_config, "architectures", None) or []
+    is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
+    is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
+    return _AttnSideProfile(
+        architectures=tuple(architectures),
+        requested_backend=requested_backend,
+        is_hybrid_gdn=any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures),
+        is_kda=is_dsa_kda
+        or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
+        is_dsa_kda=is_dsa_kda,
+        is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
+        # The DSpark draft resolves as a V4 architecture but has no paged
+        # attention config of its own; it must not take the V4 branches.
+        is_deepseek_v4=not is_dspark and is_deepseek_v4(hf_config),
+        is_dspark=is_dspark,
+    )
+
+
+def _check_pd_support(
+    server_args: ServerArgs,
+    target: _AttnSideProfile,
+    draft: _AttnSideProfile | None,
+    *,
+    has_draft_model: bool,
+) -> None:
+    """Every disaggregated-serving support gate, raised up front."""
+    if server_args.disaggregation_mode not in ("prefill", "decode"):
+        return
+    if draft is not None and draft.is_deepseek_v4:
+        raise NotImplementedError(
+            "DeepSeek V4 PD supports target-only decoding; a DeepSeek V4 "
+            "draft cache is not transferable"
+        )
+    if (target.is_inkling or (draft is not None and draft.is_inkling)) and (
+        has_draft_model or server_args.speculative_algorithm is not None
+    ):
+        raise NotImplementedError(
+            "Inkling PD supports target-only decoding; speculative/draft "
+            "ShortConv checkpoint transfer is not implemented"
+        )
+
+
+def _apply_backend_overrides(
+    server_args: ServerArgs,
+    target: _AttnSideProfile,
+    draft: _AttnSideProfile | None,
+) -> None:
+    """The one place family resolution writes back into ``server_args``.
+
+    The mutation is deliberate, not a shortcut: ``_create_attn_config`` reads
+    the backend choice through the generate() protocol, and the
+    ``global_server_args_dict`` snapshot serves models that pick kernel paths
+    at build time (e.g. ``deepseek_v3.attention_backend``). Must run before
+    any ``_create_attn_config`` call. The user's pre-override choice survives
+    as ``profile.requested_backend``.
+    """
+    if target.is_deepseek_v4:
+        server_args.attention_backend = "deepseek_v4"
+    if draft is not None and draft.is_deepseek_v4:
+        server_args.drafter_attention_backend = "deepseek_v4"
+
+    if target.is_hybrid_linear:
+        # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
+        # hybrid_linear_attn. The user's original choice stays in the profile
+        # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
+        server_args.attention_backend = "hybrid_linear_attn"
+    elif server_args.attention_backend == "hybrid_linear_attn":
+        logger.warning(
+            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
+            target.architectures,
+        )
+        server_args.attention_backend = None
+        if server_args.drafter_attention_backend == "hybrid_linear_attn":
+            logger.warning(
+                "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
+                draft.architectures if draft is not None else (),
+            )
+            server_args.drafter_attention_backend = None
+
+
+def _resolve_full_attn_backend_name(
+    profile: _AttnSideProfile, softmax_attn, hybrid_request: str | None
+) -> str:
+    """The name the full-attention layers run on (the hybrid sub-backend,
+    or the config's own resolution)."""
+    if profile.is_hybrid_linear:
+        return _resolve_hybrid_full_backend_name(
+            hybrid_request,
+            is_kda=profile.is_kda,
+            is_dsa=profile.is_dsa_kda,
+            has_cache_plan=True,
+        )
+    return softmax_attn.backend_name
+
+
+def _has_state_layers(config: AttnConfig) -> bool:
+    """The plan actually carries recurrent state (hybrid arch + state labels)."""
+    if config.component(LinearAttnConfig) is None:
+        return False
+    return any(
+        layer_type in STATE_LAYER_TYPES
+        for layer_type in config.component(SoftmaxAttnConfig).layer_types
+    )
+
+
+def _resolve_cache_family(
+    profile: _AttnSideProfile,
+    model_config: ModelConfig,
+    config: AttnConfig,
+) -> CacheModelFamily:
+    """The one dispatch from family facts (plus built config) to the recipe."""
+    if profile.is_deepseek_v4:
+        return "deepseek_v4"
+    if profile.is_hybrid_gdn and _has_state_layers(config):
+        # The qwen4_exp check needs the top-level config: the nested
+        # text_config has no ``architectures`` so resolve_architecture would
+        # return its class name and the check would always be False.
+        if is_qwen4_exp(model_config.hf_config):
+            return "qwen4_exp"
+        return "qwen_gdn"
+    if profile.is_dsa_kda:
+        return "glm53_flash"
+    if profile.is_kda:
+        return "kimi_k3"
+    if profile.is_inkling:
+        return "inkling"
+    family = _ordinary_cache_family(config)
+    if family is None:
+        raise RuntimeError(
+            "No cache recipe is registered for "
+            f"attention config {type(config.component(SoftmaxAttnConfig)).__name__}"
+        )
+    return family
 
 
 def _get_default_backend_name(arch: AttentionArch) -> str:
@@ -223,15 +400,12 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
 
 def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     if name is None:
-        candidates = [_get_default_backend_name(arch)]
-        for candidate in candidates:
-            entry = _BACKEND_REGISTRY.get(candidate)
-            if entry is not None and arch in entry[0]:
-                return entry[1]
+        entry = _BACKEND_REGISTRY.get(_get_default_backend_name(arch))
+        if entry is not None and arch in entry[0]:
+            return entry[1]
         raise ValueError(
             f"No backend supports arch {arch}. Available: {list(_BACKEND_REGISTRY)}"
         )
-    name = _BACKEND_ALIASES.get(name, name)
     entry = _BACKEND_REGISTRY.get(name)
     if entry is None:
         raise ValueError(
@@ -246,8 +420,53 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     return cls
 
 
+def create_paged_router(
+    config: AttnConfig,
+    arch: AttentionArch,
+    *,
+    backend_name: str | None = None,
+) -> AttentionBackend:
+    """Build the CacheGroupRouter for one side's paged attention.
+
+    The router builds one ``PagedAttentionBackend`` leaf per paged
+    (history-family) cache group of the pool view bound later via
+    ``set_cache_pool``; each leaf's kernel page size resolves from the
+    config override, the leaf class default, or the group's own block
+    granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
+    """
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+
+    spec = config.component(SoftmaxAttnConfig)
+    name = backend_name if backend_name is not None else spec.backend_name
+    if name == "hybrid_linear_attn":
+        # The composite sentinel _apply_backend_overrides writes into
+        # server_args (and MHAConfig.generate copies into the spec). It
+        # names the WRAPPER; the leaf under it auto-resolves from the arch.
+        name = None
+    leaf_cls = _get_backend_cls(name, arch)
+
+    def leaf_factory(group_id: str, block_granularity: int):
+        del group_id
+        kernel_page_size = leaf_cls.resolve_kernel_page_size(config, block_granularity)
+        # A fresh spec, never a mutate-restore of the shared component: leaf
+        # construction happens lazily at set_cache_pool, and several leaves
+        # interpret backend_name themselves (MHA/MLA kernel-solution maps),
+        # so a wrapper-selecting name like 'dsa' must not reach them.
+        leaf_spec = dataclasses.replace(spec, backend_name=name)
+        return leaf_cls(config, leaf_spec, kernel_page_size=kernel_page_size)
+
+    return CacheGroupRouter(
+        leaf_factory,
+        is_draft=bool(config.is_draft),
+        spec_num_tokens=config.speculative_num_draft_tokens or 1,
+        device=config.device,
+    )
+
+
 def _validate_lcm_page_size(
-    config: BaseAttnConfig,
+    config: AttnConfig,
     *,
     prefix_granularity: int,
 ) -> None:
@@ -272,54 +491,87 @@ def _validate_lcm_page_size(
 
 # ---------- arch -> config class ----------
 
-_CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
+_CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
     AttentionArch.MLA: MLAConfig,
     AttentionArch.DSA: DSAConfig,
     AttentionArch.MSA: MSAConfig,
 }
 
+# Architectures declaring a linear-attention component, registered like
+# _CONFIG_CLS. Whether a given checkpoint actually has linear layers is
+# decided by generate() (NextN drafts may carry none).
+_LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
+    arch: LinearAttnConfig
+    for arch in (
+        *_HYBRID_GDN_ARCHITECTURES,
+        *_HYBRID_MLA_KDA_ARCHITECTURES,
+        # GLM NextN is one DSA layer. It reuses the target's mixed-layer
+        # metadata but must not acquire a linear-attention component.
+        *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
+    )
+}
+
 
 def _create_attn_config(
     server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
-) -> BaseAttnConfig:
+) -> AttnConfig:
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    return _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    config = _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    # Extra components are built through the same generate() protocol and
+    # composed into config.components (consumers look them up by class via
+    # ``component()``).
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    linear_cls = next(
+        (_LINEAR_ATTN_CLS[a] for a in architectures if a in _LINEAR_ATTN_CLS), None
+    )
+    if linear_cls is not None:
+        linear_attn = linear_cls.generate(server_args, model_config, is_draft)
+        if linear_attn is not None:
+            config = dataclasses.replace(
+                config, components=config.components + (linear_attn,)
+            )
+    return config
 
 
 def _create_attn_backend(
     arch: AttentionArch,
-    config: BaseAttnConfig,
+    config: AttnConfig,
 ) -> AttentionBackend:
-    # LongCat LSA owns Index-K only on paired physical layers. Its DSA wrapper
-    # already contains the TRT-LLM MLA dense delegate, so keep an explicit
-    # dense selection inside that wrapper. Other DSA families retain their
-    # existing backend-selection behavior.
+    spec = config.component(SoftmaxAttnConfig)
     backend_name = (
         _get_default_backend_name(arch)
         if (
             arch == AttentionArch.DSA
-            and config.backend_name == "trtllm_mla"
-            and config.indexer_layer_ids is not None
+            and spec.backend_name == "trtllm_mla"
+            and spec.indexer_layer_ids is not None
         )
-        else config.backend_name
+        else spec.backend_name
     )
-    return _get_backend_cls(backend_name, arch)(config)
+    return _create_attn_backend_with_name(backend_name, arch, config)
 
 
 def _create_attn_backend_with_name(
     name: str | None,
     arch: AttentionArch,
-    config: BaseAttnConfig,
+    config: AttnConfig,
 ) -> AttentionBackend:
-    original_name = config.backend_name
-    config.backend_name = name
-    try:
-        return _get_backend_cls(name, arch)(config)
-    finally:
-        config.backend_name = original_name
+    from tokenspeed.runtime.layers.attention.backends.paged.base import (
+        PagedAttentionBackend,
+    )
+
+    cls = _get_backend_cls(name, arch)
+    if issubclass(cls, PagedAttentionBackend):
+        # Paged leaves are served through the cache-group router: one leaf
+        # per history group, blocks -> kernel pages mapped in one place.
+        return create_paged_router(config, arch, backend_name=name)
+    spec = dataclasses.replace(
+        config.component(SoftmaxAttnConfig),
+        backend_name=name,
+    )
+    return cls(config, spec)
 
 
 def _resolve_kda_backend(kda_backend: str) -> str:
@@ -366,12 +618,13 @@ def _resolve_hybrid_full_backend_name(
     requested_name: str | None,
     *,
     is_kda: bool,
+    is_dsa: bool,
     has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
-    name = _BACKEND_ALIASES.get(requested_name, requested_name)
-    if name == "hybrid_linear_attn":
-        name = None
+    name = None if requested_name == "hybrid_linear_attn" else requested_name
+    if has_cache_plan and is_dsa and name is None:
+        return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
     if has_cache_plan and is_kda and name is None and not current_platform().is_amd:
@@ -382,7 +635,7 @@ def _resolve_hybrid_full_backend_name(
 def _create_hybrid_linear_attn_backend(
     server_args: ServerArgs,
     model_config: ModelConfig,
-    config: BaseAttnConfig,
+    config: AttnConfig,
     *,
     pool,
     full_attn_backend_name: str | None = None,
@@ -391,62 +644,55 @@ def _create_hybrid_linear_attn_backend(
     """Create a hybrid backend for a linear-attention model over one pool.
 
     GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3,
-    MLA base). ``pool`` is the model's layer-mapped view over the one
-    shared cache pool; both sub-backends consume its per-group tables.
+    MLA base; GLM-5.3-Flash, DSA base). ``pool`` is the model's layer-mapped
+    view over the one shared cache pool; both sub-backends consume its
+    per-group tables.
     """
-    from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
-        HybridKDABackend,
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.state.kda import (
         KdaAttnBackend,
     )
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-        HybridLinearAttnBackend,
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
         MambaAttnBackend,
     )
 
     hf_config = model_config.hf_config
     text_config = getattr(hf_config, "text_config", hf_config)
     full_attn_layers = text_config.full_attention_layer_ids
-    # Create the full attention backend for standard MHA layers.
-    # Use user's original choice if provided, otherwise auto-select.
+    # The paged full-attention router (MHA, MLA or DSA leaves by arch): the
+    # user's original choice if provided, otherwise auto-selected.
     full_attn_backend = _create_attn_backend_with_name(
         full_attn_backend_name,
         model_config.attention_arch,
         config,
     )
 
-    if is_kda:
-        # Cache contract: see CuteDSLMLABackend.mark_cache_contract.
-        mark_cache_contract = getattr(full_attn_backend, "mark_cache_contract", None)
-        if mark_cache_contract is not None:
-            mark_cache_contract()
-
     # Create mamba/linear attention backend. Only propagate the configured
     # verify width when spec-dec is actually enabled — matches MLAConfig /
-    # MHAConfig.generate. Otherwise the BaseAttnConfig sentinel (1) wins so
+    # MHAConfig.generate. Otherwise the AttnConfig sentinel (1) wins so
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
     if server_args.speculative_algorithm is not None:
         config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
-    # Read mamba2_cache_params to decide whether this model actually has
-    # any linear / mamba layers. A draft model on a hybrid-GDN target
+    # The linear component's presence decides whether this model actually
+    # has any linear / mamba layers. A draft model on a hybrid-GDN target
     # (e.g. MTP on Qwen3.5) shares the same architecture class as the
-    # target but commonly ships with *zero* mamba layers — in that case
-    # we skip the mamba backend entirely so that its
-    # ``init_forward_metadata_*`` hooks do not run (they would otherwise
-    # touch a zero-sized pool on the same persistent state_indices_list
-    # as the target, which breaks the captured CUDA graph).
-    mamba_layer_ids = text_config.mamba2_cache_params[-1]
+    # target but commonly ships with *zero* mamba layers; such a view has no
+    # state groups to consume, so the router alone serves it.
+    linear_attn = config.component(LinearAttnConfig)
 
-    if len(mamba_layer_ids) == 0:
+    if linear_attn is None:
         logger.info(
             "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
-            "attn layers (skipping mamba backend)",
+            "attn layers in this cache view (skipping linear backend)",
             len(full_attn_layers),
         )
         return full_attn_backend
 
-    kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
+    kda_backend = server_args.kda_backend.strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
         uses_channel_beta = (
@@ -454,28 +700,34 @@ def _create_hybrid_linear_attn_backend(
         )
         linear_attn_backend = KdaAttnBackend(
             config,
+            config.component(SoftmaxAttnConfig),
             kda_backend=kda_backend,
             enable_verify_replay=not uses_channel_beta,
         )
     elif is_qwen4_exp(hf_config):
-        from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+        from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
             Qwen4ExpMambaAttnBackend,
         )
 
-        linear_attn_backend = Qwen4ExpMambaAttnBackend(config)
+        linear_attn_backend = Qwen4ExpMambaAttnBackend(
+            config, config.component(SoftmaxAttnConfig)
+        )
     else:
-        linear_attn_backend = MambaAttnBackend(config)
+        linear_attn_backend = MambaAttnBackend(
+            config, config.component(SoftmaxAttnConfig)
+        )
 
     # Recurrent state lives in the LCM arena and is addressed by the
     # per-group block tables, so no separate request-indexed Mamba pool exists.
     linear_attn_backend.set_kv_pool(pool)
 
-    hybrid_cls = HybridKDABackend if is_kda else HybridLinearAttnBackend
-    backend = hybrid_cls(full_attn_backend, linear_attn_backend, full_attn_layers)
+    backend = HybridLinearAttnBackend(
+        full_attn_backend, linear_attn_backend, full_attn_layers
+    )
     logger.info(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),
-        len(mamba_layer_ids),
+        len(linear_attn.layer_ids),
         "LCM state fields",
     )
     return backend
@@ -494,10 +746,9 @@ def _wrap_inkling_backend(
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
 
     The wrapper only adds conv metadata; all attention delegates to ``inner``.
-    Returns ``(backend, conv_pool)``.
     """
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-    from tokenspeed.runtime.layers.attention.backends.inkling import (
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
         InklingAttnBackend,
         InklingConvStatePool,
     )
@@ -512,8 +763,9 @@ def _wrap_inkling_backend(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
         num_slots=attn_config.max_bs + 2,
-        conv_dim=inkling_conv_total_dim(text_config, attn_config.attn_tp_size),
-        kernel_size=kernel_size,
+        conv_dim=inkling_conv_total_dim(
+            text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
+        ),
         ring_size=ring_size,
         dtype=torch.bfloat16,
         device=attn_config.device,
@@ -530,10 +782,9 @@ def _wrap_inkling_backend(
         conv_pool,
         conv_columns=conv_columns,
         spec_num_tokens=spec_tokens,
-        is_draft=is_draft,
         enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
-    return backend, conv_pool
+    return backend
 
 
 def _inkling_conv_columns(pool, text_config):
@@ -613,7 +864,7 @@ def _create_target_components(
         return backend, pool
 
     text_config = model_config.hf_config.get_text_config()
-    backend, _ = _wrap_inkling_backend(
+    backend = _wrap_inkling_backend(
         backend,
         text_config,
         config,
@@ -622,7 +873,7 @@ def _create_target_components(
         conv_columns=_inkling_conv_columns(pool, text_config),
         enable_layerwise_cache_ready=(
             server_args.disaggregation_mode == "prefill"
-            and getattr(server_args, "disaggregation_layerwise_interval", 0) > 0
+            and server_args.disaggregation_layerwise_interval > 0
         ),
     )
     return backend, pool
@@ -685,7 +936,7 @@ def _create_draft_components(
         # of the target's kvconv/hiddenconv groups; the draft gets the same
         # paged bridges (publish/restore) the target wrapper gets.
         text_config = model_config.hf_config.get_text_config()
-        backend, _ = _wrap_inkling_backend(
+        backend = _wrap_inkling_backend(
             backend,
             text_config,
             config,
@@ -727,6 +978,24 @@ def _prepare_verify_workspace(
 
 
 # ---------- public API ----------
+def _narrow_spec_for_pp(spec: CachePoolSpec, mapping) -> tuple[CachePoolSpec, object]:
+    """Chunk-pipeline stage: physically allocate only this stage's layers'
+    planes. The logical geometry (parents, packing, page math) stays the
+    full model's so every rank's scheduler plans identically; the returned
+    full plan serves the PD wire contract (every stage registers the same
+    logical layout, Decode plans stage windows against it).
+    """
+    from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
+
+    stage_start, stage_end = pp_layer_window(len(spec.layer_types), mapping)
+    pp_logical_plan = spec.memory_plan
+    spec = dataclasses.replace(
+        spec,
+        memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+    )
+    return spec, pp_logical_plan
+
+
 def create_attn_components(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -744,150 +1013,48 @@ def create_attn_components(
     CachePool | None,
     dict | None,
 ]:
-    architectures = getattr(model_config.hf_config, "architectures", None) or []
-    is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
-    is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
-    is_hybrid_mla_kda = any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures)
-    # Both take the hybrid-linear path; they differ only in the linear kernel
-    # (GDN scalar decay vs KDA per-channel) and the base attn arch (MHA vs MLA).
-    is_hybrid_linear = is_hybrid_gdn or is_hybrid_mla_kda
-    is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
-    draft_architectures = (
-        getattr(draft_model_config.hf_config, "architectures", None) or []
+    target = _resolve_attn_side(model_config, server_args.attention_backend)
+    draft = (
+        _resolve_attn_side(draft_model_config, server_args.drafter_attention_backend)
         if draft_model_config is not None
-        else []
+        else None
     )
-    is_inkling_draft_model = any(
-        architecture in _INKLING_ARCHITECTURES for architecture in draft_architectures
+    _check_pd_support(
+        server_args, target, draft, has_draft_model=draft_model_config is not None
     )
-    is_dspark_draft_model = any(
-        architecture == "DeepseekV4ForCausalLMDSpark"
-        for architecture in draft_architectures
-    )
-    is_deepseek_v4_draft_model = (
-        draft_model_config is not None
-        and not is_dspark_draft_model
-        and is_deepseek_v4(draft_model_config.hf_config)
-    )
-    original_attn_backend = server_args.attention_backend
-    if is_deepseek_v4_model:
-        server_args.attention_backend = "deepseek_v4"
-    if is_deepseek_v4_draft_model:
-        server_args.drafter_attention_backend = "deepseek_v4"
-        if server_args.disaggregation_mode in ("prefill", "decode"):
-            raise NotImplementedError(
-                "DeepSeek V4 PD supports target-only decoding; a DeepSeek V4 "
-                "draft cache is not transferable"
-            )
-    if is_hybrid_linear:
-        # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
-        # hybrid_linear_attn. Save the user's original choice for the
-        # full-attention sub-backend (MHA for GDN, MLA for KDA).
-        server_args.attention_backend = "hybrid_linear_attn"
-    elif server_args.attention_backend == "hybrid_linear_attn":
-        logger.warning(
-            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
-            architectures,
-        )
-        server_args.attention_backend = None
-        if server_args.drafter_attention_backend == "hybrid_linear_attn":
-            server_args.drafter_attention_backend = None
+    _apply_backend_overrides(server_args, target, draft)
 
     config = _create_attn_config(server_args, model_config)
-    if is_deepseek_v4_model:
-        config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
-    if (
-        (is_inkling or is_inkling_draft_model)
-        and server_args.disaggregation_mode in ("prefill", "decode")
-        and (
-            draft_model_config is not None
-            or getattr(server_args, "speculative_algorithm", None) is not None
-        )
-    ):
-        raise NotImplementedError(
-            "Inkling PD supports target-only decoding; speculative/draft "
-            "ShortConv checkpoint transfer is not implemented"
-        )
-    target_text_config = getattr(
-        model_config.hf_config, "text_config", model_config.hf_config
-    )
-    target_mamba_params = getattr(target_text_config, "mamba2_cache_params", None)
-    has_state = bool(
-        target_mamba_params
-        and target_mamba_params[-1]
-        and any(
-            layer_type in STATE_LAYER_TYPES
-            for layer_type in getattr(config, "layer_types", ())
-        )
-    )
-    use_cache_gdn = is_hybrid_gdn and has_state
-    # The qwen4_exp family check needs the top-level config: the nested
-    # text_config has no ``architectures`` so resolve_architecture would
-    # return its class name and the check would always be False.
-    use_qwen4_exp_cache = use_cache_gdn and is_qwen4_exp(model_config.hf_config)
-    use_cache_k3 = is_hybrid_mla_kda
-    use_cache_inkling = is_inkling
-    if is_deepseek_v4_model:
-        cache_family = "deepseek_v4"
-    elif use_qwen4_exp_cache:
-        cache_family = "qwen4_exp"
-    elif use_cache_gdn:
-        cache_family = "qwen_gdn"
-    elif use_cache_k3:
-        cache_family = "kimi_k3"
-    elif use_cache_inkling:
-        cache_family = "inkling"
-    elif type(config) is MHAConfig:
-        cache_family = "mha"
-    elif type(config) is MLAConfig:
-        cache_family = "mla"
-    elif isinstance(config, DSAConfig):
-        cache_family = "dsa"
-    elif isinstance(config, MSAConfig):
-        cache_family = "msa"
-    else:
-        cache_family = None
-    if cache_family is None:
-        raise RuntimeError(
-            "No cache recipe is registered for "
-            f"attention config {type(config).__name__}"
-        )
-    target_full_attn_backend_name = (
-        _resolve_hybrid_full_backend_name(
-            original_attn_backend,
-            is_kda=is_hybrid_mla_kda,
-            has_cache_plan=True,
-        )
-        if is_hybrid_linear
-        else config.backend_name
+    softmax_attn = config.component(SoftmaxAttnConfig)
+    if target.is_deepseek_v4:
+        softmax_attn.sliding_window_tokens = int(model_config.hf_config.sliding_window)
+    cache_family = _resolve_cache_family(target, model_config, config)
+    target_full_attn_backend_name = _resolve_full_attn_backend_name(
+        target, softmax_attn, hybrid_request=target.requested_backend
     )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
-        if draft_model_config and not is_dspark_draft_model
+        if draft is not None and not draft.is_dspark
         else None
     )
-    if is_deepseek_v4_draft_model:
-        draft_attn_config.sliding_window_tokens = int(
+    draft_softmax_attn = (
+        draft_attn_config.component(SoftmaxAttnConfig)
+        if draft_attn_config is not None
+        else None
+    )
+    if draft is not None and draft.is_deepseek_v4:
+        draft_softmax_attn.sliding_window_tokens = int(
             draft_model_config.hf_config.sliding_window
         )
-    draft_is_hybrid_gdn = any(
-        architecture in _HYBRID_GDN_ARCHITECTURES
-        for architecture in draft_architectures
+    draft_full_attn_backend_name = (
+        # The draft's hybrid sub-backend request is its config's own
+        # resolution, not the user's target choice.
+        _resolve_full_attn_backend_name(
+            draft, draft_softmax_attn, hybrid_request=draft_softmax_attn.backend_name
+        )
+        if draft_attn_config is not None
+        else None
     )
-    draft_is_hybrid_mla_kda = any(
-        architecture in _HYBRID_MLA_KDA_ARCHITECTURES
-        for architecture in draft_architectures
-    )
-    draft_full_attn_backend_name = None
-    if draft_attn_config is not None:
-        if draft_is_hybrid_gdn or draft_is_hybrid_mla_kda:
-            draft_full_attn_backend_name = _resolve_hybrid_full_backend_name(
-                draft_attn_config.backend_name,
-                is_kda=draft_is_hybrid_mla_kda,
-                has_cache_plan=True,
-            )
-        else:
-            draft_full_attn_backend_name = draft_attn_config.backend_name
     draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
@@ -958,23 +1125,7 @@ def create_attn_components(
     # compute view below (target, draft) is a layer window onto.
     pp_logical_plan = None
     if server_args.mapping.has_pp:
-        # Chunk-pipeline stage: physically allocate only this stage's layers'
-        # planes. The logical geometry (parents, packing, page math) stays
-        # the full model's so every rank's scheduler plans identically; keep
-        # the full plan for the PD wire contract (every stage registers the
-        # same logical layout, Decode plans stage windows against it).
-        from dataclasses import replace as _dc_replace
-
-        from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
-
-        stage_start, stage_end = pp_layer_window(
-            len(spec.layer_types), server_args.mapping
-        )
-        pp_logical_plan = spec.memory_plan
-        spec = _dc_replace(
-            spec,
-            memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
-        )
+        spec, pp_logical_plan = _narrow_spec_for_pp(spec, server_args.mapping)
         target_spec = spec
     arena = create_cache_arena(
         spec,
@@ -991,9 +1142,9 @@ def create_attn_components(
         arena=arena,
         rank=rank,
         full_attn_backend_name=target_full_attn_backend_name,
-        is_hybrid_linear=is_hybrid_linear,
-        is_kda=is_hybrid_mla_kda,
-        is_inkling=is_inkling,
+        is_hybrid_linear=target.is_hybrid_linear,
+        is_kda=target.is_kda,
+        is_inkling=target.is_inkling,
     )
     draft_attn_backend, draft_pool = _create_draft_components(
         server_args=server_args,
@@ -1004,33 +1155,27 @@ def create_attn_components(
         num_target_layers=cache_setup.num_target_layers,
         full_attn_backend_name=draft_full_attn_backend_name,
         is_heterogeneous=heterogeneous_draft_family is not None,
-        is_hybrid_linear=draft_is_hybrid_gdn or draft_is_hybrid_mla_kda,
-        is_kda=draft_is_hybrid_mla_kda,
-        is_inkling=any(a in _INKLING_ARCHITECTURES for a in draft_architectures),
+        is_hybrid_linear=draft is not None and draft.is_hybrid_linear,
+        is_kda=draft is not None and draft.is_kda,
+        is_inkling=draft is not None and draft.is_inkling,
     )
 
-    # A cache-group contract backend needs the contract marked before CUDA-graph
-    # state allocation (mark_cache_contract sizes the per-group write-location
-    # buffer). Composite/wrapper backends without the hook are a no-op.
+    # Bind the pools before CUDA-graph state allocation: backends learn
+    # their group geometry (and buffer sizing) from the pool's published
+    # specs. Every LCM pool publishes a cache contract, so there is no
+    # separate contract-marking step.
     for side_backend, side_pool in ((backend, pool), (draft_attn_backend, draft_pool)):
         if side_backend is None or side_pool is None:
             continue
         side_backend.set_cache_pool(side_pool)
-        side_arena = getattr(side_pool, "arena", None)
-        if getattr(side_arena, "runtime_contract", None) is None:
-            continue
-        mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
-        if mark_cache_contract is None:
-            continue
-        mark_cache_contract()
 
     _prepare_verify_workspace(
         server_args=server_args,
         config=config,
         backend=backend,
         draft_backend=draft_attn_backend,
-        uses_paged_state_verify=use_cache_gdn or use_cache_k3,
-        is_inkling=use_cache_inkling,
+        uses_paged_state_verify=cache_family in ("qwen4_exp", "qwen_gdn", "kimi_k3"),
+        is_inkling=cache_family == "inkling",
         expected_bytes=fixed_workspace_bytes,
     )
 

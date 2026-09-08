@@ -28,7 +28,12 @@ from typing import NamedTuple
 
 import psutil
 import torch
-from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+from tokenspeed_kernel.ops.kvcache.host_transfer import (
+    HostTransferWorkspace,
+    build_host_transfer_geometry,
+    transfer_cache_blocks,
+    wait_layer_ready,
+)
 from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
@@ -37,7 +42,7 @@ from tokenspeed.runtime.cache.l2.storage import (
     compute_host_lcm_block_bytes,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
@@ -102,9 +107,11 @@ class L2CacheExecutor:
         host_ratio: float,
         host_size_gb: float,
         io_backend: str,
+        attn_tp_rank: int = 0,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
+        self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -165,6 +172,88 @@ class L2CacheExecutor:
         # work) can touch them. Loads keep their own stream: their consumers
         # are fenced per layer by the tracker events.
         self.load_stream = _new_cache_stream(_load_stream_priority())
+        device = self.layout.buffers[0].device
+        fields_by_id = {}
+        for group_index, group in enumerate(self.layout.groups):
+            for field_index, field in enumerate(group.fields):
+                if field.field_id in fields_by_id:
+                    raise ValueError(
+                        f"cache transfer field {field.field_id!r} appears twice"
+                    )
+                fields_by_id[field.field_id] = (
+                    group_index,
+                    field_index,
+                    group,
+                    field,
+                )
+
+        rows = []
+        layer_slices = []
+        consumed_fields = set()
+        for consumer in self.layout.consumers:
+            layer_offset = len(rows)
+            for field_id in consumer:
+                if field_id in consumed_fields:
+                    raise ValueError(
+                        f"cache transfer field {field_id!r} has two consumers"
+                    )
+                try:
+                    group_index, field_index, group, field = fields_by_id[field_id]
+                except KeyError as exc:
+                    raise ValueError(
+                        f"cache consumer references unknown field {field_id!r}"
+                    ) from exc
+                consumed_fields.add(field_id)
+                rows.append(
+                    (
+                        group_index,
+                        field.device_buffer_index,
+                        field.device_block_zero_offset_bytes,
+                        field.block_stride_bytes,
+                        self.host_storage.host_cache_block_bytes[group_index],
+                        self.host_storage.host_field_offsets[group_index][field_index],
+                        group.cache_blocks_per_lcm_block,
+                        field.payload_bytes,
+                    )
+                )
+            layer_slices.append((layer_offset, len(rows) - layer_offset))
+        missing_fields = set(fields_by_id) - consumed_fields
+        if missing_fields:
+            raise ValueError(
+                f"cache transfer fields have no consumer {sorted(missing_fields)}"
+            )
+
+        geometry = build_host_transfer_geometry(
+            rows=tuple(rows),
+            layer_slices=tuple(layer_slices),
+            group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in self.layout.groups
+            ),
+            host_lcm_block_bytes=self.host_storage.host_lcm_block_bytes,
+            num_host_lcm_blocks=self.host_storage.num_host_lcm_blocks,
+            num_device_lcm_blocks=self.layout.num_lcm_blocks,
+            num_device_buffers=len(self.layout.buffers),
+        )
+        if io_backend == "kernel" and device.type != "npu":
+            # Both the caller stream (D2H) and load stream (H2D) consume this
+            # immutable table, so publish it synchronously once at init.
+            geometry = geometry.bind(device, non_blocking=False)
+        self._transfer_geometry = geometry
+        self._write_workspace = HostTransferWorkspace()
+        self._write_metadata_done = None
+        # A tracker waits for an event set's previous final-layer event before
+        # reusing its index. Aligning workspaces to those indices keeps each
+        # load's pinned and Device block-ID tables immutable until all
+        # consumers of that table have completed.
+        load_workspace_count = len(self._load_trackers[0][0].event_sets)
+        if any(
+            len(tracker.event_sets) != load_workspace_count
+            for tracker, _ in self._load_trackers
+        ):
+            raise RuntimeError("target and draft Host-load event sets diverged")
+        self._load_workspaces = tuple(
+            HostTransferWorkspace() for _ in range(load_workspace_count)
+        )
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only), so the completion queues below are the
@@ -174,6 +263,7 @@ class L2CacheExecutor:
         self._load_acks: list[_Ack] = []
         self._ready_write_op_ids: list[int] = []
         self._ready_load_op_ids: list[int] = []
+        self._load_poisoned = False
 
     def submit_write_backs(self, plan) -> None:
         """Enqueue the plan's D2H snapshot copies on the current stream.
@@ -243,30 +333,6 @@ class L2CacheExecutor:
                 )
                 transfers.append((int(group), int(device_block_id), int(host_block_id)))
 
-    def _transfer_ranges(
-        self,
-        transfers: Sequence[tuple[int, int, int]],
-        field_ids: set[str] | None = None,
-    ) -> list[tuple[int, int, int, int]]:
-        ranges = []
-        for group_index, device_block_id, host_block_id in transfers:
-            group = self.layout.groups[group_index]
-            for field_index, field in enumerate(group.fields):
-                if field_ids is not None and field.field_id not in field_ids:
-                    continue
-                ranges.append(
-                    (
-                        field.device_buffer_index,
-                        field.device_block_zero_offset_bytes
-                        + device_block_id * field.block_stride_bytes,
-                        self.host_storage.host_field_offset(
-                            group_index, host_block_id, field_index
-                        ),
-                        field.payload_bytes,
-                    )
-                )
-        return ranges
-
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -279,23 +345,55 @@ class L2CacheExecutor:
             with self._ack_lock:
                 self._ready_write_op_ids.extend(op_ids)
             return
-        logger.info(
-            "[L2] writeback started: operations=%d blocks=%d",
-            len(op_ids),
-            len(transfers),
-        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                "[L2] writeback started: operations=%d blocks=%d",
+                len(op_ids),
+                len(transfers),
+            )
         # On the caller's (forward thread's default) stream: the scheduler
         # releases -- and may re-grant -- the source pages the moment it
         # emits this op, and the single-stream FIFO is what keeps the copy
         # ahead of the pages' next writer.
         stream = device_module.current_stream()
-        transfer_cache_ranges(
+        # CPU writes are not ordered by stream FIFO. Retire the previous
+        # metadata upload before refilling its pinned source, not at submit.
+        if self._write_metadata_done is not None:
+            if not self._write_metadata_done.query():
+                self._write_metadata_done.synchronize()
+        num_blocks, _ = self._write_workspace.load_block_transfers(
+            transfers, geometry=self._transfer_geometry
+        )
+        mode = self._write_workspace.prepare_backend(
+            self.layout.buffers,
+            self.host_storage.host_buffer,
+            backend=self.transfer_backend,
+        )
+        if mode.uses_device_tables:
+            if self._write_metadata_done is None:
+                self._write_metadata_done = device_module.Event()
+            try:
+                self._write_workspace.commit_block_transfers(
+                    num_blocks, self.layout.buffers[0].device, non_blocking=True
+                )
+            finally:
+                # Also protect a partially submitted upload if staging fails.
+                # This event excludes the payload transfer; Device table reuse
+                # and source-page reuse remain ordered by the caller stream.
+                self._write_metadata_done.record(stream)
+        transfer_cache_blocks(
             "d2h",
             self.layout.buffers,
             self.host_storage.host_buffer,
-            self._transfer_ranges(transfers),
+            self._transfer_geometry,
+            self._write_workspace,
             stream,
+            num_blocks=num_blocks,
+            geometry_offset=0,
+            num_geometry_rows=self._transfer_geometry.num_field_rows,
             backend=self.transfer_backend,
+            grid_cap=None,
+            layer_ready_flags=None,
         )
         finish = device_module.Event()
         finish.record(stream)
@@ -307,6 +405,10 @@ class L2CacheExecutor:
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
     ) -> int | None:
+        if self._load_poisoned:
+            raise RuntimeError(
+                "L2 cache executor is poisoned after failed Host-load retirement"
+            )
         if not op_ids:
             return None
         if get_is_capture_mode():
@@ -316,47 +418,153 @@ class L2CacheExecutor:
             with self._ack_lock:
                 self._ready_load_op_ids.extend(op_ids)
             return None
-        logger.info(
-            "[L2] load started: operations=%d blocks=%d",
-            len(op_ids),
-            len(transfers),
-        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                "[L2] load started: operations=%d blocks=%d",
+                len(op_ids),
+                len(transfers),
+            )
 
         # EventLoop zeroes freshly allocated Device blocks before submitting the
-        # load. Recording the start event here makes every layer-wise H2D
-        # copy wait for that zeroing; the per-layer load events then keep model
-        # consumers from reading partially restored cache state.
+        # load. Recording the start event here makes the H2D copy wait for that
+        # zeroing; per-layer ready flags (Triton) or events (DMA) then keep
+        # model consumers from reading partially restored cache state.
         load_index = None
-        consumer_offset = 0
         finish = None
-        for tracker, consumer_count in self._load_trackers:
-            current_load_index = tracker.begin_load()
+        flags = None
+        active_trackers = []
+        try:
+            for tracker, consumer_count in self._load_trackers:
+                current_load_index = tracker.begin_load()
+                load_events = tracker.event_sets[current_load_index]
+                # Register the generation immediately after begin_load so an
+                # exception in tracker convergence or start-event setup still
+                # retires every target/draft event set that advanced.
+                active_trackers.append((load_events, consumer_count))
+                if load_index is None:
+                    load_index = current_load_index
+                elif current_load_index != load_index:
+                    raise RuntimeError("target and draft Host-load trackers diverged")
+                load_events.start_event.record()
+                load_events.start_event.wait(self.load_stream)
             if load_index is None:
-                load_index = current_load_index
-            elif current_load_index != load_index:
-                raise RuntimeError("target and draft Host-load trackers diverged")
-            load_events = tracker.event_sets[current_load_index]
-            load_events.start_event.record()
-            load_events.start_event.wait(self.load_stream)
-            for layer_index in range(consumer_count):
-                consumer = self.layout.consumers[consumer_offset + layer_index]
-                transfer_cache_ranges(
+                raise RuntimeError("cache transfer layout has no layer consumers")
+
+            device = self.layout.buffers[0].device
+            workspace = self._load_workspaces[load_index]
+            num_blocks, _ = workspace.load_block_transfers(
+                transfers, geometry=self._transfer_geometry
+            )
+            layer_slices = self._transfer_geometry.layer_slices
+            # Resolve the transport before choosing the consumer wait protocol.
+            with device_module.stream(self.load_stream):
+                mode = workspace.prepare_backend(
+                    self.layout.buffers,
+                    self.host_storage.host_buffer,
+                    backend=self.transfer_backend,
+                )
+                if mode.uses_device_tables:
+                    workspace.commit_block_transfers(
+                        num_blocks,
+                        device,
+                        non_blocking=True,
+                    )
+                if mode.layer_ready:
+                    flags = workspace.prepare_layer_ready(len(layer_slices), device)
+                    for load_events, _ in active_trackers:
+                        load_events.layer_ready_init_event.record(self.load_stream)
+            if mode.layer_ready:
+                flag_offset = 0
+                for load_events, consumer_count in active_trackers:
+                    load_events.layer_ready_flags = flags[
+                        flag_offset : flag_offset + consumer_count
+                    ]
+                    load_events.wait_layer_ready = wait_layer_ready
+                    flag_offset += consumer_count
+                transfer_cache_blocks(
                     "h2d",
                     self.layout.buffers,
                     self.host_storage.host_buffer,
-                    self._transfer_ranges(transfers, set(consumer)),
+                    self._transfer_geometry,
+                    workspace,
                     self.load_stream,
+                    num_blocks=num_blocks,
+                    geometry_offset=0,
+                    num_geometry_rows=self._transfer_geometry.num_field_rows,
                     backend=self.transfer_backend,
+                    layer_ready_flags=flags,
+                    grid_cap=None,
                 )
                 finish = device_module.Event()
                 finish.record(self.load_stream)
-                load_events.layer_done_events[layer_index] = finish
-            consumer_offset += consumer_count
-        if load_index is None or finish is None:
-            raise RuntimeError("cache transfer layout has no layer consumers")
-        with self._ack_lock:
-            self._load_acks.append(_Ack(finish, op_ids))
-        return load_index
+                for load_events, consumer_count in active_trackers:
+                    load_events.set_completion(finish)
+            else:
+                for load_events, _ in active_trackers:
+                    load_events.layer_ready_flags = None
+                    load_events.wait_layer_ready = None
+                flat_layer_index = 0
+                for load_events, consumer_count in active_trackers:
+                    for layer_index in range(consumer_count):
+                        geometry_offset, num_geometry_rows = layer_slices[
+                            flat_layer_index
+                        ]
+                        transfer_cache_blocks(
+                            "h2d",
+                            self.layout.buffers,
+                            self.host_storage.host_buffer,
+                            self._transfer_geometry,
+                            workspace,
+                            self.load_stream,
+                            num_blocks=num_blocks,
+                            geometry_offset=geometry_offset,
+                            num_geometry_rows=num_geometry_rows,
+                            backend=self.transfer_backend,
+                            grid_cap=None,
+                            layer_ready_flags=None,
+                        )
+                        finish = device_module.Event()
+                        finish.record(self.load_stream)
+                        load_events.layer_done_events[layer_index] = finish
+                        flat_layer_index += 1
+            if finish is None:
+                raise RuntimeError("cache transfer layout has no layer consumers")
+            with self._ack_lock:
+                self._load_acks.append(_Ack(finish, op_ids))
+            return load_index
+        except BaseException as original_error:
+            self._retire_failed_load(active_trackers, flags, original_error)
+            raise
+
+    def _retire_failed_load(self, active_trackers, flags, original_error) -> None:
+        """Retire submitted GPU readers without publishing a success ACK."""
+        if not active_trackers:
+            return
+        try:
+            if flags is not None:
+                with device_module.stream(self.load_stream):
+                    flags.fill_(1)
+            retirement = device_module.Event()
+            retirement.record(self.load_stream)
+            for load_events, _ in active_trackers:
+                load_events.set_completion(retirement)
+            return
+        except BaseException as retirement_error:
+            # If event publication fails, only stream completion permits reuse.
+            try:
+                self.load_stream.synchronize()
+            except BaseException as sync_error:
+                self._load_poisoned = True
+                add_note = getattr(original_error, "add_note", None)
+                if add_note is not None:
+                    try:
+                        add_note(
+                            "Host-load retirement failed; executor poisoned: "
+                            f"retirement error={retirement_error!r}; "
+                            f"synchronize error={sync_error!r}"
+                        )
+                    except BaseException:
+                        pass
 
     def poll_results(self) -> list:
         with self._ack_lock:
