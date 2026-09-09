@@ -380,9 +380,13 @@ def _zero_byte_ranges_kernel(
     backing_ptr,
     ranges_ptr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_OFFSET: tl.constexpr,
 ):
+    """Clear selected cache byte ranges; BLOCK_OFFSET resumes a split launch."""
     range_id = tl.program_id(0)
-    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    byte_offsets = (BLOCK_OFFSET + tl.program_id(1)) * BLOCK_SIZE + tl.arange(
+        0, BLOCK_SIZE
+    )
     range_offset = tl.load(ranges_ptr + range_id * 2)
     range_size = tl.load(ranges_ptr + range_id * 2 + 1)
     tl.store(
@@ -418,14 +422,32 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     block_size = 1024
     max_size = max(size for _, size in ranges)
 
-    grid = (len(ranges), triton.cdiv(max_size, block_size))
+    blocks_per_range = triton.cdiv(max_size, block_size)
+    if not current_platform().is_npu:
+        _zero_byte_ranges_kernel[(len(ranges), blocks_per_range)](
+            backing,
+            range_table,
+            BLOCK_SIZE=block_size,
+            BLOCK_OFFSET=0,
+            num_warps=4,
+        )
+        return
 
-    _zero_byte_ranges_kernel[grid](
-        backing,
-        range_table,
-        BLOCK_SIZE=block_size,
-        num_warps=4,
-    )
+    # Bound each NPU launch's total grid; large cache blocks need several
+    # launches. BLOCK_OFFSET preserves the byte position within each range.
+    max_programs = 65535
+    for block_offset in range(0, blocks_per_range, max_programs):
+        block_count = min(max_programs, blocks_per_range - block_offset)
+        ranges_per_launch = max(1, max_programs // block_count)
+        for range_offset in range(0, len(ranges), ranges_per_launch):
+            range_count = min(ranges_per_launch, len(ranges) - range_offset)
+            _zero_byte_ranges_kernel[(range_count, block_count)](
+                backing,
+                range_table[range_offset:],
+                BLOCK_SIZE=block_size,
+                BLOCK_OFFSET=block_offset,
+                num_warps=4,
+            )
 
 
 # -----------------------------------------------------------------------------
