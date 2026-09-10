@@ -958,6 +958,24 @@ def mla_project_value_prefers_contiguous_weight(
     return True
 
 
+def mla_prolog_available() -> bool:
+    """Whether flash_ops provides the optional Ascend Lite MLA prolog."""
+    if not current_platform().is_npu:
+        return False
+    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog_available as available
+
+    return available()
+
+
+def mla_prolog(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the packaged Lite prolog, or return None before writes if ineligible."""
+    if not current_platform().is_npu:
+        raise NotImplementedError("Lite MLA prolog is only available on Ascend")
+    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog as npu_mla_prolog
+
+    return npu_mla_prolog(*args, **kwargs)
+
+
 def mla_project_value(
     attention: torch.Tensor,
     weight: torch.Tensor,
