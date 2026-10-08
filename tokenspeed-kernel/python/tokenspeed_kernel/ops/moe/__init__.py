@@ -31,7 +31,7 @@ import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
 import tokenspeed_kernel.ops.moe.mega_moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
@@ -88,6 +88,9 @@ from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
 from tokenspeed_kernel.ops.moe.softmax_topk import _moe_softmax_topk  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.moe.ascend  # noqa: F401
 
 
 def _assert_indices_in_range(
