@@ -89,6 +89,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # The sparse layers (QSA) index the full-attention child's groups.
         return self.full_attn_backend.sparse_topk
 
+    @property
+    def dsa_selection_policy(self) -> tuple[int, int]:
+        return self.full_attn_backend.dsa_selection_policy
+
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 
@@ -97,6 +101,10 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
+
+    def run_projection_branches(self, layer, primary, secondary):
+        """Keep full-attention projection scheduling behind the hybrid wrapper."""
+        return self.full_attn_backend.run_projection_branches(layer, primary, secondary)
 
     # Composite: the full-attention child owns the per-request decode lengths
     # the draft reads, so every drafter length-edit hook reaches it (the

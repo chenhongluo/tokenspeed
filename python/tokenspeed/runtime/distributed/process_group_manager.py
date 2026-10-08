@@ -51,6 +51,7 @@ class ProcessGroupManager:
         # Set by init_emulated_rank_zero: one group per backend holding only
         # this process, standing in for every logical group.
         self._emulated_rank_groups: dict[str, dist.ProcessGroup] | None = None
+        self._dedicated_groups: dict[tuple[str, Group], dist.ProcessGroup] = {}
 
     def init_distributed(
         self,
@@ -161,22 +162,41 @@ class ProcessGroupManager:
         else:
             backends = backend
 
-        for backend in backends:
-            if self.has_process_group(backend, group):
+        for group_backend in backends:
+            if self.has_process_group(group_backend, group):
                 continue
             if self._emulated_rank_groups is not None:
-                if backend not in self._emulated_rank_groups:
-                    self._emulated_rank_groups[backend] = dist.new_group(
-                        [0], backend=backend, timeout=self._pg_timeout
+                if group_backend not in self._emulated_rank_groups:
+                    self._emulated_rank_groups[group_backend] = dist.new_group(
+                        [0], backend=group_backend, timeout=self._pg_timeout
                     )
                 self.register_process_group(
-                    backend, group, self._emulated_rank_groups[backend]
+                    group_backend, group, self._emulated_rank_groups[group_backend]
                 )
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
+                pg = dist.new_group(g, backend=group_backend, timeout=self._pg_timeout)
                 if g == group:
-                    self.register_process_group(backend, g, pg)
+                    self.register_process_group(group_backend, g, pg)
+
+    def get_dedicated_device_group(self, group: Group, namespace: str):
+        """Create an isolated device collective in deterministic global order.
+
+        Native communication windows must not share an HCCL communicator with
+        ordinary framework collectives. Every rank calls this with the same
+        namespace and group pattern before graph capture.
+        """
+        if self._emulated_rank_groups is not None:
+            raise RuntimeError("Dedicated device groups do not support rank emulation")
+        key = (namespace, tuple(group))
+        if key not in self._dedicated_groups:
+            for ranks in _make_all_groups(group):
+                process_group = dist.new_group(
+                    ranks, backend=self._device_backend, timeout=self._pg_timeout
+                )
+                if ranks == group:
+                    self._dedicated_groups[key] = process_group
+        return self._dedicated_groups[key]
 
 
 process_group_manager = ProcessGroupManager()

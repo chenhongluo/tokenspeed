@@ -906,8 +906,11 @@ class CacheGroupRouter(AttentionBackend):
         **kwargs,
     ):
         # No ambient-ctx override: a MIXED round's halves pass sub-context modes this must honor.
-        assert not save_kv_cache, _PREWRITTEN
         leaf = self._leaf_for(layer)
+        if save_kv_cache and not getattr(leaf, "supports_direct_cache_write", False):
+            raise AssertionError(_PREWRITTEN)
+        if getattr(leaf, "supports_direct_cache_write", False):
+            kwargs["save_kv_cache"] = save_kv_cache
         out_cache_loc = self.forward_write_locations(layer, forward_mode)
         with self.record_pd_cache_step(
             forward_mode, writes_in_call=False, record_kv_cache=record_kv_cache
@@ -947,10 +950,13 @@ class CacheGroupRouter(AttentionBackend):
         **kwargs,
     ):
         """Composite hosts (hybrid GDN/KDA) dispatch decode directly."""
-        assert not save_kv_cache, _PREWRITTEN
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
         leaf = self._leaf_for(layer)
+        if save_kv_cache and not getattr(leaf, "supports_direct_cache_write", False):
+            raise AssertionError(_PREWRITTEN)
+        if getattr(leaf, "supports_direct_cache_write", False):
+            kwargs["save_kv_cache"] = save_kv_cache
         out_cache_loc = self.forward_write_locations(layer, ForwardMode.DECODE)
         return leaf.forward_decode(
             q,
@@ -976,10 +982,13 @@ class CacheGroupRouter(AttentionBackend):
         **kwargs,
     ):
         """Composite hosts dispatch extend directly."""
-        assert not save_kv_cache, _PREWRITTEN
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
         leaf = self._leaf_for(layer)
+        if save_kv_cache and not getattr(leaf, "supports_direct_cache_write", False):
+            raise AssertionError(_PREWRITTEN)
+        if getattr(leaf, "supports_direct_cache_write", False):
+            kwargs["save_kv_cache"] = save_kv_cache
         out_cache_loc = self.write_locations(layer, ForwardMode.EXTEND)
         return leaf.forward_extend(
             q,
@@ -1043,6 +1052,13 @@ class CacheGroupRouter(AttentionBackend):
         return self._sole_leaf("forward_sparse_prefill").forward_sparse_prefill(
             *args, **kwargs
         )
+
+    @property
+    def dsa_selection_policy(self) -> tuple[int, int]:
+        return self._sole_leaf("dsa_selection_policy").dsa_selection_policy
+
+    def run_projection_branches(self, layer, primary, secondary):
+        return self._leaf_for(layer).run_projection_branches(layer, primary, secondary)
 
     # ------------------------------------------------------------------
     # DSA query-shard surface: a sparse-attention model's own top-k over KVP
