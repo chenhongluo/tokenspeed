@@ -41,9 +41,6 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
-    TRTLLMMLABackend,
-)
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
@@ -139,6 +136,10 @@ def _make_dense_leaf(
     # selected THIS wrapper must not leak through.
     dense_spec = dataclasses.replace(spec, backend_name=None)
     if platform.is_nvidia:
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+            TRTLLMMLABackend,
+        )
+
         return TRTLLMMLABackend(config, dense_spec, kernel_page_size=kernel_page_size)
     if platform.is_amd:
         return MLAAttnBackend(config, dense_spec, kernel_page_size=kernel_page_size)
@@ -164,7 +165,9 @@ class DSABackend(PagedAttentionBackend):
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
-        self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
+        self._dense_backend = self._create_dense_leaf(
+            config, spec, platform, kernel_page_size
+        )
         self.dcp_group = tuple(config.dcp_group)
         self.dcp_rank = config.dcp_rank
         self.dcp_block_granularity: int | None = None
@@ -221,6 +224,15 @@ class DSABackend(PagedAttentionBackend):
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
         if len(self.qcp_group) > 1:
             self._probe_history_gather_topk_leaf(spec)
+
+    def _create_dense_leaf(
+        self,
+        config: AttnConfig,
+        spec: DSAConfig,
+        platform,
+        kernel_page_size: int,
+    ) -> PagedAttentionBackend:
+        return _make_dense_leaf(config, spec, platform, kernel_page_size)
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm
@@ -1315,4 +1327,5 @@ class DSABackend(PagedAttentionBackend):
         return out.reshape(-1, heads * layer.v_head_dim)
 
 
-register_backend("dsa", {AttentionArch.DSA}, DSABackend)
+if not current_platform().is_npu:
+    register_backend("dsa", {AttentionArch.DSA}, DSABackend)
