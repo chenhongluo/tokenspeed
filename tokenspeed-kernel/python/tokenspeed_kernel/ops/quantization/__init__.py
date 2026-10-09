@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -501,10 +500,7 @@ def quantize_fp8_group32_ue8m0_swizzled(
         return kernel(x)
 
 
-# These implementations use the CUDA Triton/FlashInfer toolchain.  Importing
-# them on Ascend also runs their JIT decorators, which are incompatible with
-# Triton-Ascend even if no CUDA quantization kernel is ever selected.
-if not current_platform().is_npu:
-    import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
-    import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
-    import tokenspeed_kernel.ops.quantization.trtllm  # noqa: E402,F401
+# Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.quantization.trtllm  # noqa: E402,F401
