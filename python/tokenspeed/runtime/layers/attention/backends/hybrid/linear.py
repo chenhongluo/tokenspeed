@@ -98,10 +98,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
-    def run_projection_branches(self, layer, primary, secondary):
-        """Keep full-attention projection scheduling behind the hybrid wrapper."""
-        return self.full_attn_backend.run_projection_branches(layer, primary, secondary)
-
     # Composite: the full-attention child owns the per-request decode lengths
     # the draft reads, so every drafter length-edit hook reaches it (the
     # linear child's state follows the committed position, not seq_lens).
