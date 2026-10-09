@@ -89,10 +89,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         # The sparse layers (QSA) index the full-attention child's groups.
         return self.full_attn_backend.sparse_topk
 
-    @property
-    def dsa_selection_policy(self) -> tuple[int, int]:
-        return self.full_attn_backend.dsa_selection_policy
-
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 

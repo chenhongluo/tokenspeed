@@ -1044,10 +1044,6 @@ class CacheGroupRouter(AttentionBackend):
             *args, **kwargs
         )
 
-    @property
-    def dsa_selection_policy(self) -> tuple[int, int]:
-        return self._sole_leaf("dsa_selection_policy").dsa_selection_policy
-
     def run_projection_branches(self, layer, primary, secondary):
         return self._leaf_for(layer).run_projection_branches(layer, primary, secondary)
 
