@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -524,5 +523,4 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         return result, None
 
 
-if current_platform().is_nvidia:
-    register_backend("trtllm_mla", {AttentionArch.MLA}, TRTLLMMLABackend)
+register_backend("trtllm_mla", {AttentionArch.MLA}, TRTLLMMLABackend)
