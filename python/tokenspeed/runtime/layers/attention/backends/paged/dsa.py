@@ -164,7 +164,9 @@ class DSABackend(PagedAttentionBackend):
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
-        self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
+        self._dense_backend = self._create_dense_leaf(
+            config, spec, platform, kernel_page_size
+        )
         self.dcp_group = tuple(config.dcp_group)
         self.dcp_rank = config.dcp_rank
         self.dcp_block_granularity: int | None = None
@@ -221,6 +223,15 @@ class DSABackend(PagedAttentionBackend):
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
         if len(self.qcp_group) > 1:
             self._probe_history_gather_topk_leaf(spec)
+
+    def _create_dense_leaf(
+        self,
+        config: AttnConfig,
+        spec: DSAConfig,
+        platform,
+        kernel_page_size: int,
+    ) -> PagedAttentionBackend:
+        return _make_dense_leaf(config, spec, platform, kernel_page_size)
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm

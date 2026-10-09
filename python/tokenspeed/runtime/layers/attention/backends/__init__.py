@@ -43,6 +43,7 @@ if platform.is_nvidia:
         tokenspeed_mla,
     )
 
+from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import dsa  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mla  # noqa: F401
