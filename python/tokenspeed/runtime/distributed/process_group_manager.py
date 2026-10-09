@@ -162,22 +162,22 @@ class ProcessGroupManager:
         else:
             backends = backend
 
-        for group_backend in backends:
-            if self.has_process_group(group_backend, group):
+        for backend in backends:
+            if self.has_process_group(backend, group):
                 continue
             if self._emulated_rank_groups is not None:
-                if group_backend not in self._emulated_rank_groups:
-                    self._emulated_rank_groups[group_backend] = dist.new_group(
-                        [0], backend=group_backend, timeout=self._pg_timeout
+                if backend not in self._emulated_rank_groups:
+                    self._emulated_rank_groups[backend] = dist.new_group(
+                        [0], backend=backend, timeout=self._pg_timeout
                     )
                 self.register_process_group(
-                    group_backend, group, self._emulated_rank_groups[group_backend]
+                    backend, group, self._emulated_rank_groups[backend]
                 )
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=group_backend, timeout=self._pg_timeout)
+                pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
                 if g == group:
-                    self.register_process_group(group_backend, g, pg)
+                    self.register_process_group(backend, g, pg)
 
     def get_dedicated_device_group(self, group: Group, namespace: str):
         """Create an isolated device collective in deterministic global order.
