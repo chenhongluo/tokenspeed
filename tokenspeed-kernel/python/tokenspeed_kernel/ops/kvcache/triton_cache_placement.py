@@ -111,7 +111,7 @@ def virtual_slots_to_local(
             raise ValueError("virtual slot outputs must match shape, device and dtype")
     if slots.numel() == 0:
         return out, owner_mask
-    if slots.is_cuda:
+    if slots.is_cuda or slots.device.type == "npu":
         source = slots.contiguous()
         _translate_virtual_slots[(triton.cdiv(slots.numel(), 256),)](
             source,
@@ -233,7 +233,7 @@ def compact_dcp_pages(
     ):
         raise ValueError("DCP page buffers disagree")
     out.zero_()
-    if table.is_cuda:
+    if table.is_cuda or table.device.type == "npu":
         _compact_owned_pages[(table.shape[0],)](
             table,
             lengths,
@@ -334,7 +334,7 @@ def dcp_local_visible_lengths(
     Returns:
         None; out is refreshed without scanning or rebuilding page tables.
     """
-    if visible_lengths.is_cuda:
+    if visible_lengths.is_cuda or visible_lengths.device.type == "npu":
         _local_visible_lengths[(visible_lengths.shape[0],)](
             page_prefix,
             visible_lengths,
