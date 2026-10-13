@@ -1641,3 +1641,44 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
 × {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
 (accuracy equal or better; speculative accept length within noise).
+
+### Ascend dense MLA over sharded pages
+
+The Ascend `tokenspeed_mla` leaf uses the same `CachePlacement` and
+`CompactDCPLayout` as Ascend DSA. It does not introduce plugin-owned page
+geometry. A verify window publishes one causal endpoint per query; compact
+metadata translates those endpoints into local KV lengths before attention.
+The prologue writes only the owning rank's cache rows.
+
+Ascend MLA and DSA share communication groups and collective wrappers in
+`dcp/ascend.py`. Dense MLA gathers query heads, evaluates packed FIA against
+local pages, exchanges partial outputs and natural-log LSE by head owner,
+and merges the KV shards before value projection. Its native merge currently
+requires eight shards; degree one bypasses exchange and merge. Empty shards
+have zero output and negative-infinite LSE; all-empty requests return zero.
+
+Packed FIA takes host length lists. The NPU kernel adapter binds each captured
+MLA invocation to its own local-length mirror and refreshes it before graph
+update, instead of installing the runner's global sequence lengths. Pool
+rebind discards the backend's old metadata views and length bindings.
+Model-specific projection weights and composition remain with the model;
+no plugin attention-backend override or DCP implementation is needed.
+
+Validate on eight Ascend devices with the packed FIA and KVP merge operators
+installed:
+
+```bash
+python test/runtime/distributed/run_ascend_dcp_metadata.py
+torchrun --standalone --nproc-per-node=8 test/runtime/distributed/run_ascend_mla_dcp.py
+torchrun --standalone --nproc-per-node=8 test/runtime/distributed/run_ascend_mla_lifecycle.py
+```
+
+The first test checks dense CPU-oracle parity, empty shards, verify causality,
+accepted-prefix continuation and dynamic graph replay. The second checks
+prefill, cached prefill, page reuse, and subsequent projected/gated decode.
+Neither substitutes for end-to-end model accuracy testing.
+
+Ascend page compaction uses native device sorting/gather and prefix counts.
+The Triton compaction launcher can require synchronous lock initialization,
+which is not permitted inside NPU graph capture. This device path also updates
+query endpoints without host transfers; CUDA retains its Triton implementation.
