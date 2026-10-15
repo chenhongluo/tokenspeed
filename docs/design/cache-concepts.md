@@ -72,6 +72,11 @@ A fourth quantity lives outside the logical world entirely:
   consumed by only one backend, such as Ascend DSA's 128-row pages, may live
   with that backend; its resolver remains the single source for callers.
 
+  The public `dsa` backend name selects the current platform's implementation:
+  Ascend uses `AscendDSABackend`, including its fixed 128-row kernel pages;
+  NVIDIA and AMD use `DSABackend`. Model profiles and launch configurations
+  use the same name across platforms.
+
   DeepSeek V4's geometry is fully
   registry-sourced: the compressed full-history chains declare
   `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
